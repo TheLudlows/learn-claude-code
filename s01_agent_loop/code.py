@@ -45,14 +45,16 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN") or os.getenv("ANTHROPIC_API_KEY")
+base_url = os.getenv("ANTHROPIC_BASE_URL")
+print("auth_token:", auth_token)
+print("base_url:", base_url)
+client = Anthropic(auth_token=auth_token, base_url=base_url)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
-
+print("base_url:", SYSTEM)
 # -- Tool definition: just bash --
 TOOLS = [{
     "name": "bash",
@@ -84,11 +86,12 @@ def run_bash(command: str) -> str:
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
     while True:
+        print("messages:", messages)
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
-
+        print("resp:", response)
         # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
 
