@@ -1,9 +1,33 @@
+/*
+s02_tool_use.rs - Tool Use (Rust)
+
+The agent loop from s01 does not change. This lesson adds four tools
+and a dispatch map:
+
+    +----------+      +-------+      +--------------------------+
+    |   User   | ---> |  LLM  | ---> | Tool Dispatch            |
+    |  prompt  |      |       |      | bash       -> run_bash   |
+    +----------+      +---+---+      | read_file  -> run_read   |
+                          ^          | write_file -> run_write  |
+                          |          | edit_file  -> run_edit   |
+                          +----------| glob       -> run_glob   |
+                          tool_result+--------------------------+
+
+  + run_read / run_write / run_edit / run_glob
+  + TOOL_HANDLERS (dispatch_tool) instead of a hard-coded run_bash call
+  + safe_path to keep file tools inside the workspace
+
+Key insight: the loop stays the same; only tool registration and dispatch grow.
+*/
+
+mod tools;
+
 use dotenv::dotenv;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{self, Write};
-use std::process::Command;
+use tools::{dispatch_tool, get_tool_definitions, ToolDefinition};
 
 /// Anthropic API 请求体
 #[derive(Serialize)]
@@ -41,51 +65,11 @@ enum ContentBlock {
     },
 }
 
-/// 工具定义
-#[derive(Serialize)]
-struct ToolDefinition {
-    name: String,
-    description: String,
-    input_schema: serde_json::Value,
-}
-
 /// Anthropic API 响应
 #[derive(Deserialize)]
 struct MessagesResponse {
     content: Vec<ContentBlock>,
     stop_reason: String,
-}
-
-/// 执行 bash 命令
-fn run_bash(command: &str) -> String {
-    let dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
-
-    for d in dangerous {
-        if command.contains(d) {
-            return "Error: Dangerous command blocked".to_string();
-        }
-    }
-
-    match Command::new("bash")
-        .arg("-c")
-        .arg(command)
-        .current_dir(env::current_dir().unwrap_or_else(|_| ".".into()))
-        .output()
-    {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let result = format!("{}\n{}", stdout, stderr).trim().to_string();
-            if result.is_empty() {
-                "(no output)".to_string()
-            } else if result.len() > 50000 {
-                result[..50000].to_string()
-            } else {
-                result
-            }
-        }
-        Err(e) => format!("Error: {}", e),
-    }
 }
 
 /// Agent 核心循环
@@ -103,19 +87,7 @@ async fn agent_loop(
             max_tokens: 8000,
             system: system.to_string(),
             messages: messages.clone(),
-            tools: vec![ToolDefinition {
-                name: "bash".to_string(),
-                description: "Run a shell command.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string"
-                        }
-                    },
-                    "required": ["command"]
-                }),
-            }],
+            tools: get_tool_definitions(),
         };
 
         let response = client
@@ -140,18 +112,14 @@ async fn agent_loop(
             break;
         }
 
-        // 执行工具调用
+        // 执行工具调用 - 使用工具分发机制
         let mut tool_results = Vec::new();
         for block in &response.content {
-            if let ContentBlock::ToolUse { id, input, .. } = block {
-                let command = input.get("command")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-
-                print!("\x1b[33m$ {}\x1b[0m", command);
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                print!("\x1b[33m> {}\x1b[0m", name);
                 io::stdout().flush().unwrap();
 
-                let output = run_bash(command);
+                let output = dispatch_tool(name, input);
                 println!("{}", &output[..output.len().min(200)]);
 
                 tool_results.push(ContentBlock::ToolResult {
@@ -175,7 +143,7 @@ async fn agent_loop(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
-    println!("rust-agent: Agent Loop (Rust)");
+    println!("rust-agent: s02 Tool Use (Rust)");
     println!("Enter a question, press Enter to send. Type q to quit.\n");
 
     let api_key = env::var("ANTHROPIC_AUTH_TOKEN")
@@ -189,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| ".".into())
         .to_string_lossy()
         .to_string();
-    let system = format!("You are a coding agent at {}. Use bash to solve tasks. Act, don't explain.", cwd);
+    let system = format!("You are a coding agent at {}. Use tools to solve tasks. Act, don't explain.", cwd);
 
     let mut messages: Vec<Message> = Vec::new();
 

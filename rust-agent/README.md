@@ -1,14 +1,35 @@
 # rust-agent
 
-Rust 版本的 Agent Loop 实现，对应 Python 版本的 `s01_agent_loop/code.py`。
+Rust 版本的 s02 Tool Use 实现，对应 Python 版本的 `s02_tool_use/code.py`。
 
 ## 核心原理
 
 ```
-while stop_reason == "tool_use":
-    response = LLM(messages, tools)
-    execute tools
-    append results
++----------+      +-------+      +--------------------------+
+|   User   | ---> |  LLM  | ---> | Tool Dispatch            |
+|  prompt  |      |       |      | bash       -> run_bash   |
++----------+      +---+---+      | read_file  -> run_read   |
+                          ^          | write_file -> run_write  |
+                          |          | edit_file  -> run_edit   |
+                          +----------| glob       -> run_glob   |
+                          tool_result+--------------------------+
+```
+
+**关键洞察**: 循环保持不变；只有工具注册和分发机制在增长。
+
+### 工具分发机制
+
+```rust
+fn dispatch_tool(tool_name: &str, input: &serde_json::Value) -> String {
+    match tool_name {
+        "bash" => run_bash(cmd),
+        "read_file" => run_read_file(path, limit),
+        "write_file" => run_write_file(path, content),
+        "edit_file" => run_edit_file(path, old_text, new_text),
+        "glob" => run_glob(pattern),
+        _ => format!("Unknown tool: {}", tool_name),
+    }
+}
 ```
 
 ## 安装
@@ -39,6 +60,7 @@ cargo run --release
 
 ## 尝试的示例
 
-1. `Create a file called hello.py that prints "Hello, World!"`
-2. `List all Python files in this directory`
-3. `What is the current git branch?`
+1. `Read the file README.md and tell me what this project is about`
+2. `Create a file called test.py that prints "hello", then read it back`
+3. `Find all Python files in this directory`
+4. `Read both README.md and requirements.txt, then create a summary file`
