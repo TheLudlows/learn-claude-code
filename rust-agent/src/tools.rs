@@ -255,6 +255,13 @@ pub fn dispatch_tool(tool_name: &str, input: &serde_json::Value) -> String {
             let pattern = input.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
             run_glob(pattern)
         }
+        "todo_write" => {
+            if let Some(todos) = input.get("todos") {
+                crate::todo::run_todo_write(todos)
+            } else {
+                "Error: missing todos".to_string()
+            }
+        }
         _ => format!("Unknown tool: {}", tool_name),
     }
 }
@@ -330,6 +337,28 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                     "pattern": { "type": "string" }
                 },
                 "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
+            name: "todo_write".to_string(),
+            description: "Create and manage a task list for your current coding session.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "minLength": 1},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["todos"]
             }),
         },
     ]
