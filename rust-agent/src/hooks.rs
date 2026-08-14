@@ -17,6 +17,8 @@ hooks.rs - 钩子系统 (s04)
 具体逻辑全在回调里 —— 这正是 s04 的要点。
 */
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::client::Message;
 use crate::tools::workdir;
 
@@ -85,6 +87,29 @@ impl Hooks {
             }
         }
         None
+    }
+}
+
+/// 自上次 todo_write 以来的轮次计数器
+static ROUNDS_SINCE_TODO: AtomicUsize = AtomicUsize::new(0);
+
+/// PostToolUse: 在 3 轮未使用 todo_write 时注入提醒
+pub fn todo_reminder_hook(
+    name: &str,
+    _input: &serde_json::Value,
+    _output: &str,
+) -> Option<String> {
+    if name == "todo_write" {
+        ROUNDS_SINCE_TODO.store(0, Ordering::SeqCst);
+        None
+    } else {
+        let count = ROUNDS_SINCE_TODO.fetch_add(1, Ordering::SeqCst) + 1;
+        if count >= 3 {
+            ROUNDS_SINCE_TODO.store(0, Ordering::SeqCst);
+            Some("<reminder>Update your todos.</reminder>".to_string())
+        } else {
+            None
+        }
     }
 }
 
