@@ -6,7 +6,7 @@ TodoManager 管理任务列表，提供验证和渲染功能。
 */
 
 use std::sync::OnceLock;
-use parking_lot::RwLock;
+use std::sync::RwLock;
 
 /// 单个待办事项
 #[derive(Clone, Debug)]
@@ -136,7 +136,8 @@ fn get_instance() -> &'static RwLock<TodoManager> {
 
 /// todo_write 工具处理函数
 pub fn run_todo_write(todos: &serde_json::Value) -> String {
-    let result = get_instance().write().update(todos);
+    let mut guard = get_instance().write().unwrap_or_else(|e| e.into_inner());
+    let result = guard.update(todos);
 
     match result {
         Ok(rendered) => {
