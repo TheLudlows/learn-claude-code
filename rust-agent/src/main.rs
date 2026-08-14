@@ -42,7 +42,7 @@ mod tools;
 
 use client::{Client, ContentBlock, Message};
 use dotenv::dotenv;
-use hooks::{context_inject_hook, large_output_hook, log_hook, summary_hook, Hooks};
+use hooks::{context_inject_hook, large_output_hook, log_hook, summary_hook, todo_reminder_hook, Hooks};
 use permission::permission_hook;
 use std::env;
 use std::io::{self, Write};
@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string_lossy()
         .to_string();
     let system = format!(
-        "You are a coding agent at {} on {}. Use tools to solve tasks. Act, don't explain.",
+        "You are a coding agent at {} on {}. Before starting any multi-step task, use todo_write to plan your steps. Update status as you go. Use tools to solve tasks. Act, don't explain.",
         cwd, env::consts::OS
     );
 
@@ -146,8 +146,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     hooks.on_pre_tool(log_hook);
     hooks.on_post_tool(large_output_hook);
     hooks.on_stop(summary_hook);
+    hooks.on_post_tool(todo_reminder_hook);
 
     let mut messages: Vec<Message> = Vec::new();
+
+    // 初始化 TodoManager 并设置全局实例
+    let todo_manager = todo::TodoManager::new();
+    todo::set_instance(todo_manager);
 
     loop {
         print!("\x1b[36m You >> \x1b[0m");

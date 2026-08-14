@@ -98,17 +98,14 @@ pub fn todo_reminder_hook(
     name: &str,
     _input: &serde_json::Value,
     _output: &str,
-) -> Option<String> {
+) {
     if name == "todo_write" {
         ROUNDS_SINCE_TODO.store(0, Ordering::SeqCst);
-        None
     } else {
         let count = ROUNDS_SINCE_TODO.fetch_add(1, Ordering::SeqCst) + 1;
         if count >= 3 {
             ROUNDS_SINCE_TODO.store(0, Ordering::SeqCst);
-            Some("<reminder>Update your todos.</reminder>".to_string())
-        } else {
-            None
+            println!("\x1b[33m[REMINDER] Update your todos.\x1b[0m");
         }
     }
 }
