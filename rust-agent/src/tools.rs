@@ -34,15 +34,10 @@ fn safe_path(path_str: &str) -> Result<PathBuf, String> {
 }
 
 /// 执行 bash 命令
+///
+/// 危险命令的拦截已移至 permission::permission_hook 闸门(s03/s04),
+/// 在到达这里之前就已被拒; safe_path 仍是文件工具的工作区沙箱。
 fn run_bash(command: &str) -> String {
-    let dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
-
-    for d in dangerous {
-        if command.contains(d) {
-            return "Error: Dangerous command blocked".to_string();
-        }
-    }
-
     match Command::new("bash")
         .arg("-c")
         .arg(command)
@@ -130,34 +125,96 @@ fn run_edit_file(path: &str, old_text: &str, new_text: &str) -> String {
     }
 }
 
-/// 查找匹配的文件
-fn run_glob(pattern: &str) -> String {
-    let workdir = workdir();
-    let mut results = Vec::new();
+/// 把路径分隔符统一成 `/`（Windows 上 `strip_prefix` 给的是 `\`），方便做 glob 匹配。
+fn to_unix_path(p: &str) -> String {
+    p.replace('\\', "/")
+}
 
-    // 简单的 glob 实现
-    let pattern_suffix = pattern.replace("**", "");
+/// 单个路径段是否匹配单个模式段（段内不含 `/`）。
+/// `*` 匹配任意长度（含空）的字符；`?` 匹配单个字符；其余按字面量。
+fn seg_match(pat: &[u8], text: &[u8]) -> bool {
+    let (mut pi, mut ti) = (0, 0);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0;
+    while ti < text.len() {
+        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == b'*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
 
-    fn walk_dir(dir: &Path, pattern: &str, results: &mut Vec<String>, workdir: &Path) {
+/// 判断 `path`（`/` 分隔的相对路径）是否匹配 glob `pattern`。
+/// `*` 匹配一段内的任意字符；`**` 作为独立段时匹配零或多个整段路径。
+fn glob_match(pattern: &str, path: &str) -> bool {
+    fn rec(pat: &[&str], txt: &[&str]) -> bool {
+        if pat.is_empty() {
+            return txt.is_empty();
+        }
+        if pat[0] == "**" {
+            // ** 匹配零或多个整段：先试零段，失败再吃掉一段 txt
+            if rec(&pat[1..], txt) {
+                return true;
+            }
+            if !txt.is_empty() {
+                return rec(pat, &txt[1..]);
+            }
+            false
+        } else {
+            // 普通段必须恰好匹配一个 txt 段
+            if txt.is_empty() || !seg_match(pat[0].as_bytes(), txt[0].as_bytes()) {
+                return false;
+            }
+            rec(&pat[1..], &txt[1..])
+        }
+    }
+    let pat: Vec<&str> = pattern.split('/').collect();
+    let txt: Vec<&str> = path.split('/').collect();
+    rec(&pat, &txt)
+}
+
+/// 在 `base` 下递归收集所有匹配 glob `pattern` 的相对路径（`/` 分隔）。
+fn glob_in(pattern: &str, base: &Path) -> Vec<String> {
+    let mut results: Vec<String> = Vec::new();
+
+    fn walk(dir: &Path, base: &Path, pattern: &str, results: &mut Vec<String>) {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.contains(pattern) || pattern == "*" {
-                        if let Ok(rel) = path.strip_prefix(workdir) {
-                            results.push(rel.to_string_lossy().to_string());
-                        }
+                if let Ok(rel) = path.strip_prefix(base) {
+                    let rel = to_unix_path(&rel.to_string_lossy());
+                    if glob_match(pattern, &rel) {
+                        results.push(rel);
                     }
                 }
                 if path.is_dir() {
-                    walk_dir(&path, pattern, results, workdir);
+                    walk(&path, base, pattern, results);
                 }
             }
         }
     }
 
-    walk_dir(&workdir, &pattern_suffix, &mut results, &workdir);
+    walk(base, base, pattern, &mut results);
+    results
+}
 
+/// 查找匹配的文件（按 glob 规则匹配相对路径，递归整个工作区）
+fn run_glob(pattern: &str) -> String {
+    let results = glob_in(pattern, &workdir());
     if results.is_empty() {
         "(no matches)".to_string()
     } else {
@@ -206,7 +263,7 @@ pub fn dispatch_tool(tool_name: &str, input: &serde_json::Value) -> String {
 ///
 /// 这些定义告诉模型有什么工具可用、每个工具的输入参数是什么。
 /// 加一个新工具只需要在这里加一条 ToolDefinition。
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -276,4 +333,85 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+#[cfg(test)]
+mod test_tool {
+    use crate::tools::run_glob;
+
+    #[test]
+    fn test_glob() {
+        let r = run_glob("**/*.txt");
+        print!("{}", r)
+    }
+}
+
+#[cfg(test)]
+mod glob_match_tests {
+    use super::*;
+
+    #[test]
+    fn literal_exact() {
+        assert!(glob_match("a.rs", "a.rs"));
+        assert!(!glob_match("a.rs", "b.rs"));
+        assert!(!glob_match("src", "src_backup")); // 段必须整体匹配，不做子串
+        assert!(!glob_match("src", "src/a.rs"));   // 段数不等
+    }
+
+    #[test]
+    fn star_within_segment() {
+        assert!(glob_match("*.rs", "a.rs"));
+        assert!(glob_match("*.rs", "tools.rs"));
+        assert!(!glob_match("*.rs", "src"));        // 缺 .rs
+        assert!(!glob_match("*.rs", "src/a.rs"));  // * 不跨段
+        assert!(glob_match("a*.rs", "abc.rs"));
+        assert!(glob_match("a*z", "abcxyz"));
+        assert!(!glob_match("a*.rs", "abc.txt"));
+    }
+
+    #[test]
+    fn question_mark() {
+        assert!(glob_match("?.rs", "a.rs"));
+        assert!(glob_match("?.rs", "b.rs"));
+        assert!(!glob_match("?.rs", "ab.rs"));     // ? 只配一个字符
+        assert!(!glob_match("?.rs", ".rs"));        // ? 至少要有一个
+    }
+
+    #[test]
+    fn double_star_recursive() {
+        assert!(glob_match("**", "a.rs"));
+        assert!(glob_match("**", "src/a.rs"));
+        assert!(glob_match("**", "src/sub/a.rs"));
+        assert!(glob_match("**/*.rs", "a.rs"));      // ** 匹配零段
+        assert!(glob_match("**/*.rs", "src/a.rs"));
+        assert!(glob_match("**/*.rs", "src/sub/a.rs"));
+        assert!(glob_match("src/**/*.rs", "src/a.rs"));
+        assert!(glob_match("src/**/*.rs", "src/sub/a.rs"));
+        assert!(!glob_match("src/**/*.rs", "a.rs"));      // 不在 src 下
+        assert!(!glob_match("src/**/*.rs", "test/a.rs")); // 前缀不符
+    }
+
+    #[test]
+    fn glob_in_walks_tree() {
+        let dir = std::env::temp_dir().join("rust-agent-glob-test-walk");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("a.rs"), b"").unwrap();
+        std::fs::write(dir.join("b.txt"), b"").unwrap();
+        std::fs::write(dir.join("src").join("c.rs"), b"").unwrap();
+
+        let mut got = glob_in("**/*.rs", &dir);
+        got.sort();
+        let mut want = vec!["a.rs".to_string(), "src/c.rs".to_string()];
+        want.sort();
+        assert_eq!(got, want);
+
+        let mut top = glob_in("*.rs", &dir);
+        top.sort();
+        assert_eq!(top, vec!["a.rs".to_string()]);
+
+        assert_eq!(glob_in("zzz", &dir), Vec::<String>::new());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
