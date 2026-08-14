@@ -25,7 +25,7 @@ use crate::tools::workdir;
 // ---- 回调类型 ----
 pub type PromptHook = fn(&str);
 pub type PreToolHook = fn(&str, &serde_json::Value) -> Option<String>;
-pub type PostToolHook = fn(&str, &serde_json::Value, &str);
+pub type PostToolHook = fn(&str, &serde_json::Value, &str) -> Option<String>;
 pub type StopHook = fn(&[Message]) -> Option<String>;
 
 /// 钩子注册表: 事件 -> 回调列表。
@@ -98,14 +98,17 @@ pub fn todo_reminder_hook(
     name: &str,
     _input: &serde_json::Value,
     _output: &str,
-) {
+) -> Option<String> {
     if name == "todo_write" {
         ROUNDS_SINCE_TODO.store(0, Ordering::SeqCst);
+        None
     } else {
         let count = ROUNDS_SINCE_TODO.fetch_add(1, Ordering::SeqCst) + 1;
         if count >= 3 {
             ROUNDS_SINCE_TODO.store(0, Ordering::SeqCst);
-            println!("\x1b[33m[REMINDER] Update your todos.\x1b[0m");
+            Some("<reminder>Update your todos.</reminder>".to_string())
+        } else {
+            None
         }
     }
 }
@@ -138,7 +141,7 @@ pub fn log_hook(name: &str, input: &serde_json::Value) -> Option<String> {
 }
 
 /// PostToolUse: 输出过大时提醒。
-pub fn large_output_hook(name: &str, _input: &serde_json::Value, output: &str) {
+pub fn large_output_hook(name: &str, _input: &serde_json::Value, output: &str) -> Option<String> {
     if output.len() > 100_000 {
         println!(
             "\x1b[33m[HOOK] Large output from {}: {} chars\x1b[0m",
@@ -146,6 +149,7 @@ pub fn large_output_hook(name: &str, _input: &serde_json::Value, output: &str) {
             output.len()
         );
     }
+    None
 }
 
 /// Stop: 收尾统计本轮用过的工具次数。
