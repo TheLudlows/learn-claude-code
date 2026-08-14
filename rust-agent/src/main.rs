@@ -37,6 +37,7 @@ Key insight: the loop stays the same; only the four trigger points are wired in.
 mod client;
 mod hooks;
 mod permission;
+mod todo;
 mod tools;
 
 use client::{Client, ContentBlock, Message};
