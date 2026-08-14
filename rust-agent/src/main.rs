@@ -97,7 +97,13 @@ async fn agent_loop(
                 }
 
                 let output = dispatch_tool(name, input);
-                hooks.trigger_post_tool(name, input, &output);
+                if let Some(msg) = hooks.trigger_post_tool(name, input, &output) {
+                    tool_results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: msg,
+                    });
+                    continue;
+                }
 
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),

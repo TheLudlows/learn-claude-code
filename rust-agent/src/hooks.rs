@@ -72,11 +72,14 @@ impl Hooks {
         None
     }
 
-    /// 工具执行后触发。返回值不参与控制流。
-    pub fn trigger_post_tool(&self, name: &str, input: &serde_json::Value, output: &str) {
+    /// 工具执行后触发。返回 Some(msg) -> 注入 msg 并继续, 不退出。
+    pub fn trigger_post_tool(&self, name: &str, input: &serde_json::Value, output: &str) -> Option<String> {
         for f in &self.post_tool {
-            f(name, input, output);
+            if let Some(msg) = f(name, input, output) {
+                return Some(msg);
+            }
         }
+        None
     }
 
     /// 循环即将退出时触发。返回 Some(msg) -> 注入 msg 并继续, 不退出。
