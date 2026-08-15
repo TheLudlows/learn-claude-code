@@ -58,7 +58,7 @@ fn check_rules(name: &str, input: &serde_json::Value) -> Option<&'static str> {
                 return Some("Access outside workspace");
             }
         }
-        "bash" => {
+        "command" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if ["rm ", "> /etc/", "chmod 777"].iter().any(|kw| cmd.contains(kw)) {
                 return Some("Potentially destructive command");
@@ -87,7 +87,7 @@ fn ask_user(name: &str, input: &serde_json::Value, reason: &str) -> bool {
 /// 末尾 `return false` 把所有工具都拒掉的 bug。
 pub fn permission_hook(name: &str, input: &serde_json::Value) -> Option<String> {
     // 闸门 1: 硬拒绝
-    if name == "bash" {
+    if name == "command" {
         let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
         if let Some(p) = check_deny_list(cmd) {
             println!("\n\x1b[31m[blocked] '{}' is on the deny list\x1b[0m", p);
@@ -134,15 +134,15 @@ mod tests {
     #[test]
     fn rules_fire_on_destructive() {
         let rm = serde_json::json!({"command": "rm test.txt"});
-        assert_eq!(check_rules("bash", &rm), Some("Potentially destructive command"));
-        assert_eq!(check_rules("bash", &serde_json::json!({"command":"ls"})), None);
+        assert_eq!(check_rules("command", &rm), Some("Potentially destructive command"));
+        assert_eq!(check_rules("command", &serde_json::json!({"command":"ls"})), None);
     }
 
     #[test]
     fn permission_hook_allows_safe() {
         // 安全命令: 不进 deny list, 不命中规则 -> 放行(且不读 stdin)
         assert_eq!(
-            permission_hook("bash", &serde_json::json!({"command": "ls"})),
+            permission_hook("command", &serde_json::json!({"command": "ls"})),
             None
         );
     }
@@ -151,7 +151,7 @@ mod tests {
     fn permission_hook_blocks_deny_list() {
         // 命中闸门 1, 直接拦截(且不读 stdin)
         assert_eq!(
-            permission_hook("bash", &serde_json::json!({"command": "sudo apt update"})),
+            permission_hook("command", &serde_json::json!({"command": "sudo apt update"})),
             Some("Permission denied: 'sudo' on deny list".to_string())
         );
     }

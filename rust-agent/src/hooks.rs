@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn empty_registry_allows() {
         let h = Hooks::new();
-        assert!(h.trigger_pre_tool("bash", &serde_json::json!({})).is_none());
+        assert!(h.trigger_pre_tool("command", &serde_json::json!({})).is_none());
     }
 
     #[test]
@@ -196,7 +196,7 @@ mod tests {
         h.on_pre_tool(always_block);
         h.on_pre_tool(panic_if_called); // 没短路就会 panic
         assert_eq!(
-            h.trigger_pre_tool("bash", &serde_json::json!({})),
+            h.trigger_pre_tool("command", &serde_json::json!({})),
             Some("nope".to_string())
         );
     }
@@ -206,7 +206,7 @@ mod tests {
         let mut h = Hooks::new();
         h.on_pre_tool(never_block);
         h.on_pre_tool(never_block);
-        assert!(h.trigger_pre_tool("bash", &serde_json::json!({})).is_none());
+        assert!(h.trigger_pre_tool("command", &serde_json::json!({})).is_none());
     }
 
     #[test]
