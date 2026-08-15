@@ -22,12 +22,14 @@ pub fn workdir() -> PathBuf {
 /// 路径安全校验 - 确保路径在工作目录内
 fn safe_path(path_str: &str) -> Result<PathBuf, String> {
     let workdir = workdir();
+    let workdir_canonical = workdir.canonicalize()
+        .map_err(|e| format!("Error: {}", e))?;
     let path = workdir.join(path_str);
     let abs_path = path.canonicalize()
-        .map_err(|e| format!("Error resolving path: {}", e))?;
+        .map_err(|e| format!("Error: {}", e))?;
 
-    if !abs_path.starts_with(&workdir) {
-        return Err(format!("Path escapes workspace: {}", path_str));
+    if !abs_path.starts_with(&workdir_canonical) {
+        return Err(format!("Error: path escapes workspace"));
     }
 
     Ok(abs_path)
@@ -216,9 +218,20 @@ fn glob_in(pattern: &str, base: &Path) -> Vec<String> {
 fn run_glob(pattern: &str) -> String {
     let results = glob_in(pattern, &workdir());
     if results.is_empty() {
-        "(no matches)".to_string()
+        "Error: no matches".to_string()
     } else {
         results.join("\n")
+    }
+}
+
+/// 添加错误前缀
+fn with_error_prefix(prefix: &str, message: &str) -> String {
+    if message.starts_with("Error:") {
+        format!("[ERROR:{}] {}", prefix, &message[7..].trim_start())
+    } else if message.starts_with("[ERROR:") {
+        message.to_string() // Already has error prefix
+    } else {
+        message.to_string()
     }
 }
 
@@ -227,8 +240,8 @@ fn run_glob(pattern: &str) -> String {
 /// 这是 s02 的核心：加一个工具只需要在这里加一个 match 分支。
 /// 循环逻辑保持不变。
 pub fn dispatch_tool(tool_name: &str, input: &serde_json::Value) -> String {
-    match tool_name {
-        "bash" => {
+    let result = match tool_name {
+        "command" => {
             if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
                 run_bash(cmd)
             } else {
@@ -262,7 +275,14 @@ pub fn dispatch_tool(tool_name: &str, input: &serde_json::Value) -> String {
                 "Error: missing todos".to_string()
             }
         }
-        _ => format!("Unknown tool: {}", tool_name),
+        _ => return format!("[ERROR:unknown] Unknown tool: {}", tool_name),
+    };
+
+    // Add error prefix for known tools
+    if result.starts_with("Error:") {
+        with_error_prefix(tool_name, &result)
+    } else {
+        result
     }
 }
 
@@ -281,7 +301,7 @@ pub struct ToolDefinition {
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
-            name: "bash".to_string(),
+            name: "command".to_string(),
             description: "Run a shell command.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -442,5 +462,61 @@ mod glob_match_tests {
         assert_eq!(glob_in("zzz", &dir), Vec::<String>::new());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_error_prefix_on_read_file_error() {
+        let result = dispatch_tool("read_file", &json!({"path": "nonexistent.txt"}));
+        assert!(result.starts_with("[ERROR:read_file]"));
+    }
+
+    #[test]
+    fn test_error_prefix_on_write_file_error() {
+        let result = dispatch_tool("write_file", &json!({"path": "/", "content": "test"}));
+        assert!(result.starts_with("[ERROR:write_file]"));
+    }
+
+    #[test]
+    fn test_error_prefix_on_command_error() {
+        let result = dispatch_tool("command", &json!({}));
+        assert!(result.starts_with("[ERROR:command]"));
+    }
+
+    #[test]
+    fn test_error_prefix_on_glob_no_matches() {
+        let result = dispatch_tool("glob", &json!({"pattern": "**/*.zzzzzzzzz"}));
+        assert!(result.starts_with("[ERROR:glob]"));
+    }
+
+    #[test]
+    fn test_no_error_prefix_on_success() {
+        // Create a temp file for testing
+        use std::fs;
+        let temp_file = std::env::temp_dir().join("test_read.txt");
+        fs::write(&temp_file, "hello world").unwrap();
+
+        // Change to temp dir for safe_path
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(std::env::temp_dir()).unwrap();
+
+        let result = dispatch_tool("read_file", &json!({"path": "test_read.txt"}));
+
+        std::env::set_current_dir(original_dir).unwrap();
+        fs::remove_file(temp_file).ok();
+
+        assert!(!result.starts_with("[ERROR:"));
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_error_prefix_on_unknown_tool() {
+        let result = dispatch_tool("foo_bar", &json!({}));
+        assert_eq!(result, "[ERROR:unknown] Unknown tool: foo_bar");
     }
 }
