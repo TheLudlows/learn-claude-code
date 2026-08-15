@@ -35,17 +35,27 @@ fn safe_path(path_str: &str) -> Result<PathBuf, String> {
     Ok(abs_path)
 }
 
-/// 执行 bash 命令
+/// 执行命令（跨平台）
 ///
+/// - Windows: 使用 cmd.exe
+/// - Unix: 使用 bash
 /// 危险命令的拦截已移至 permission::permission_hook 闸门(s03/s04),
 /// 在到达这里之前就已被拒; safe_path 仍是文件工具的工作区沙箱。
 fn run_bash(command: &str) -> String {
-    match Command::new("bash")
-        .arg("-c")
-        .arg(command)
-        .current_dir(workdir())
-        .output()
-    {
+    let result = if cfg!(windows) {
+        Command::new("cmd.exe")
+            .args(["/C", command])
+            .current_dir(workdir())
+            .output()
+    } else {
+        Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .current_dir(workdir())
+            .output()
+    };
+
+    match result {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);

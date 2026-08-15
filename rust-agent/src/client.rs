@@ -205,7 +205,11 @@ impl Client {
                                             .get("text")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
-                                        print!("{}", t);
+                                        if text_buf.is_empty() {
+                                            print!("\x1b[35magent\x1b[0m{}", t);
+                                        } else {
+                                            print!("{}", t);
+                                        }
                                         io::stdout().flush().ok();
                                         text_buf.push_str(t);
                                     }
@@ -282,6 +286,26 @@ impl Client {
             }
         }
 
+        // 如果有文本输出，打印换行和所有响应
+        let has_text = content.iter().any(|block| matches!(block, ContentBlock::Text { .. }));
+        if has_text {
+            println!();
+        }
+        println!("=== All Response Content ===");
+        for block in &content {
+            match block {
+                ContentBlock::Text { text } => {
+                    println!("Text: {}", text);
+                }
+                ContentBlock::ToolUse { id, name, input } => {
+                    println!("ToolUse: id={}, name={}, input={}", id, name, serde_json::to_string(input).unwrap_or_default());
+                }
+                ContentBlock::ToolResult { tool_use_id, content: result_content } => {
+                    println!("ToolResult: tool_use_id={}, content={}", tool_use_id, result_content);
+                }
+            }
+        }
+        println!("===========================");
         Ok(MessagesResponse { content, stop_reason })
     }
 }
