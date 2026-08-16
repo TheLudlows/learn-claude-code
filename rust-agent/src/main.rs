@@ -37,6 +37,7 @@ Key insight: the loop stays the same; only the four trigger points are wired in.
 mod client;
 mod hooks;
 mod permission;
+mod subagent;
 mod todo;
 mod tools;
 
@@ -47,6 +48,39 @@ use permission::permission_hook;
 use std::env;
 use std::io::{self, Write};
 use tools::{dispatch_tool, get_tool_definitions};
+
+/// 执行单个工具调用（含 hooks）
+///
+/// s06: 完整的工具执行流程：PreToolUse hook -> 执行 -> PostToolUse hook
+async fn execute_tool(
+    client: &Client,
+    name: &str,
+    input: &serde_json::Value,
+    hooks: &Hooks,
+) -> String {
+    // PreToolUse 拦截
+    if let Some(reason) = hooks.trigger_pre_tool(name, input) {
+        return reason;
+    }
+
+    // 执行工具
+    let output = if name == "task" {
+        if let Some(prompt) = input.get("prompt").and_then(|p| p.as_str()) {
+            subagent::run_subagent_loop(client, prompt, hooks).await.unwrap_or_else(|e| format!("Subagent error: {}", e))
+        } else {
+            "Error: missing prompt".to_string()
+        }
+    } else {
+        dispatch_tool(name, input)
+    };
+
+    // PostToolUse hook
+    if let Some(msg) = hooks.trigger_post_tool(name, input, &output) {
+        return msg;
+    }
+
+    output
+}
 
 /// Agent 核心循环
 ///
@@ -83,28 +117,11 @@ async fn agent_loop(
             break;
         }
 
-        // 执行工具调用: PreToolUse 拦截 -> dispatch -> PostToolUse
+        // 执行工具调用
         let mut tool_results = Vec::new();
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                // s04: hook 取代硬编码的 check_permission; Some(reason) 即拦截
-                if let Some(reason) = hooks.trigger_pre_tool(name, input) {
-                    tool_results.push(ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: reason,
-                    });
-                    continue;
-                }
-
-                let output = dispatch_tool(name, input);
-                if let Some(msg) = hooks.trigger_post_tool(name, input, &output) {
-                    tool_results.push(ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: msg,
-                    });
-                    continue;
-                }
-
+                let output = execute_tool(client, name, input, hooks).await;
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content: output,
@@ -141,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string_lossy()
         .to_string();
     let system = format!(
-        "You are a coding agent at {} on {}. Before starting any multi-step task, use todo_write to plan your steps. Update status as you go. Use tools to solve tasks. Act, don't explain.",
+        "You are a coding agent at {} on {}. Before starting any multi-step task, odo_write to plan your steps. Update status as you go.you can use tool.",
         cwd, env::consts::OS
     );
 

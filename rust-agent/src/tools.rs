@@ -300,15 +300,15 @@ pub fn dispatch_tool(tool_name: &str, input: &serde_json::Value) -> String {
 ///
 /// 这些定义告诉模型有什么工具可用、每个工具的输入参数是什么。
 /// 加一个新工具只需要在这里加一条 ToolDefinition。
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
 }
 
-/// 获取工具定义列表
-pub fn get_tool_definitions() -> Vec<ToolDefinition> {
+/// 基础工具定义（不含 task，用于子 agent）
+fn get_base_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "command".to_string(),
@@ -369,29 +369,34 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["pattern"]
             }),
         },
-        ToolDefinition {
-            name: "todo_write".to_string(),
-            description: "Create and manage a task list for your current coding session.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "todos": {
-                        "type": "array",
-                        "maxItems": 20,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": {"type": "string", "minLength": 1},
-                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
-                            },
-                            "required": ["content", "status"]
-                        }
-                    }
-                },
-                "required": ["todos"]
-            }),
-        },
     ]
+}
+
+/// s06: task 工具定义
+fn get_task_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "task".to_string(),
+        description: "Run a subagent with fresh conversation context and return its final text.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string" }
+            },
+            "required": ["prompt"]
+        }),
+    }
+}
+
+/// 获取子 agent 的工具列表（不含 task 工具，防止递归）
+pub fn get_subagent_tool_definitions() -> Vec<ToolDefinition> {
+    get_base_tool_definitions()
+}
+
+/// 获取完整工具列表（含 task 工具，用于父 agent）
+pub fn get_tool_definitions() -> Vec<ToolDefinition> {
+    let mut tools = get_base_tool_definitions();
+    tools.push(get_task_tool_definition());
+    tools
 }
 
 #[cfg(test)]

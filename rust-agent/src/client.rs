@@ -206,9 +206,9 @@ impl Client {
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
                                         if text_buf.is_empty() {
-                                            print!("\x1b[35magent\x1b[0m{}", t);
+                                            print!("\x1b[35magent>>\x1b[0m{}", t);
                                         } else {
-                                            print!("{}", t);
+                                            print!("\x1b[35m{}\x1b[0m", t);
                                         }
                                         io::stdout().flush().ok();
                                         text_buf.push_str(t);
