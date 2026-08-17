@@ -19,6 +19,7 @@ pub mod edit_file;
 pub mod glob;
 pub mod load_skill;
 pub mod todo_write;
+pub mod task;
 
 // Re-exports for convenient access
 pub use self::registry::ToolRegistry;
@@ -447,8 +448,8 @@ pub fn build_registry() -> ToolRegistry {
     // Task 11: Todo write tool for updating todo tasks
     registry.register(Box::new(crate::tools::todo_write::TodoWriteTool));
 
-    // Task 12: Future tool (to be implemented)
-    // registry.register(Box::new(AnotherTool));
+    // Task 12: Task tool for running subagents
+    registry.register(Box::new(crate::tools::task::TaskTool));
 
     registry
 }
