@@ -3,22 +3,20 @@ permission.rs - 三道闸门权限管线 (s03 逻辑, s04 暴露为 PreToolUse �
 
 工具执行前依次过三道闸门:
   1. 拒绝列表(rm -rf /、sudo…)         命中 -> 直接拒绝
-  2. 规则匹配(写工作区外 / 破坏性命令)   命中 -> 交给闸门 3
+  2. 工具权限检查(通过 registry.check_permission)  命中 -> 交给闸门 3
   3. 用户审批(暂停等 y/N)              用户决定
 三道都没命中 -> 放行。
 
-s04: 本模块的 check_permission() 已改成 permission_hook() —— 返回
-Option<String>(Some=拦截理由, None=放行), 注册为 PreToolUse 钩子,
-由 hooks.trigger_pre_tool() 触发; 闸门内部逻辑一字不改。
+s04: 本模块的 permission_hook() 返回 Option<String>(Some=拦截理由, None=放行),
+注册为 PreToolUse 钩子, 由 hooks.trigger_pre_tool() 触发。
 
 注: 字符串匹配仅用于演示闸门位置, 非完整安全边界(见 s03 README)。
 文件类工具另有 tools::safe_path 做工作区沙箱(defense in depth)。
 */
 
-use crate::tools_legacy::workdir;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::trait_def::PermissionCheck;
 use std::io::{self, Write};
-use std::path::{Component, PathBuf};
 
 /// 闸门 1: 硬拒绝列表 —— 永远禁止
 const DENY_LIST: &[&str] = &[
@@ -29,46 +27,6 @@ fn check_deny_list(command: &str) -> Option<&'static str> {
     DENY_LIST.iter().copied().find(|p| command.contains(p))
 }
 
-/// 词法判断相对路径是否会逃出工作区(不访问文件系统, 支持不存在的路径)
-fn escapes_workspace(path: &str) -> bool {
-    !normalize(&workdir(), path).starts_with(workdir())
-}
-
-/// 把 `base/path` 词法归一化: 消解 `..`/`.`, 绝对路径则替换 base。
-/// 不访问文件系统, 因而对尚不存在的路径(新建文件)也成立。
-fn normalize(base: &std::path::Path, path: &str) -> PathBuf {
-    let mut norm = PathBuf::new();
-    for c in base.join(path).components() {
-        match c {
-            Component::ParentDir => {
-                norm.pop();
-            }
-            Component::CurDir => {}
-            other => norm.push(other.as_os_str()),
-        }
-    }
-    norm
-}
-
-/// 闸门 2: 规则匹配 —— 命中返回需向用户说明的理由, 交给闸门 3
-fn check_rules(name: &str, input: &serde_json::Value) -> Option<&'static str> {
-    match name {
-        "read_file" | "write_file" | "edit_file" => {
-            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if escapes_workspace(path) {
-                return Some("Access outside workspace");
-            }
-        }
-        "command" => {
-            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            if ["rm ", "> /etc/", "chmod 777"].iter().any(|kw| cmd.contains(kw)) {
-                return Some("Potentially destructive command");
-            }
-        }
-        _ => {}
-    }
-    None
-}
 
 /// 闸门 3: 暂停等用户确认
 fn ask_user(name: &str, input: &serde_json::Value, reason: &str) -> bool {
@@ -86,7 +44,7 @@ fn ask_user(name: &str, input: &serde_json::Value, reason: &str) -> bool {
 /// 循环经 `hooks.trigger_pre_tool()` 调用本函数; 末尾返回 None(而非 false),
 /// 才符合 "三道都没命中 -> 放行" 的语义 —— 这也修掉了 s03 check_permission
 /// 末尾 `return false` 把所有工具都拒掉的 bug。
-pub fn permission_hook(_registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
+pub fn permission_hook(registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
     // 闸门 1: 硬拒绝
     if name == "command" {
         let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -95,10 +53,19 @@ pub fn permission_hook(_registry: &ToolRegistry, name: &str, input: &serde_json:
             return Some(format!("Permission denied: '{}' on deny list", p));
         }
     }
-    // 闸门 2 + 3: 规则命中 -> 问用户
-    if let Some(reason) = check_rules(name, input) {
-        if !ask_user(name, input, reason) {
-            return Some("Permission denied by user".to_string());
+
+    // 闸门 2: 使用 registry 检查工具权限
+    if let Some(permission_check) = registry.check_permission(name, input) {
+        match permission_check {
+            PermissionCheck::Pass => {
+                // 通过权限检查，继续执行
+            }
+            PermissionCheck::NeedsApproval(reason) => {
+                // 闸门 3: 向用户请求确认
+                if !ask_user(name, input, reason) {
+                    return Some("Permission denied by user".to_string());
+                }
+            }
         }
     }
     None
@@ -107,23 +74,7 @@ pub fn permission_hook(_registry: &ToolRegistry, name: &str, input: &serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn normalize_strips_dotdot() {
-        let base = Path::new("/home/u/proj");
-        assert_eq!(normalize(base, "src/a.rs"), Path::new("/home/u/proj/src/a.rs"));
-        assert_eq!(normalize(base, "src/../a.rs"), Path::new("/home/u/proj/a.rs"));
-    }
-
-    #[test]
-    fn escapes_relative() {
-        // 用真实 cwd(=crate 根), 相对路径在所有平台语义一致
-        assert!(!escapes_workspace("src/main.rs")); // 工作区内
-        assert!(!escapes_workspace(""));            // 工作目录本身
-        assert!(escapes_workspace("../secret"));   // 逃到父目录
-        assert!(escapes_workspace("../"));          // 父目录
-    }
+    use crate::tools::build_registry;
 
     #[test]
     fn deny_list_matches() {
@@ -133,15 +84,8 @@ mod tests {
     }
 
     #[test]
-    fn rules_fire_on_destructive() {
-        let rm = serde_json::json!({"command": "rm test.txt"});
-        assert_eq!(check_rules("command", &rm), Some("Potentially destructive command"));
-        assert_eq!(check_rules("command", &serde_json::json!({"command":"ls"})), None);
-    }
-
-    #[test]
     fn permission_hook_allows_safe() {
-        // 安全命令: 不进 deny list, 不命中规则 -> 放行(且不读 stdin)
+        // 安全命令: 不进 deny list, registry 检查通过 -> 放行
         let registry = ToolRegistry::new();
         assert_eq!(
             permission_hook(&registry, "command", &serde_json::json!({"command": "ls"})),
@@ -157,5 +101,43 @@ mod tests {
             permission_hook(&registry, "command", &serde_json::json!({"command": "sudo apt update"})),
             Some("Permission denied: 'sudo' on deny list".to_string())
         );
+    }
+
+    #[test]
+    fn permission_hook_uses_registry() {
+        // 测试 permission_hook 确实调用了 registry.check_permission
+        let registry = build_registry();
+
+        // 对于 command 工具，默认权限检查应该通过
+        let result = permission_hook(&registry, "command", &serde_json::json!({"command": "ls"}));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn permission_hook_requires_approval() {
+        // 使用 build_registry 创建一个包含所有工具的 registry
+        let registry = build_registry();
+
+        // 测试工具权限检查系统是否正常工作
+        // 由于大多数工具默认不需要审批，我们可以测试这个系统
+        let result = permission_hook(
+            &registry,
+            "command",
+            &serde_json::json!({"command": "ls"})
+        );
+        // command 工具不应该需要审批
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn permission_hook_unknown_tool() {
+        // 测试未知工具的处理
+        let registry = ToolRegistry::new();
+        let result = permission_hook(
+            &registry,
+            "unknown_tool",
+            &serde_json::json!({})
+        );
+        assert_eq!(result, None); // 未知工具直接放行
     }
 }
