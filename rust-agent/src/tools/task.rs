@@ -64,7 +64,7 @@ impl Tool for TaskTool {
                 .unwrap_or(30) as usize;
 
             // Use the client from the tool context (it's guaranteed to be available)
-            match run_subagent_loop(&ctx.client, &ctx.registry, prompt, &ctx.hooks).await {
+            match run_subagent_loop(ctx.client, ctx.registry, prompt, ctx.hooks).await {
                 Ok(summary) => {
                     format!("Task completed:\n\n{}", summary)
                 }

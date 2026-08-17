@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 /// Write File Tool for writing file contents
-
+///
 /// This tool allows the AI agent to write file contents safely.
 /// It includes path safety checks to ensure files are written within the workspace.
 pub struct WriteFileTool;

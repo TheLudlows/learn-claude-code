@@ -37,8 +37,7 @@ Key insight: the loop stays the same; only the four trigger points are wired in.
 use rust_agent::client::{Client, ContentBlock, Message};
 use rust_agent::hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
 use rust_agent::permission::permission_hook;
-use rust_agent::tools::{build_registry, ToolContext, ToolRegistry};
-use rust_agent::tools_legacy::get_tool_definitions;
+use rust_agent::tools::{ToolContext, ToolRegistry};
 use dotenv::dotenv;
 use std::env;
 use std::io::{self, Write};
@@ -122,7 +121,7 @@ async fn agent_loop(
         let mut reminders: Vec<String> = Vec::new();
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                let tool_output = execute_tool(client, &registry, name, input, hooks).await;
+                let tool_output = execute_tool(client, registry, name, input, hooks).await;
                 // 打印工具执行结果（此前只喂回 LLM，用户看不到工具返回了什么）
                 {
                     let mut out = io::stdout().lock();

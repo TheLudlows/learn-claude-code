@@ -66,21 +66,20 @@ impl Tool for CommandTool {
             }
 
             // Single file deletion to critical directories
-            if command_lower.contains("rm ") || command_lower.contains("rm -") {
-                if command_lower.contains("/etc/") ||
-                   command_lower.contains("/usr/") ||
-                   command_lower.contains("/lib/") ||
-                   command_lower.contains("/bin/") ||
-                   command_lower.contains("/sbin/") ||
-                   command_lower.contains("/var/") ||
-                   command_lower.contains("/opt/") ||
-                   command_lower.contains("/boot/") ||
-                   command_lower.contains("/home/") ||
-                   command_lower.contains("/root/") {
-                    return PermissionCheck::NeedsApproval(
-                        "This command attempts to delete critical system files. This action requires explicit approval."
-                    );
-                }
+            if (command_lower.contains("rm ") || command_lower.contains("rm -")) &&
+               (command_lower.contains("/etc/") ||
+                command_lower.contains("/usr/") ||
+                command_lower.contains("/lib/") ||
+                command_lower.contains("/bin/") ||
+                command_lower.contains("/sbin/") ||
+                command_lower.contains("/var/") ||
+                command_lower.contains("/opt/") ||
+                command_lower.contains("/boot/") ||
+                command_lower.contains("/home/") ||
+                command_lower.contains("/root/")) {
+                return PermissionCheck::NeedsApproval(
+                    "This command attempts to delete critical system files. This action requires explicit approval."
+                );
             }
 
             // Critical system modifications
@@ -114,14 +113,13 @@ impl Tool for CommandTool {
             }
 
             // Dangerous system operations
-            if command_lower.contains("fdisk ") ||
-               command_lower.contains("mkfs ") ||
-               command_lower.contains("dd ") {
-                if command_lower.contains("/dev/sd") || command_lower.contains("/dev/hd") {
-                    return PermissionCheck::NeedsApproval(
-                        "This command modifies disk partitions or filesystems. This action requires explicit approval."
-                    );
-                }
+            if (command_lower.contains("fdisk ") ||
+                command_lower.contains("mkfs ") ||
+                command_lower.contains("dd ")) &&
+               (command_lower.contains("/dev/sd") || command_lower.contains("/dev/hd")) {
+                return PermissionCheck::NeedsApproval(
+                    "This command modifies disk partitions or filesystems. This action requires explicit approval."
+                );
             }
         }
 

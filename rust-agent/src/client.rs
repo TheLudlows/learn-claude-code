@@ -1,4 +1,4 @@
-use crate::tools_legacy::ToolDefinition;
+use crate::tools::trait_def::ToolDefinition;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 

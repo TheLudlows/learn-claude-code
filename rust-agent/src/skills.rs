@@ -122,6 +122,11 @@ impl SkillLoader {
         self.skills.len()
     }
 
+    /// 检查是否有技能。
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty()
+    }
+
     /// 技能目录（仅 name + description），编入 system prompt。
     /// 每行 `- {name}: {description}`；无技能时返回空串。
     pub fn catalog(&self) -> String {

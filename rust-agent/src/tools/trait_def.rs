@@ -32,6 +32,14 @@ pub struct ToolContext<'a> {
     pub registry: &'a crate::tools::registry::ToolRegistry,
 }
 
+/// Tool definition structure for API integration
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
 /// Async trait that all tools must implement
 ///
 /// This trait defines the interface that all tools in the system must follow.

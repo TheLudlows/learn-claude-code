@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::client::{ContentBlock, Message};
 use crate::tools::registry::ToolRegistry;
-use crate::tools_legacy::workdir;
+use crate::tools::workdir;
 
 // ---- 回调类型 ----
 pub type PromptHook = fn(&str);

@@ -24,9 +24,7 @@ pub mod task;
 // Re-exports for convenient access
 pub use self::registry::ToolRegistry;
 pub use self::trait_def::{PermissionCheck, Tool, ToolContext};
-pub use crate::tools_legacy::ToolDefinition;
-
-// Shared utility functions from tools_legacy.rs
+pub 
 
 use std::env;
 use std::fs;

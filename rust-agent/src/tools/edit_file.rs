@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 /// Edit File Tool for editing file contents
-
+///
 /// This tool allows the AI agent to edit file contents safely by replacing specific text.
 /// It includes path safety checks to ensure files are edited within the workspace.
 pub struct EditFileTool;
