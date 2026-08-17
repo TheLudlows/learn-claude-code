@@ -14,10 +14,11 @@ pub mod registry;
 // Tool module implementations
 pub mod command;
 pub mod read_file;
-// Placeholder declarations for future tool modules
-// pub mod write_file;
-// pub mod edit_file;
-// pub mod glob;
+pub mod write_file;
+pub mod edit_file;
+pub mod glob;
+pub mod load_skill;
+pub mod todo_write;
 
 // Re-exports for convenient access
 pub use self::registry::ToolRegistry;
@@ -431,11 +432,23 @@ pub fn build_registry() -> ToolRegistry {
     // Task 6: Read file tool for reading file contents
     registry.register(Box::new(crate::tools::read_file::ReadFileTool));
 
-    // Future tools (to be implemented in Tasks 7-12):
-    // registry.register(Box::new(WriteFileTool));
-    // registry.register(Box::new(EditFileTool));
-    // registry.register(Box::new(GlobTool));
-    // ...
+    // Task 7: Write file tool for writing file contents
+    registry.register(Box::new(crate::tools::write_file::WriteFileTool));
+
+    // Task 8: Edit file tool for editing file contents
+    registry.register(Box::new(crate::tools::edit_file::EditFileTool));
+
+    // Task 9: Glob tool for file pattern matching
+    registry.register(Box::new(crate::tools::glob::GlobTool));
+
+    // Task 10: Load skill tool for loading skill definitions
+    registry.register(Box::new(crate::tools::load_skill::LoadSkillTool));
+
+    // Task 11: Todo write tool for updating todo tasks
+    registry.register(Box::new(crate::tools::todo_write::TodoWriteTool));
+
+    // Task 12: Future tool (to be implemented)
+    // registry.register(Box::new(AnotherTool));
 
     registry
 }
