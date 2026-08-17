@@ -10,8 +10,7 @@
 
 use crate::client::{Client, ContentBlock, Message};
 use crate::hooks::{assemble_post_tool_messages, Hooks};
-use crate::tools::registry::ToolRegistry;
-use crate::tools_legacy::{dispatch_tool, get_subagent_tool_definitions};
+use crate::tools::{ToolContext, ToolRegistry};
 
 /// 子 agent 的最大轮数限制
 const MAX_SUBAGENT_TURNS: usize = 30;
@@ -67,7 +66,7 @@ pub async fn run_subagent_loop(
             .stream_messages(
                 SUB_SYSTEM,
                 &messages,
-                &get_subagent_tool_definitions(),
+                &registry.definitions_for_subagent(),
                 8000,
             )
             .await?;
@@ -106,26 +105,29 @@ pub async fn run_subagent_loop(
             if let ContentBlock::ToolUse { id, name, input } = block {
                 println!("\x1b[90m[sub] {} {:?}\x1b[0m", name, input);
 
-                // 触发 PreToolUse hook（共享权限检查）
-                if let Some(reason) = hooks.trigger_pre_tool(registry, name, input) {
-                    tool_results.push(ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: reason,
-                    });
-                    continue;
+                // 创建工具上下文
+                let ctx = ToolContext { client, hooks, registry };
+
+                // 使用 registry.dispatch
+                match registry.dispatch(name, &ctx, input).await {
+                    Some(output) => {
+                        // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
+                        if let Some(msg) = hooks.trigger_post_tool(name, input, &output) {
+                            reminders.push(msg);
+                        }
+
+                        tool_results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: output,
+                        });
+                    },
+                    None => {
+                        tool_results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: format!("Error: Tool '{}' not found", name),
+                        });
+                    }
                 }
-
-                let output = dispatch_tool(name, input);
-
-                // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
-                if let Some(msg) = hooks.trigger_post_tool(name, input, &output) {
-                    reminders.push(msg);
-                }
-
-                tool_results.push(ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: output,
-                });
             }
         }
 
