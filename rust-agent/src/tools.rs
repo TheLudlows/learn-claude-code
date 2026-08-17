@@ -11,7 +11,7 @@ This module contains all tool-related code:
 use serde::Serialize;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 /// 工作目录
@@ -20,27 +20,116 @@ pub fn workdir() -> PathBuf {
 }
 
 /// 路径安全校验 - 确保路径在工作目录内
-fn safe_path(path_str: &str) -> Result<PathBuf, String> {
-    let workdir = workdir();
-    let workdir_canonical = workdir.canonicalize()
-        .map_err(|e| format!("Error: {}", e))?;
-    let path = workdir.join(path_str);
-    let abs_path = path.canonicalize()
+///
+/// 先对 `canonical_workdir/path` 做**词法归一化**（消解 `..`/`.`，不访问文件系统）
+/// 再判越界，因此**对尚不存在的路径（如 `write_file` 新建文件/目录）也成立**——
+/// 原实现对目标路径 `canonicalize()`，路径不存在时直接 `Err`，导致永远写不进去。
+/// 已存在路径再 `canonicalize()` 复核一次（防御纵深，解析符号链接/junction）。
+fn safe_path_in(workdir: &Path, path_str: &str) -> Result<PathBuf, String> {
+    // canonicalize 工作目录本身：工作目录一定存在，不会失败。
+    // 以 canonical workdir 作 base 做词法归一化，避免 cwd 自身含符号链接
+    // 导致「词法路径 vs canonical 工作目录」误判越界。
+    let workdir_canonical = workdir
+        .canonicalize()
         .map_err(|e| format!("Error: {}", e))?;
 
-    if !abs_path.starts_with(&workdir_canonical) {
-        return Err(format!("Error: path escapes workspace"));
+    // 词法归一化：base.join(path) 后按 components 消解 `..`/`.`，不碰文件系统。
+    let mut norm = PathBuf::new();
+    for c in workdir_canonical.join(path_str).components() {
+        match c {
+            Component::ParentDir => {
+                norm.pop();
+            }
+            Component::CurDir => {}
+            other => norm.push(other.as_os_str()),
+        }
     }
 
-    Ok(abs_path)
+    // 越界检查：归一化后必须仍在 canonical 工作目录内。
+    if !norm.starts_with(&workdir_canonical) {
+        return Err("Error: path escapes workspace".to_string());
+    }
+
+    // 已存在的路径再 canonicalize 复核（解析符号链接）；尚不存在的路径用词法结果放行。
+    if norm.exists() {
+        let canon = norm
+            .canonicalize()
+            .map_err(|e| format!("Error: {}", e))?;
+        if !canon.starts_with(&workdir_canonical) {
+            return Err("Error: path escapes workspace".to_string());
+        }
+        Ok(canon)
+    } else {
+        Ok(norm)
+    }
+}
+
+/// 路径安全校验 - 确保路径在当前工作目录内。
+fn safe_path(path_str: &str) -> Result<PathBuf, String> {
+    safe_path_in(&workdir(), path_str)
+}
+
+/// 把命令输出字节解码成字符串：先按 UTF-8（cargo 等现代程序直接用 UTF-8），
+/// 失败再按 OEM 代码页解码（cmd.exe 内建命令、git 等在中文 locale 下用 GBK），
+/// 都不行才退化为 lossy。避免非 ASCII 被替成 U+FFFD（乱码）。
+fn decode_console(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    #[cfg(windows)]
+    if let Some(s) = decode_with_oem_codepage(bytes) {
+        return s;
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// 按 OEM 代码页（中文 locale 为 936/GBK）把字节解成 UTF-16 再转 String。
+/// 失败返回 None，让调用方退化为 lossy。
+#[cfg(windows)]
+fn decode_with_oem_codepage(bytes: &[u8]) -> Option<String> {
+    use std::os::raw::{c_int, c_uchar};
+    extern "system" {
+        fn GetOEMCP() -> u32;
+        fn MultiByteToWideChar(
+            CodePage: u32,
+            dwFlags: u32,
+            lpMultiByteStr: *const c_uchar,
+            cbMultiByte: c_int,
+            lpWideCharStr: *mut u16,
+            cchWideChar: c_int,
+        ) -> c_int;
+    }
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let cp = unsafe { GetOEMCP() };
+    let n = bytes.len() as c_int;
+    let size = unsafe {
+        MultiByteToWideChar(cp, 0, bytes.as_ptr(), n, std::ptr::null_mut(), 0)
+    };
+    if size <= 0 {
+        return None;
+    }
+    let mut buf: Vec<u16> = vec![0u16; size as usize];
+    let written = unsafe {
+        MultiByteToWideChar(cp, 0, bytes.as_ptr(), n, buf.as_mut_ptr(), size)
+    };
+    if written <= 0 {
+        return None;
+    }
+    buf.truncate(written as usize);
+    Some(String::from_utf16_lossy(&buf))
 }
 
 /// 执行命令（跨平台）
 ///
 /// - Windows: 使用 cmd.exe
 /// - Unix: 使用 bash
+///
 /// 危险命令的拦截已移至 permission::permission_hook 闸门(s03/s04),
 /// 在到达这里之前就已被拒; safe_path 仍是文件工具的工作区沙箱。
+const MAX_OUTPUT_BYTES: usize = 50_000;
+
 fn run_bash(command: &str) -> String {
     let result = if cfg!(windows) {
         Command::new("cmd.exe")
@@ -57,13 +146,19 @@ fn run_bash(command: &str) -> String {
 
     match result {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = decode_console(&output.stdout);
+            let stderr = decode_console(&output.stderr);
             let result = format!("{}\n{}", stdout, stderr).trim().to_string();
             if result.is_empty() {
                 "(no output)".to_string()
-            } else if result.len() > 50000 {
-                result[..50000].to_string()
+            } else if result.len() > MAX_OUTPUT_BYTES {
+                // 按字节上限截断，但必须落在 UTF-8 字符边界上，否则
+                // `result[..end]` 会在多字节序列（CJK 输出极常见）中间 panic。
+                let mut end = MAX_OUTPUT_BYTES;
+                while !result.is_char_boundary(end) {
+                    end -= 1;
+                }
+                result[..end].to_string()
             } else {
                 result
             }
@@ -238,9 +333,8 @@ fn run_glob(pattern: &str) -> String {
 fn with_error_prefix(prefix: &str, message: &str) -> String {
     if message.starts_with("Error:") {
         format!("[ERROR:{}] {}", prefix, &message[7..].trim_start())
-    } else if message.starts_with("[ERROR:") {
-        message.to_string() // Already has error prefix
     } else {
+        // 已有 [ERROR: 前缀或无前缀：原样返回（两者行为一致，合并分支）。
         message.to_string()
     }
 }
@@ -367,6 +461,39 @@ fn get_base_tool_definitions() -> Vec<ToolDefinition> {
                     "pattern": { "type": "string" }
                 },
                 "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
+            name: "todo_write".to_string(),
+            description: "Create or replace the todo list for multi-step tasks. \
+                          Each call replaces the entire list; at most one item may be \
+                          in_progress. Use this to plan before starting work and \
+                          update statuses as you progress."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "The task description."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Defaults to pending if omitted."
+                                }
+                            },
+                            "required": ["content"]
+                        }
+                    }
+                },
+                "required": ["todos"]
             }),
         },
     ]
@@ -533,5 +660,77 @@ mod dispatch_tool_tests {
     fn test_error_prefix_on_unknown_tool() {
         let result = dispatch_tool("foo_bar", &json!({}));
         assert_eq!(result, "[ERROR:unknown] Unknown tool: foo_bar");
+    }
+}
+
+#[cfg(test)]
+mod run_bash_tests {
+    use super::run_bash;
+
+    /// 回归：cmd.exe 在中文 locale 默认按 GBK(936) 输出，`from_utf8_lossy` 会把
+    /// 非 ASCII（如 `ver` 输出里的 "版本"）替换成 U+FFFD（乱码）。强制 UTF-8 后
+    /// 应为合法 UTF-8 中文，不含替换符。
+    #[test]
+    #[cfg(windows)]
+    fn decodes_non_ascii_without_replacement_chars() {
+        let out = run_bash("ver");
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "命令输出不应含 U+FFFD 替换符（应为合法 UTF-8）: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod safe_path_tests {
+    use super::safe_path_in;
+    use std::fs;
+
+    #[test]
+    fn allows_nonexistent_path_for_new_file() {
+        // C2 回归：write_file 新建文件/目录时目标路径尚不存在，
+        // safe_path 不应因 canonicalize 失败而拒绝。
+        let dir = std::env::temp_dir().join("rust-agent-safe-path-nonexistent");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir_canon = dir.canonicalize().unwrap();
+
+        let got = safe_path_in(&dir, "subdir/newfile.txt");
+        assert!(got.is_ok(), "non-existent path should be allowed: {:?}", got);
+        let abs = got.unwrap();
+        assert!(abs.starts_with(&dir_canon), "{:?} should be under base", abs);
+        assert_eq!(abs.file_name(), Some(std::ffi::OsStr::new("newfile.txt")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_escape_via_dotdot() {
+        let dir = std::env::temp_dir().join("rust-agent-safe-path-escape");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let got = safe_path_in(&dir, "../secret.txt");
+        assert!(got.is_err(), "path escaping workspace must be rejected");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_path_canonicalized_and_allowed() {
+        let dir = std::env::temp_dir().join("rust-agent-safe-path-existing");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("real.txt");
+        fs::write(&file, b"hi").unwrap();
+
+        let got = safe_path_in(&dir, "real.txt");
+        assert!(got.is_ok(), "existing in-workspace path should be allowed: {:?}", got);
+        assert_eq!(
+            got.unwrap().canonicalize().unwrap(),
+            file.canonicalize().unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

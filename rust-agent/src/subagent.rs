@@ -1,6 +1,4 @@
 /*
-subagent.rs - Subagent (s06)
-
 子 agent 核心思想：用全新的 messages[] 运行嵌套循环，只返回最终文本。
 
 关键边界：
@@ -11,18 +9,22 @@ subagent.rs - Subagent (s06)
 */
 
 use crate::client::{Client, ContentBlock, Message};
-use crate::hooks::Hooks;
+use crate::hooks::{assemble_post_tool_messages, Hooks};
 use crate::tools::{dispatch_tool, get_subagent_tool_definitions};
 
 /// 子 agent 的最大轮数限制
 const MAX_SUBAGENT_TURNS: usize = 30;
 
 /// 子 agent 的 system prompt
-const SUB_SYSTEM: &str = "You are a focused coding agent. Complete your task efficiently. Use tools as needed. Return a concise summary of your work. you can ";
+const SUB_SYSTEM: &str = "You are a focused coding agent. Complete your task efficiently. Use tools as needed. Return a concise summary of your work.";
 
-/// 提取响应中的最终文本（不含 tool_use）
+/// 提取响应中的最终文本（不含 tool_use）。
+///
+/// 无 Text 块时返回 `None`，使调用方的 `else { "(no summary)" }` 分支可达。
+/// （原实现末尾 `.into()` 借助 `From<T> for Option<T>` 恒返回 `Some`，连空串也是
+/// `Some("")`，导致 `else` 成为死代码、最终无文本时返回空串而非 "(no summary)"。）
 fn extract_final_text(content: &[ContentBlock]) -> Option<String> {
-    content
+    let texts: Vec<String> = content
         .iter()
         .filter_map(|block| {
             if let ContentBlock::Text { text } = block {
@@ -31,9 +33,12 @@ fn extract_final_text(content: &[ContentBlock]) -> Option<String> {
                 None
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .into()
+        .collect();
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    }
 }
 
 /// 子 agent 循环
@@ -94,9 +99,10 @@ pub async fn run_subagent_loop(
 
         // 执行工具调用
         let mut tool_results = Vec::new();
+        let mut reminders: Vec<String> = Vec::new();
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                print!("\x1b[90m[sub] {} {:?}\x1b[0m\n", name, input);
+                println!("\x1b[90m[sub] {} {:?}\x1b[0m", name, input);
 
                 // 触发 PreToolUse hook（共享权限检查）
                 if let Some(reason) = hooks.trigger_pre_tool(name, input) {
@@ -109,13 +115,9 @@ pub async fn run_subagent_loop(
 
                 let output = dispatch_tool(name, input);
 
-                // 触发 PostToolUse hook
+                // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
                 if let Some(msg) = hooks.trigger_post_tool(name, input, &output) {
-                    tool_results.push(ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: msg,
-                    });
-                    continue;
+                    reminders.push(msg);
                 }
 
                 tool_results.push(ContentBlock::ToolResult {
@@ -125,11 +127,8 @@ pub async fn run_subagent_loop(
             }
         }
 
-        // 添加工具结果
-        messages.push(Message {
-            role: "user".to_string(),
-            content: tool_results,
-        });
+        // 添加工具结果（真实输出）+ PostToolUse 提醒（独立 user 消息）
+        messages.extend(assemble_post_tool_messages(tool_results, reminders));
     }
 
     // 超过最大轮数
@@ -141,4 +140,32 @@ pub async fn run_subagent_loop(
         "Subagent stopped after {} turns without a final answer.",
         MAX_SUBAGENT_TURNS
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_final_text_none_when_no_text_blocks() {
+        // C7 回归：无 Text 块时必须返回 None（原实现恒返回 Some，连空串也是 Some("")）。
+        assert_eq!(extract_final_text(&[]), None);
+
+        // 仅 ToolUse 块、无 Text 块 -> None
+        let only_tool = vec![ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "command".to_string(),
+            input: serde_json::json!({}),
+        }];
+        assert_eq!(extract_final_text(&only_tool), None);
+    }
+
+    #[test]
+    fn extract_final_text_some_when_text_present() {
+        let blocks = vec![
+            ContentBlock::Text { text: "hello".to_string() },
+            ContentBlock::Text { text: "world".to_string() },
+        ];
+        assert_eq!(extract_final_text(&blocks), Some("hello\nworld".to_string()));
+    }
 }

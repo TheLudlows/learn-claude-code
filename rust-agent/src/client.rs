@@ -1,7 +1,6 @@
 use crate::tools::ToolDefinition;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Write};
 
 /// Anthropic API 请求体
 #[derive(Serialize)]
@@ -69,8 +68,9 @@ impl Client {
     }
     /// 流式调用 /v1/messages。
     ///
-    /// text delta 边收边打到 stdout（live），tool_use 的 input_json delta 累加成
-    /// 完整 JSON，最后返回 `MessagesResponse`。`agent_loop` 拿到后照旧判断 stop_reason。
+    /// 累加 text 与 tool_use 的 input_json delta，最后返回 `MessagesResponse`。
+    /// 本函数不打印任何内容——展示交给 `output::render`，由调用方拿到响应后调用。
+    /// `agent_loop` 拿到后照旧判断 stop_reason。
     pub async fn stream_messages(
         &self,
         system: &str,
@@ -93,7 +93,7 @@ impl Client {
             .http
             .post(&url)
             .header("x-api-key", &self.api_key)
-            //.header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&request)
             .send()
@@ -205,12 +205,6 @@ impl Client {
                                             .get("text")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
-                                        if text_buf.is_empty() {
-                                            print!("\x1b[35magent>>\x1b[0m{}", t);
-                                        } else {
-                                            print!("\x1b[35m{}\x1b[0m", t);
-                                        }
-                                        io::stdout().flush().ok();
                                         text_buf.push_str(t);
                                     }
                                     (BlockAcc::ToolUse { partial_json, .. }, "input_json_delta") => {
@@ -286,26 +280,6 @@ impl Client {
             }
         }
 
-        // 如果有文本输出，打印换行和所有响应
-        let has_text = content.iter().any(|block| matches!(block, ContentBlock::Text { .. }));
-        if has_text {
-            println!();
-        }
-        println!("=== All Response Content ===");
-        for block in &content {
-            match block {
-                ContentBlock::Text { text } => {
-                    println!("Text: {}", text);
-                }
-                ContentBlock::ToolUse { id, name, input } => {
-                    println!("ToolUse: id={}, name={}, input={}", id, name, serde_json::to_string(input).unwrap_or_default());
-                }
-                ContentBlock::ToolResult { tool_use_id, content: result_content } => {
-                    println!("ToolResult: tool_use_id={}, content={}", tool_use_id, result_content);
-                }
-            }
-        }
-        println!("===========================");
         Ok(MessagesResponse { content, stop_reason })
     }
 }

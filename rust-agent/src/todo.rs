@@ -2,11 +2,10 @@
 todo.rs - TodoWrite (s05)
 
 TodoManager 管理任务列表，提供验证和渲染功能。
-全局访问机制使用 OnceLock + RefCell 实现。
+全局访问机制使用 OnceLock + Mutex 实现。
 */
 
-use std::cell::RefCell;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// 单个待办事项
 #[derive(Clone, Debug)]
@@ -26,6 +25,12 @@ enum TodoStatus {
 /// TodoManager - 管理任务列表
 pub struct TodoManager {
     items: Vec<TodoItem>,
+}
+
+impl Default for TodoManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TodoManager {
@@ -120,29 +125,31 @@ impl TodoManager {
     }
 }
 
-/// Thread-safe wrapper for RefCell<TodoManager>
-pub struct SharedTodoManager(RefCell<TodoManager>);
-
-unsafe impl Sync for SharedTodoManager {}
+/// Thread-safe wrapper: `Mutex<TodoManager>`。
+///
+/// `Mutex<T: Send>` 自动满足 `Sync`，无需 `unsafe impl Sync`（原 `RefCell` 版本对
+/// `RefCell` 强制实现 `Sync` 是不健全的：多线程下 `borrow_mut` 会 panic 或触发 UB）。
+pub struct SharedTodoManager(Mutex<TodoManager>);
 
 /// 全局 TodoManager 实例
 static TODO_MANAGER: OnceLock<SharedTodoManager> = OnceLock::new();
 
 /// 初始化全局 TodoManager
 pub fn set_instance(manager: TodoManager) {
-    let _ = TODO_MANAGER.get_or_init(|| SharedTodoManager(RefCell::new(manager)));
+    let _ = TODO_MANAGER.get_or_init(|| SharedTodoManager(Mutex::new(manager)));
 }
 
 /// 获取全局 TodoManager 的引用
-fn get_instance() -> &'static RefCell<TodoManager> {
-    &TODO_MANAGER.get()
+fn get_instance() -> &'static Mutex<TodoManager> {
+    &TODO_MANAGER
+        .get()
         .expect("TodoManager not initialized. Call set_instance() first()")
         .0
 }
 
 /// todo_write 工具处理函数
 pub fn run_todo_write(todos: &serde_json::Value) -> String {
-    let mut guard = get_instance().borrow_mut();
+    let mut guard = get_instance().lock().unwrap();
     let result = guard.update(todos);
 
     match result {

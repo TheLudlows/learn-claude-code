@@ -36,6 +36,7 @@ Key insight: the loop stays the same; only the four trigger points are wired in.
 
 mod client;
 mod hooks;
+mod output;
 mod permission;
 mod subagent;
 mod todo;
@@ -43,15 +44,17 @@ mod tools;
 
 use client::{Client, ContentBlock, Message};
 use dotenv::dotenv;
-use hooks::{context_inject_hook, large_output_hook, log_hook, summary_hook, todo_reminder_hook, Hooks};
+use hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
 use permission::permission_hook;
 use std::env;
 use std::io::{self, Write};
 use tools::{dispatch_tool, get_tool_definitions};
 
-/// 执行单个工具调用（含 hooks）
+/// 执行单个工具调用（含 PreToolUse 拦截）。
 ///
-/// s06: 完整的工具执行流程：PreToolUse hook -> 执行 -> PostToolUse hook
+/// 返回真实工具输出（被 PreToolUse 拦截时返回拦截原因作为 tool_result）。
+/// PostToolUse 不在此处理：其返回值由 agent_loop 经 assemble_post_tool_messages
+/// 作为独立 user 消息注入，不再覆盖 tool_result。
 async fn execute_tool(
     client: &Client,
     name: &str,
@@ -63,8 +66,8 @@ async fn execute_tool(
         return reason;
     }
 
-    // 执行工具
-    let output = if name == "task" {
+    // 执行工具（PostToolUse 提醒由调用方注入，见 agent_loop）
+    if name == "task" {
         if let Some(prompt) = input.get("prompt").and_then(|p| p.as_str()) {
             subagent::run_subagent_loop(client, prompt, hooks).await.unwrap_or_else(|e| format!("Subagent error: {}", e))
         } else {
@@ -72,14 +75,7 @@ async fn execute_tool(
         }
     } else {
         dispatch_tool(name, input)
-    };
-
-    // PostToolUse hook
-    if let Some(msg) = hooks.trigger_post_tool(name, input, &output) {
-        return msg;
     }
-
-    output
 }
 
 /// Agent 核心循环
@@ -97,6 +93,12 @@ async fn agent_loop(
         let response = client
             .stream_messages(system, messages, &get_tool_definitions(), 8000)
             .await?;
+
+        // 打印这一轮的 LLM 内容（text + tool_use）；client 自身不打印。
+        {
+            let mut out = io::stdout().lock();
+            output::render(&response, &mut out);
+        }
 
         // 添加助手响应(含 text 与 tool_use 块, 原样回传给下一轮)
         messages.push(Message {
@@ -119,24 +121,43 @@ async fn agent_loop(
 
         // 执行工具调用
         let mut tool_results = Vec::new();
+        let mut reminders: Vec<String> = Vec::new();
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                let output = execute_tool(client, name, input, hooks).await;
+                let tool_output = execute_tool(client, name, input, hooks).await;
+                // 打印工具执行结果（此前只喂回 LLM，用户看不到工具返回了什么）
+                {
+                    let mut out = io::stdout().lock();
+                    output::render_tool_result(name, &tool_output, &mut out);
+                }
+                // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
+                if let Some(msg) = hooks.trigger_post_tool(name, input, &tool_output) {
+                    reminders.push(msg);
+                }
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: output,
+                    content: tool_output,
                 });
             }
         }
 
-        // 添加工具结果
-        messages.push(Message {
-            role: "user".to_string(),
-            content: tool_results,
-        });
+        // 添加工具结果（真实输出）+ PostToolUse 提醒（独立 user 消息）
+        messages.extend(assemble_post_tool_messages(tool_results, reminders));
     }
 
     Ok(())
+}
+
+/// 把 API key 打码：仅留前 4 与后 4 字符，避免完整密钥泄露到 stdout。
+fn mask_key(k: &str) -> String {
+    let chars: Vec<char> = k.chars().collect();
+    if chars.len() > 8 {
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{}…{}", head, tail)
+    } else {
+        "***".to_string()
+    }
 }
 
 #[tokio::main]
@@ -149,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url = env::var("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
     let model = env::var("MODEL_ID")?;
-    println!("api-key: {}, base_url {}, mode {}", api_key, base_url, model);
+    println!("base_url: {}, model: {}, key: {}", base_url, model, mask_key(&api_key));
 
     let client = Client::new(api_key, base_url, model);
 
@@ -158,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string_lossy()
         .to_string();
     let system = format!(
-        "You are a coding agent at {} on {}. Before starting any multi-step task, odo_write to plan your steps. Update status as you go.you can use tool.",
+        "You are a coding agent at {} on {}. Before starting any multi-step task, use todo_write to plan your steps. Update status as you go. You can use tools as needed.",
         cwd, env::consts::OS
     );
 
@@ -166,7 +187,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hooks = Hooks::new();
     hooks.on_prompt(context_inject_hook);
     hooks.on_pre_tool(permission_hook); // s03 三道闸门, 搬成 PreToolUse 回调
-    hooks.on_pre_tool(log_hook);
     hooks.on_post_tool(large_output_hook);
     hooks.on_stop(summary_hook);
     hooks.on_post_tool(todo_reminder_hook);
