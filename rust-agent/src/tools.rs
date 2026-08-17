@@ -22,9 +22,13 @@ pub fn workdir() -> PathBuf {
 /// 路径安全校验 - 确保路径在工作目录内
 ///
 /// 先对 `canonical_workdir/path` 做**词法归一化**（消解 `..`/`.`，不访问文件系统）
-/// 再判越界，因此**对尚不存在的路径（如 `write_file` 新建文件/目录）也成立**——
+/// 得到绝对路径，再用**canonical 对 canonical**的方式判越界——
+/// 因此**对尚不存在的路径（如 `write_file` 新建文件/目录）也成立**：
 /// 原实现对目标路径 `canonicalize()`，路径不存在时直接 `Err`，导致永远写不进去。
-/// 已存在路径再 `canonicalize()` 复核一次（防御纵深，解析符号链接/junction）。
+///
+/// 越界比较必须用 canonical 形式：Windows 下 `canonicalize()` 会给路径加 `\\?\`
+/// verbatim 前缀并展开 8.3 短名，而词法归一化结果（尤其当 `path_str` 是绝对路径时）
+/// 可能既无前缀又含短名——直接 `starts_with` 会把工作区内路径误判成越界（C3 回归）。
 fn safe_path_in(workdir: &Path, path_str: &str) -> Result<PathBuf, String> {
     // canonicalize 工作目录本身：工作目录一定存在，不会失败。
     // 以 canonical workdir 作 base 做词法归一化，避免 cwd 自身含符号链接
@@ -34,6 +38,7 @@ fn safe_path_in(workdir: &Path, path_str: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("Error: {}", e))?;
 
     // 词法归一化：base.join(path) 后按 components 消解 `..`/`.`，不碰文件系统。
+    // 注意：path_str 为绝对路径时 join 会替换 base——这是预期行为（绝对路径本就不相对 base）。
     let mut norm = PathBuf::new();
     for c in workdir_canonical.join(path_str).components() {
         match c {
@@ -45,22 +50,54 @@ fn safe_path_in(workdir: &Path, path_str: &str) -> Result<PathBuf, String> {
         }
     }
 
-    // 越界检查：归一化后必须仍在 canonical 工作目录内。
-    if !norm.starts_with(&workdir_canonical) {
-        return Err("Error: path escapes workspace".to_string());
+    // 越界检查：用 canonical 形式比较（见函数注释）。
+    // 连祖先都无法 canonicalize 时按失败闭合处理（安全侧）。
+    let within = match canonical_form_of(&norm) {
+        Some(c) => c.starts_with(&workdir_canonical),
+        None => false,
+    };
+    if !within {
+        return Err(format!("Error: path escapes workspace {:?}, {:?}", workdir_canonical, norm));
     }
 
-    // 已存在的路径再 canonicalize 复核（解析符号链接）；尚不存在的路径用词法结果放行。
+    // 返回值：已存在路径返回 canonical（解析符号链接/junction）；尚不存在的路径用词法结果放行。
     if norm.exists() {
-        let canon = norm
-            .canonicalize()
-            .map_err(|e| format!("Error: {}", e))?;
-        if !canon.starts_with(&workdir_canonical) {
-            return Err("Error: path escapes workspace".to_string());
-        }
-        Ok(canon)
+        norm.canonicalize().map_err(|e| format!("Error: {}", e))
     } else {
         Ok(norm)
+    }
+}
+
+/// 把路径归一成 canonical 形式，专供越界比较使用。
+///
+/// - 路径本身存在：直接 `canonicalize()`。
+/// - 路径不存在：沿祖先上溯到第一个已存在的目录，`canonicalize()` 它，再拼回尚不存在的尾部。
+///   这样不存在的路径（`write_file` 新建文件/目录）也能得到与 canonical base 可比的形态。
+/// - 连根目录都无法 `canonicalize()`：返回 `None`（调用方按失败闭合处理）。
+fn canonical_form_of(path: &Path) -> Option<PathBuf> {
+    // 快路径：路径本身存在。
+    if let Ok(c) = path.canonicalize() {
+        return Some(c);
+    }
+    // 路径不存在：上溯找第一个已存在的祖先，canonicalize 后拼回尾部。
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        match cur.canonicalize() {
+            Ok(canon) => {
+                let mut full = canon;
+                for seg in tail.into_iter().rev() {
+                    full.push(seg);
+                }
+                return Some(full);
+            }
+            Err(_) => {
+                // cur 不存在：记下这一段名字，继续上溯。
+                let name = cur.file_name()?.to_owned();
+                tail.push(name);
+                cur = cur.parent()?.to_path_buf();
+            }
+        }
     }
 }
 
@@ -379,6 +416,7 @@ pub fn dispatch_tool(tool_name: &str, input: &serde_json::Value) -> String {
                 "Error: missing todos".to_string()
             }
         }
+        "load_skill" => crate::skills::run_load_skill(input),
         _ => return format!("[ERROR:unknown] Unknown tool: {}", tool_name),
     };
 
@@ -461,6 +499,18 @@ fn get_base_tool_definitions() -> Vec<ToolDefinition> {
                     "pattern": { "type": "string" }
                 },
                 "required": ["pattern"]
+            }),
+        },
+        // s07: 按名称加载完整 SKILL.md 正文。name 是注册表键，不是文件路径。
+        ToolDefinition {
+            name: "load_skill".to_string(),
+            description: "Load the full SKILL.md content by skill name.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"]
             }),
         },
         ToolDefinition {
@@ -657,6 +707,31 @@ mod dispatch_tool_tests {
     }
 
     #[test]
+    fn test_read_file_with_absolute_path_in_workspace() {
+        // C3 回归：调用方传「工作区内文件的绝对路径」时，绝对路径会让 join 替换
+        // canonical base（丢掉 `\\?\` 前缀、保留 8.3 短名），词法 starts_with 误判越界，
+        // 进而 `[ERROR:read_file] path escapes workspace`。修复后应正常读到内容。
+        use std::fs;
+        let dir = std::env::temp_dir().join("rust-agent-read-abs");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("abs_read.txt");
+        fs::write(&file, "absolute ok").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let abs = file.to_string_lossy().to_string();
+        let result = dispatch_tool("read_file", &json!({"path": abs}));
+
+        std::env::set_current_dir(original_dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(!result.starts_with("[ERROR:"), "should not error: {:?}", result);
+        assert_eq!(result, "absolute ok");
+    }
+
+    #[test]
     fn test_error_prefix_on_unknown_tool() {
         let result = dispatch_tool("foo_bar", &json!({}));
         assert_eq!(result, "[ERROR:unknown] Unknown tool: foo_bar");
@@ -730,6 +805,26 @@ mod safe_path_tests {
             got.unwrap().canonicalize().unwrap(),
             file.canonicalize().unwrap()
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absolute_path_in_workspace_is_allowed() {
+        // C3 回归：调用方常传绝对路径。绝对路径会让 join 替换 base、丢掉 `\\?\`
+        // verbatim 前缀；且 temp_dir 可能用 8.3 短名。两者都使词法 norm 与 canonical
+        // base 不可直接 starts_with 比较。canonical 对 canonical 比较后应放行。
+        let dir = std::env::temp_dir().join("rust-agent-safe-path-abs");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("inner.txt");
+        fs::write(&file, b"x").unwrap();
+
+        let abs = file.to_string_lossy().to_string();
+        let got = safe_path_in(&dir, &abs);
+        assert!(got.is_ok(), "absolute in-workspace path should be allowed: {:?}", got);
+        // 已存在路径应返回 canonical 形式（带 verbatim 前缀），与直接 canonicalize 一致。
+        assert_eq!(got.unwrap(), file.canonicalize().unwrap());
 
         let _ = fs::remove_dir_all(&dir);
     }

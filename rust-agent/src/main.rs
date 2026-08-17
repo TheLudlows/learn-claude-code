@@ -38,6 +38,7 @@ mod client;
 mod hooks;
 mod output;
 mod permission;
+mod skills;
 mod subagent;
 mod todo;
 mod tools;
@@ -48,6 +49,7 @@ use hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook,
 use permission::permission_hook;
 use std::env;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use tools::{dispatch_tool, get_tool_definitions};
 
 /// 执行单个工具调用（含 PreToolUse 拦截）。
@@ -178,10 +180,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| ".".into())
         .to_string_lossy()
         .to_string();
-    let system = format!(
-        "You are a coding agent at {} on {}. Before starting any multi-step task, use todo_write to plan your steps. Update status as you go. You can use tools as needed.",
-        cwd, env::consts::OS
+
+    // s07: 启动时扫描技能目录，把「名称+描述」编入 system prompt，完整正文按需 load_skill 取。
+    // SKILLS_DIR 缺省（或空串）时回退到 cwd/skills；目录不存在则注册表为空（agent 仍可运行，只是无技能）。
+    let skills_dir = env::var("SKILLS_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{}/skills", cwd));
+    let loader = skills::SkillLoader::scan(PathBuf::from(&skills_dir));
+    let skill_count = loader.len();
+    skills::set_instance(loader);
+    println!(
+        "Loaded {} skill(s) from {}",
+        skill_count, skills_dir
     );
+
+    // 组装 system prompt：固定的 agent 指令 + 技能目录（非空才加）+ load_skill 提示。
+    // 目录只在 system prompt 里（每次调用都付这点开销）；完整正文在 load_skill 的 tool_result 里按需加载。
+    let catalog = skills::catalog();
+    let system = if catalog.is_empty() {
+        format!(
+            "You are a coding agent at {} on {}. Before starting any multi-step task, use todo_write to plan your steps. Update status as you go. You can use tools as needed.",
+            cwd, env::consts::OS
+        )
+    } else {
+        format!(
+            "You are a coding agent at {} on {}. Before starting any multi-step task, use todo_write to plan your steps. Update status as you go. You can use tools as needed.\n\n\
+             Skills available:\n{}\n\n\
+             Use load_skill to read the full instructions when a skill applies.",
+            cwd, env::consts::OS, catalog
+        )
+    };
 
     // s04: 注册钩子 —— 循环只调 trigger_*, 具体逻辑全在回调里
     let mut hooks = Hooks::new();

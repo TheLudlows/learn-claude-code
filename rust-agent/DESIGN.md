@@ -217,6 +217,47 @@ Agent 在修复 bug 时会读取大量文件追踪调用链，每个工具调用
 
 ---
 
+## 7. Skill Loading — 用到时再加载
+
+### 核心思想
+
+> system prompt 只保存技能目录（名称 + 描述）；`load_skill(name)` 按需返回完整的 `SKILL.md`。
+
+### 问题背景
+
+把项目规范（React 组件规范、SQL 风格、API 设计文档）全部塞进 system prompt，能让 Agent 读到，但每次调用 LLM 都会把**所有**文档全文一起发送。当前任务只动 React 组件时，SQL 和 API 文档与任务无关，却仍占用输入 token 和上下文窗口，留给代码、对话、工具结果的空间变少。
+
+### 解决方案
+
+启动时 `SkillLoader::scan` 扫描 `SKILLS_DIR/*/SKILL.md`，解析 YAML frontmatter 的 `name`/`description`，把这份**目录**编入 system prompt。模型需要完整说明时调用 `load_skill(name)`，返回的完整 `SKILL.md` 作为 `tool_result` 追加到消息列表。
+
+| 内容 | 进入模型的位置 | 何时加入 |
+|------|----------------|----------|
+| 技能名称和描述 | system prompt | 启动时 |
+| 完整 `SKILL.md` | `tool_result` | 调用 `load_skill` 时 |
+
+### 核心组件
+
+- `Skill { name, description, content }`：单个技能；`content` 是 `SKILL.md` 全文。
+- `SkillLoader`：启动时扫描一次，持有 `BTreeMap<String, Skill>`（按 name 排序、查找 O(log n)）；`catalog()` 输出目录，`load(name)` 按注册表键返回全文。
+- `parse_frontmatter`：用 `serde_yaml` 解析 `---` 分隔的 frontmatter；缺失、段数不足或 YAML 非法时优雅回退（name 用目录名，description 用正文首行），永不 panic。
+- 全局注册表：`OnceLock<SkillLoader>` + `set_instance` / `catalog` / `run_load_skill`，沿用 `todo.rs` 的全局访问模式（技能只读，无需 `Mutex`）。
+
+### 典型流程
+
+1. `main` 解析 `SKILLS_DIR`（缺省/空串回退 `cwd/skills`），`scan` 后 `set_instance`。
+2. 组装 system prompt：固定 agent 指令 + 技能目录（非空才加）+ `Use load_skill ...` 提示。
+3. REPL 复用同一 `system` 串——目录每次调用都付这点开销；正文按需加载。
+4. 模型发 `load_skill` 工具调用 → `run_load_skill` 查全局注册表 → 全文作为 `tool_result` 喂回下一轮。
+
+### 关键见解
+
+- `load_skill` 的 `name` 是**注册表键，不是文件路径**——只查表，不读用户输入的路径，无需 `safe_path` 沙箱。
+- 父 agent 与子 agent 共享同一 `load_skill`（在 `get_base_tool_definitions` 中注册）；`task` 仍只给父 agent。
+- 加载的 `SKILL.md` 会作为 `tool_result` 积累在 `messages[]`——这正是 s08 上下文压缩的动机。
+
+---
+
 ## 架构演进
 
 | 阶段 | 新增能力 |
@@ -227,6 +268,7 @@ Agent 在修复 bug 时会读取大量文件追踪调用链，每个工具调用
 | s04 | 钩子扩展系统 |
 | s05 | 任务列表规划 |
 | s06 | 消息隔离的子任务委托 |
+| s07 | 技能按需加载（目录在 system prompt，正文走 tool_result） |
 
 ---
 
