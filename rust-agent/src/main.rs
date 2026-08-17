@@ -34,23 +34,14 @@ API 交互(请求构造 + 流式解析)在 client.rs;工具与分发在 tools.rs
 Key insight: the loop stays the same; only the four trigger points are wired in.
 */
 
-mod client;
-mod hooks;
-mod output;
-mod permission;
-mod skills;
-mod subagent;
-mod todo;
-mod tools;
-
-use client::{Client, ContentBlock, Message};
+use rust_agent::client::{Client, ContentBlock, Message};
+use rust_agent::hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
+use rust_agent::permission::permission_hook;
 use dotenv::dotenv;
-use hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
-use permission::permission_hook;
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use tools::{dispatch_tool, get_tool_definitions};
+use rust_agent::tools_legacy::{dispatch_tool, get_tool_definitions};
 
 /// 执行单个工具调用（含 PreToolUse 拦截）。
 ///
@@ -71,7 +62,7 @@ async fn execute_tool(
     // 执行工具（PostToolUse 提醒由调用方注入，见 agent_loop）
     if name == "task" {
         if let Some(prompt) = input.get("prompt").and_then(|p| p.as_str()) {
-            subagent::run_subagent_loop(client, prompt, hooks).await.unwrap_or_else(|e| format!("Subagent error: {}", e))
+            rust_agent::subagent::run_subagent_loop(client, prompt, hooks).await.unwrap_or_else(|e| format!("Subagent error: {}", e))
         } else {
             "Error: missing prompt".to_string()
         }
@@ -99,7 +90,7 @@ async fn agent_loop(
         // 打印这一轮的 LLM 内容（text + tool_use）；client 自身不打印。
         {
             let mut out = io::stdout().lock();
-            output::render(&response, &mut out);
+            rust_agent::output::render(&response, &mut out);
         }
 
         // 添加助手响应(含 text 与 tool_use 块, 原样回传给下一轮)
@@ -130,7 +121,7 @@ async fn agent_loop(
                 // 打印工具执行结果（此前只喂回 LLM，用户看不到工具返回了什么）
                 {
                     let mut out = io::stdout().lock();
-                    output::render_tool_result(name, &tool_output, &mut out);
+                    rust_agent::output::render_tool_result(name, &tool_output, &mut out);
                 }
                 // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
                 if let Some(msg) = hooks.trigger_post_tool(name, input, &tool_output) {
@@ -187,9 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("{}/skills", cwd));
-    let loader = skills::SkillLoader::scan(PathBuf::from(&skills_dir));
+    let loader = rust_agent::skills::SkillLoader::scan(PathBuf::from(&skills_dir));
     let skill_count = loader.len();
-    skills::set_instance(loader);
+    rust_agent::skills::set_instance(loader);
     println!(
         "Loaded {} skill(s) from {}",
         skill_count, skills_dir
@@ -197,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 组装 system prompt：固定的 agent 指令 + 技能目录（非空才加）+ load_skill 提示。
     // 目录只在 system prompt 里（每次调用都付这点开销）；完整正文在 load_skill 的 tool_result 里按需加载。
-    let catalog = skills::catalog();
+    let catalog = rust_agent::skills::catalog();
     let system = if catalog.is_empty() {
         format!(
             "You are a coding agent at {} on {}. Before starting any multi-step task, use todo_write to plan your steps. Update status as you go. You can use tools as needed.",
@@ -223,8 +214,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut messages: Vec<Message> = Vec::new();
 
     // 初始化 TodoManager 并设置全局实例
-    let todo_manager = todo::TodoManager::new();
-    todo::set_instance(todo_manager);
+    let todo_manager = rust_agent::todo::TodoManager::new();
+    rust_agent::todo::set_instance(todo_manager);
 
     loop {
         print!("\x1b[36m You >> \x1b[0m");

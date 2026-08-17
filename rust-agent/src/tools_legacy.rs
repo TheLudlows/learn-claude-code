@@ -578,7 +578,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
 
 #[cfg(test)]
 mod test_tool {
-    use crate::tools::run_glob;
+    use crate::tools_legacy::run_glob;
 
     #[test]
     fn test_glob() {

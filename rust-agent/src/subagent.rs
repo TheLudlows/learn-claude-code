@@ -10,7 +10,7 @@
 
 use crate::client::{Client, ContentBlock, Message};
 use crate::hooks::{assemble_post_tool_messages, Hooks};
-use crate::tools::{dispatch_tool, get_subagent_tool_definitions};
+use crate::tools_legacy::{dispatch_tool, get_subagent_tool_definitions};
 
 /// 子 agent 的最大轮数限制
 const MAX_SUBAGENT_TURNS: usize = 30;

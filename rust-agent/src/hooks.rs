@@ -21,7 +21,7 @@ hooks.rs - 钩子系统 (s04)
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::client::{ContentBlock, Message};
-use crate::tools::workdir;
+use crate::tools_legacy::workdir;
 
 // ---- 回调类型 ----
 pub type PromptHook = fn(&str);

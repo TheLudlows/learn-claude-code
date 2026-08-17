@@ -15,7 +15,7 @@ Option<String>(Some=拦截理由, None=放行), 注册为 PreToolUse 钩子,
 文件类工具另有 tools::safe_path 做工作区沙箱(defense in depth)。
 */
 
-use crate::tools::workdir;
+use crate::tools_legacy::workdir;
 use std::io::{self, Write};
 use std::path::{Component, PathBuf};
 
