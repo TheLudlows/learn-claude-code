@@ -9,8 +9,7 @@ and definition generation. It provides:
 - Permission checking before execution
 */
 
-use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
-use crate::tools_legacy::ToolDefinition;
+use crate::tools::trait_def::{PermissionCheck, Tool, ToolDefinition, ToolContext};
 use serde_json::Value;
 
 /// Registry for managing and dispatching tools
@@ -214,8 +213,69 @@ mod tests {
         }
     }
 
-    // Create a mock context for testing
-    // Create a dummy context for tests
+    #[tokio::test]
+    async fn test_registry_dispatch_known_tool() {
+        use crate::tools::trait_def::ToolContext;
+        use crate::client::Client;
+        use crate::hooks::Hooks;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TestTool {
+            name: "known_tool".to_string(),
+            description: "A known tool".to_string(),
+        }));
+
+        let input = json!({"input": "test_value"});
+
+        // Create mock context inside the test function
+        let client = Client::new(
+            "test-key".to_string(),
+            "https://api.example.com".to_string(),
+            "claude-3".to_string(),
+        );
+        let hooks = Hooks::new();
+        let registry_for_ctx = ToolRegistry::new(); // Empty registry for context
+
+        let ctx = ToolContext {
+            client: &client,
+            hooks: &hooks,
+            registry: &registry_for_ctx,
+        };
+
+        let result = registry.dispatch("known_tool", &ctx, &input).await;
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "TestTool executed with: Object {\"input\": String(\"test_value\")}");
+    }
+
+    #[tokio::test]
+    async fn test_registry_dispatch_unknown_tool() {
+        use crate::tools::trait_def::ToolContext;
+        use crate::client::Client;
+        use crate::hooks::Hooks;
+
+        let registry = ToolRegistry::new();
+        let input = json!({"test": "value"});
+
+        // Create mock context inside the test function
+        let client = Client::new(
+            "test-key".to_string(),
+            "https://api.example.com".to_string(),
+            "claude-3".to_string(),
+        );
+        let hooks = Hooks::new();
+        let registry_for_ctx = ToolRegistry::new(); // Empty registry for context
+
+        let ctx = ToolContext {
+            client: &client,
+            hooks: &hooks,
+            registry: &registry_for_ctx,
+        };
+
+        let result = registry.dispatch("unknown_tool", &ctx, &input).await;
+
+        assert!(result.is_none());
+    }
     
     #[test]
     fn test_registry_new_empty() {
@@ -436,5 +496,116 @@ mod tests {
             description: "Tool 3".to_string(),
         }));
         assert_eq!(registry.tool_count(), 3);
+    }
+
+    #[test]
+    fn test_registry_definitions_includes_all() {
+        let mut registry = ToolRegistry::new();
+
+        // Register multiple tools
+        registry.register(Box::new(TestTool {
+            name: "command".to_string(),
+            description: "Execute shell commands".to_string(),
+        }));
+
+        registry.register(Box::new(TestTool {
+            name: "read_file".to_string(),
+            description: "Read file contents".to_string(),
+        }));
+
+        registry.register(Box::new(TestTool {
+            name: "write_file".to_string(),
+            description: "Write file contents".to_string(),
+        }));
+
+        let definitions = registry.definitions();
+
+        // Check that all registered tools are included
+        assert_eq!(definitions.len(), 3);
+        assert!(definitions.iter().any(|def| def.name == "command"));
+        assert!(definitions.iter().any(|def| def.name == "read_file"));
+        assert!(definitions.iter().any(|def| def.name == "write_file"));
+
+        // Check that the definitions contain correct information
+        for def in definitions {
+            assert!(!def.name.is_empty());
+            assert!(!def.description.is_empty());
+            assert!(def.input_schema.is_object());
+        }
+    }
+
+    #[test]
+    fn test_registry_definitions_subagent_excludes_task() {
+        use crate::tools::task::TaskTool;
+
+        let mut registry = ToolRegistry::new();
+
+        // Register various tools including TaskTool
+        registry.register(Box::new(TestTool {
+            name: "command".to_string(),
+            description: "Execute shell commands".to_string(),
+        }));
+
+        registry.register(Box::new(TestTool {
+            name: "read_file".to_string(),
+            description: "Read file contents".to_string(),
+        }));
+
+        // TaskTool should not be available to subagents
+        registry.register(Box::new(TaskTool));
+
+        let all_definitions = registry.definitions();
+        let subagent_definitions = registry.definitions_for_subagent();
+
+        // All tools should be in the full definitions
+        assert_eq!(all_definitions.len(), 3);
+
+        // TaskTool should be excluded from subagent definitions
+        assert_eq!(subagent_definitions.len(), 2);
+        assert!(subagent_definitions.iter().any(|def| def.name == "command"));
+        assert!(subagent_definitions.iter().any(|def| def.name == "read_file"));
+        assert!(!subagent_definitions.iter().any(|def| def.name == "task"));
+    }
+
+    #[test]
+    fn test_registry_check_permission_default_pass() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TestTool {
+            name: "default_tool".to_string(),
+            description: "A tool with default permission handling".to_string(),
+        }));
+
+        let input = json!({"input": "some_value"});
+        let result = registry.check_permission("default_tool", &input);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), PermissionCheck::Pass);
+    }
+
+    #[test]
+    fn test_registry_check_permission_override() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(RestrictedTestTool {
+            name: "restricted_tool".to_string(),
+        }));
+
+        // Test with input that requires approval
+        let restricted_input = json!({"action": "restricted"});
+        let result = registry.check_permission("restricted_tool", &restricted_input);
+
+        assert!(result.is_some());
+        match result.unwrap() {
+            PermissionCheck::NeedsApproval(reason) => {
+                assert!(reason.contains("approval"));
+            }
+            PermissionCheck::Pass => panic!("Expected NeedsApproval for restricted action"),
+        }
+
+        // Test with input that doesn't require approval
+        let safe_input = json!({"action": "safe"});
+        let safe_result = registry.check_permission("restricted_tool", &safe_input);
+
+        assert!(safe_result.is_some());
+        assert_eq!(safe_result.unwrap(), PermissionCheck::Pass);
     }
 }
