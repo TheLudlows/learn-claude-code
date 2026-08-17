@@ -37,8 +37,7 @@ Key insight: the loop stays the same; only the four trigger points are wired in.
 use rust_agent::client::{Client, ContentBlock, Message};
 use rust_agent::hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
 use rust_agent::permission::permission_hook;
-use rust_agent::tools::registry::ToolRegistry;
-use rust_agent::tools::trait_def::ToolContext;
+use rust_agent::tools::{build_registry, ToolContext, ToolRegistry};
 use rust_agent::tools_legacy::get_tool_definitions;
 use dotenv::dotenv;
 use std::env;
@@ -63,24 +62,16 @@ async fn execute_tool(
     }
 
     // Create ToolContext for tool execution
-    let tool_ctx = ToolContext {
+    let ctx = ToolContext {
         client,
         hooks,
         registry,
     };
 
     // 执行工具（PostToolUse 提醒由调用方注入，见 agent_loop）
-    if name == "task" {
-        if let Some(prompt) = input.get("prompt").and_then(|p| p.as_str()) {
-            rust_agent::subagent::run_subagent_loop(client, &registry, prompt, hooks).await.unwrap_or_else(|e| format!("Subagent error: {}", e))
-        } else {
-            "Error: missing prompt".to_string()
-        }
-    } else {
-        match registry.dispatch(name, &tool_ctx, input).await {
-            Some(result) => result,
-            None => "Error: tool not found".to_string(),
-        }
+    match registry.dispatch(name, &ctx, input).await {
+        Some(result) => result,
+        None => "Error: tool not found".to_string(),
     }
 }
 
@@ -98,7 +89,7 @@ async fn agent_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let response = client
-            .stream_messages(system, messages, &get_tool_definitions(), 8000)
+            .stream_messages(system, messages, &registry.definitions(), 8000)
             .await?;
 
         // 打印这一轮的 LLM 内容（text + tool_use）；client 自身不打印。
