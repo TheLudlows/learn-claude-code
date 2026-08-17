@@ -216,10 +216,7 @@ mod tests {
 
     // Create a mock context for testing
     // Create a dummy context for tests
-    // TODO: Implement proper mock context for async tests
-    // fn create_mock_context() -> ToolContext<'static> {
-    // }
-
+    
     #[test]
     fn test_registry_new_empty() {
         let registry = ToolRegistry::new();

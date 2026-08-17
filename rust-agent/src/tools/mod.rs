@@ -13,8 +13,8 @@ pub mod registry;
 
 // Tool module implementations
 pub mod command;
+pub mod read_file;
 // Placeholder declarations for future tool modules
-// pub mod read_file;
 // pub mod write_file;
 // pub mod edit_file;
 // pub mod glob;
@@ -428,8 +428,10 @@ pub fn build_registry() -> ToolRegistry {
     // Task 5: Command tool for shell command execution
     registry.register(Box::new(crate::tools::command::CommandTool));
 
-    // Future tools (to be implemented in Tasks 6-12):
-    // registry.register(Box::new(ReadFileTool));
+    // Task 6: Read file tool for reading file contents
+    registry.register(Box::new(crate::tools::read_file::ReadFileTool));
+
+    // Future tools (to be implemented in Tasks 7-12):
     // registry.register(Box::new(WriteFileTool));
     // registry.register(Box::new(EditFileTool));
     // registry.register(Box::new(GlobTool));
