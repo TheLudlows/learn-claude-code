@@ -14,6 +14,9 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::tools::trait_def::ToolContext;
+use crate::tools::registry::ToolRegistry;
+
 /// 工作目录
 pub fn workdir() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| ".".into())
@@ -380,6 +383,17 @@ fn with_error_prefix(prefix: &str, message: &str) -> String {
 ///
 /// 这是 s02 的核心：加一个工具只需要在这里加一个 match 分支。
 /// 循环逻辑保持不变。
+/// Dispatch tool using the new tool registry
+pub async fn dispatch_tool_new(
+    registry: &ToolRegistry,
+    ctx: &ToolContext<'_>,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Option<String> {
+    registry.dispatch(tool_name, ctx, input).await
+}
+
+/// Legacy dispatch tool function (deprecated)
 pub fn dispatch_tool(tool_name: &str, input: &serde_json::Value) -> String {
     let result = match tool_name {
         "command" => {

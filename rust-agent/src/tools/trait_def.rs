@@ -22,12 +22,14 @@ pub enum PermissionCheck {
 /// Context provided to tools during execution
 ///
 /// This struct provides dependency injection for tools, giving them access
-/// to shared resources like the HTTP client and hooks system.
+/// to shared resources like the HTTP client, hooks system, and tool registry.
 pub struct ToolContext<'a> {
     /// HTTP client for making API requests
     pub client: &'a crate::client::Client,
     /// Hooks system for registering and triggering callbacks
     pub hooks: &'a crate::hooks::Hooks,
+    /// Tool registry for accessing registered tools
+    pub registry: &'a crate::tools::registry::ToolRegistry,
 }
 
 /// Async trait that all tools must implement

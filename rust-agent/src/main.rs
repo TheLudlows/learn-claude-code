@@ -37,11 +37,13 @@ Key insight: the loop stays the same; only the four trigger points are wired in.
 use rust_agent::client::{Client, ContentBlock, Message};
 use rust_agent::hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
 use rust_agent::permission::permission_hook;
+use rust_agent::tools::registry::ToolRegistry;
+use rust_agent::tools::trait_def::ToolContext;
+use rust_agent::tools_legacy::get_tool_definitions;
 use dotenv::dotenv;
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use rust_agent::tools_legacy::{dispatch_tool, get_tool_definitions};
 
 /// 执行单个工具调用（含 PreToolUse 拦截）。
 ///
@@ -50,24 +52,35 @@ use rust_agent::tools_legacy::{dispatch_tool, get_tool_definitions};
 /// 作为独立 user 消息注入，不再覆盖 tool_result。
 async fn execute_tool(
     client: &Client,
+    registry: &ToolRegistry,
     name: &str,
     input: &serde_json::Value,
     hooks: &Hooks,
 ) -> String {
     // PreToolUse 拦截
-    if let Some(reason) = hooks.trigger_pre_tool(name, input) {
+    if let Some(reason) = hooks.trigger_pre_tool(registry, name, input) {
         return reason;
     }
+
+    // Create ToolContext for tool execution
+    let tool_ctx = ToolContext {
+        client,
+        hooks,
+        registry,
+    };
 
     // 执行工具（PostToolUse 提醒由调用方注入，见 agent_loop）
     if name == "task" {
         if let Some(prompt) = input.get("prompt").and_then(|p| p.as_str()) {
-            rust_agent::subagent::run_subagent_loop(client, prompt, hooks).await.unwrap_or_else(|e| format!("Subagent error: {}", e))
+            rust_agent::subagent::run_subagent_loop(client, &registry, prompt, hooks).await.unwrap_or_else(|e| format!("Subagent error: {}", e))
         } else {
             "Error: missing prompt".to_string()
         }
     } else {
-        dispatch_tool(name, input)
+        match registry.dispatch(name, &tool_ctx, input).await {
+            Some(result) => result,
+            None => "Error: tool not found".to_string(),
+        }
     }
 }
 
@@ -78,6 +91,7 @@ async fn execute_tool(
 /// 而是在固定节点上 trigger_hooks(PreToolUse / PostToolUse / Stop)。
 async fn agent_loop(
     client: &Client,
+    registry: &ToolRegistry,
     system: &str,
     messages: &mut Vec<Message>,
     hooks: &Hooks,
@@ -117,7 +131,7 @@ async fn agent_loop(
         let mut reminders: Vec<String> = Vec::new();
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                let tool_output = execute_tool(client, name, input, hooks).await;
+                let tool_output = execute_tool(client, &registry, name, input, hooks).await;
                 // 打印工具执行结果（此前只喂回 LLM，用户看不到工具返回了什么）
                 {
                     let mut out = io::stdout().lock();
@@ -211,6 +225,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     hooks.on_stop(summary_hook);
     hooks.on_post_tool(todo_reminder_hook);
 
+    // Build tool registry
+    let registry = rust_agent::tools::build_registry();
+
     let mut messages: Vec<Message> = Vec::new();
 
     // 初始化 TodoManager 并设置全局实例
@@ -239,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }],
         });
 
-        if let Err(e) = agent_loop(&client, &system, &mut messages, &hooks).await {
+        if let Err(e) = agent_loop(&client, &registry, &system, &mut messages, &hooks).await {
             eprintln!("Error: {}", e);
         }
 

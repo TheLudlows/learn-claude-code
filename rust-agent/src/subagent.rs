@@ -10,6 +10,7 @@
 
 use crate::client::{Client, ContentBlock, Message};
 use crate::hooks::{assemble_post_tool_messages, Hooks};
+use crate::tools::registry::ToolRegistry;
 use crate::tools_legacy::{dispatch_tool, get_subagent_tool_definitions};
 
 /// 子 agent 的最大轮数限制
@@ -47,6 +48,7 @@ fn extract_final_text(content: &[ContentBlock]) -> Option<String> {
 /// 只返回最终文本给父进程，中间对话被丢弃。
 pub async fn run_subagent_loop(
     client: &Client,
+    registry: &ToolRegistry,
     prompt: &str,
     hooks: &Hooks,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -105,7 +107,7 @@ pub async fn run_subagent_loop(
                 println!("\x1b[90m[sub] {} {:?}\x1b[0m", name, input);
 
                 // 触发 PreToolUse hook（共享权限检查）
-                if let Some(reason) = hooks.trigger_pre_tool(name, input) {
+                if let Some(reason) = hooks.trigger_pre_tool(registry, name, input) {
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: reason,

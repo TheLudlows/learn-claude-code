@@ -21,11 +21,12 @@ hooks.rs - 钩子系统 (s04)
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::client::{ContentBlock, Message};
+use crate::tools::registry::ToolRegistry;
 use crate::tools_legacy::workdir;
 
 // ---- 回调类型 ----
 pub type PromptHook = fn(&str);
-pub type PreToolHook = fn(&str, &serde_json::Value) -> Option<String>;
+pub type PreToolHook = fn(&ToolRegistry, &str, &serde_json::Value) -> Option<String>;
 pub type PostToolHook = fn(&str, &serde_json::Value, &str) -> Option<String>;
 pub type StopHook = fn(&[Message]) -> Option<String>;
 
@@ -64,9 +65,9 @@ impl Hooks {
     }
 
     /// 工具执行前触发。第一个返回 Some(reason) 的回调短路 -> 该工具被拦截。
-    pub fn trigger_pre_tool(&self, name: &str, input: &serde_json::Value) -> Option<String> {
+    pub fn trigger_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
         for f in &self.pre_tool {
-            if let Some(reason) = f(name, input) {
+            if let Some(reason) = f(registry, name, input) {
                 return Some(reason);
             }
         }
@@ -201,20 +202,21 @@ mod tests {
     use super::*;
     use crate::client::Message;
 
-    fn always_block(_n: &str, _i: &serde_json::Value) -> Option<String> {
+    fn always_block(_r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
         Some("nope".to_string())
     }
-    fn never_block(_n: &str, _i: &serde_json::Value) -> Option<String> {
+    fn never_block(_r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
         None
     }
-    fn panic_if_called(_n: &str, _i: &serde_json::Value) -> Option<String> {
+    fn panic_if_called(_r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
         panic!("second hook must not run after a block")
     }
 
     #[test]
     fn empty_registry_allows() {
         let h = Hooks::new();
-        assert!(h.trigger_pre_tool("command", &serde_json::json!({})).is_none());
+        let registry = ToolRegistry::new();
+        assert!(h.trigger_pre_tool(&registry, "command", &serde_json::json!({})).is_none());
     }
 
     #[test]
@@ -222,8 +224,9 @@ mod tests {
         let mut h = Hooks::new();
         h.on_pre_tool(always_block);
         h.on_pre_tool(panic_if_called); // 没短路就会 panic
+        let registry = ToolRegistry::new();
         assert_eq!(
-            h.trigger_pre_tool("command", &serde_json::json!({})),
+            h.trigger_pre_tool(&registry, "command", &serde_json::json!({})),
             Some("nope".to_string())
         );
     }
@@ -233,7 +236,8 @@ mod tests {
         let mut h = Hooks::new();
         h.on_pre_tool(never_block);
         h.on_pre_tool(never_block);
-        assert!(h.trigger_pre_tool("command", &serde_json::json!({})).is_none());
+        let registry = ToolRegistry::new();
+        assert!(h.trigger_pre_tool(&registry, "command", &serde_json::json!({})).is_none());
     }
 
     #[test]

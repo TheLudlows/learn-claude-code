@@ -16,6 +16,7 @@ Option<String>(Some=拦截理由, None=放行), 注册为 PreToolUse 钩子,
 */
 
 use crate::tools_legacy::workdir;
+use crate::tools::registry::ToolRegistry;
 use std::io::{self, Write};
 use std::path::{Component, PathBuf};
 
@@ -85,7 +86,7 @@ fn ask_user(name: &str, input: &serde_json::Value, reason: &str) -> bool {
 /// 循环经 `hooks.trigger_pre_tool()` 调用本函数; 末尾返回 None(而非 false),
 /// 才符合 "三道都没命中 -> 放行" 的语义 —— 这也修掉了 s03 check_permission
 /// 末尾 `return false` 把所有工具都拒掉的 bug。
-pub fn permission_hook(name: &str, input: &serde_json::Value) -> Option<String> {
+pub fn permission_hook(_registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
     // 闸门 1: 硬拒绝
     if name == "command" {
         let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -141,8 +142,9 @@ mod tests {
     #[test]
     fn permission_hook_allows_safe() {
         // 安全命令: 不进 deny list, 不命中规则 -> 放行(且不读 stdin)
+        let registry = ToolRegistry::new();
         assert_eq!(
-            permission_hook("command", &serde_json::json!({"command": "ls"})),
+            permission_hook(&registry, "command", &serde_json::json!({"command": "ls"})),
             None
         );
     }
@@ -150,8 +152,9 @@ mod tests {
     #[test]
     fn permission_hook_blocks_deny_list() {
         // 命中闸门 1, 直接拦截(且不读 stdin)
+        let registry = ToolRegistry::new();
         assert_eq!(
-            permission_hook("command", &serde_json::json!({"command": "sudo apt update"})),
+            permission_hook(&registry, "command", &serde_json::json!({"command": "sudo apt update"})),
             Some("Permission denied: 'sudo' on deny list".to_string())
         );
     }
