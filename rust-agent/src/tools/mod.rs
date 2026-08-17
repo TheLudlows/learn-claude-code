@@ -11,9 +11,9 @@ This module contains the tool system infrastructure:
 pub mod trait_def;
 pub mod registry;
 
+// Tool module implementations
+pub mod command;
 // Placeholder declarations for future tool modules
-// (to be implemented in Tasks 5-12)
-// pub mod command;
 // pub mod read_file;
 // pub mod write_file;
 // pub mod edit_file;
@@ -420,17 +420,22 @@ pub fn normalize(path_str: &str) -> PathBuf {
 
 /// Build and return a tool registry with all tools registered.
 ///
-/// This function will be populated with individual tool implementations
-/// in Tasks 5-12. For now, it returns an empty registry.
+/// This function populates the registry with individual tool implementations.
+/// Additional tools will be added in Tasks 6-12.
 pub fn build_registry() -> ToolRegistry {
-    ToolRegistry::new()
-    // Individual tools will be registered here in future tasks:
-    // registry.register(Box::new(CommandTool));
+    let mut registry = ToolRegistry::new();
+
+    // Task 5: Command tool for shell command execution
+    registry.register(Box::new(crate::tools::command::CommandTool));
+
+    // Future tools (to be implemented in Tasks 6-12):
     // registry.register(Box::new(ReadFileTool));
     // registry.register(Box::new(WriteFileTool));
     // registry.register(Box::new(EditFileTool));
     // registry.register(Box::new(GlobTool));
     // ...
+
+    registry
 }
 
 // Tests moved from tools_legacy.rs
