@@ -1,3 +1,4 @@
+pub mod builtins;
 pub mod client;
 pub mod compact;
 pub mod error;

@@ -13,18 +13,15 @@ hooks.rs - 钩子系统 (s04)
   Stop        返回 Some(msg)    -> 注入 msg 并继续循环, 不退出
   UserPromptSubmit 的返回值不参与控制流。
 
-回调用 trait 对象 (Box<dyn HookTrait + Send + Sync>): 每个事件一个 trait,
+回调用 trait 对象 (Box<dyn TraitX>, 各 trait 带 Send + Sync 超trait): 每个事件一个 trait,
 钩子以结构体实现, 注册时装箱。相比裸 fn 指针多一次堆分配, 但换取了
 钩子可携带 owned 状态 (如 TodoReminderHook 的计数器, 不再依赖 static 全局),
 且 Send + Sync 超trait 保证 Box<dyn> 可跨 async 边界。循环只调 trigger_*,
 具体逻辑全在回调里 —— 这正是 s04 的要点。
 */
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::client::{ContentBlock, Message};
 use crate::tools::registry::ToolRegistry;
-use crate::tools::workdir;
 
 // ---- 回调 trait ----
 pub trait PromptHook: Send + Sync {
@@ -146,91 +143,6 @@ pub fn assemble_post_tool_messages(
     }
 
     out
-}
-
-// ---- 内置钩子 (Task 2 将迁至 builtins.rs; 权限检查见 permission::PermissionHook) ----
-
-/// PostToolUse: 在 3 轮未使用 todo_write 时注入提醒。
-/// 计数器为 owned 字段, 不再依赖 static 全局 —— 不同 Hooks 实例互不干扰。
-pub struct TodoReminderHook {
-    rounds_since_todo: AtomicUsize,
-}
-
-impl TodoReminderHook {
-    pub fn new() -> Self {
-        Self {
-            rounds_since_todo: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl Default for TodoReminderHook {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PostToolHook for TodoReminderHook {
-    fn on_post_tool(&self, name: &str, _input: &serde_json::Value, _output: &str) -> Option<String> {
-        if name == "todo_write" {
-            self.rounds_since_todo.store(0, Ordering::SeqCst);
-            None
-        } else {
-            let count = self.rounds_since_todo.fetch_add(1, Ordering::SeqCst) + 1;
-            if count >= 3 {
-                self.rounds_since_todo.store(0, Ordering::SeqCst);
-                Some("<reminder>Update your todos.</reminder>".to_string())
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// UserPromptSubmit: 记录当前工作目录。
-pub struct ContextInjectHook;
-
-impl PromptHook for ContextInjectHook {
-    fn on_prompt(&self, _query: &str) {
-        println!(
-            "\x1b[90m[HOOK] UserPromptSubmit: working in {}\x1b[0m",
-            workdir().display()
-        );
-    }
-}
-
-/// PostToolUse: 输出过大时提醒。
-pub struct LargeOutputHook;
-
-impl PostToolHook for LargeOutputHook {
-    fn on_post_tool(&self, name: &str, _input: &serde_json::Value, output: &str) -> Option<String> {
-        if output.len() > 100_000 {
-            println!(
-                "\x1b[33m[HOOK] Large output from {}: {} chars\x1b[0m",
-                name,
-                output.len()
-            );
-        }
-        None
-    }
-}
-
-/// Stop: 收尾统计本轮用过的工具次数。
-pub struct SummaryHook;
-
-impl StopHook for SummaryHook {
-    fn on_stop(&self, messages: &[Message]) -> Option<String> {
-        let tool_count = messages
-            .iter()
-            .flat_map(|m| m.content.iter())
-            .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
-            .count();
-        println!(
-            "\x1b[90m[HOOK] Stop: session used {} tool calls\x1b[0m",
-            tool_count
-        );
-        None
-    }
 }
 
 #[cfg(test)]

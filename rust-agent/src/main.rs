@@ -37,7 +37,8 @@ Key insight: the loop stays the same; compaction runs transparently before each 
 use rust_agent::client::{Client, ContentBlock, Message};
 use rust_agent::compact::{ContextCompactor, MAX_REACTIVE_RETRIES};
 use rust_agent::error::AgentError;
-use rust_agent::hooks::{assemble_post_tool_messages, ContextInjectHook, Hooks, LargeOutputHook, SummaryHook, TodoReminderHook};
+use rust_agent::builtins::{ContextInjectHook, LargeOutputHook, SummaryHook, TodoReminderHook};
+use rust_agent::hooks::{assemble_post_tool_messages, Hooks};
 use rust_agent::permission::PermissionHook;
 use rust_agent::tools::{workdir, ToolContext, ToolRegistry};
 use dotenv::dotenv;
