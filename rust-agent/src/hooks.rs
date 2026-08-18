@@ -13,8 +13,10 @@ hooks.rs - 钩子系统 (s04)
   Stop        返回 Some(msg)    -> 注入 msg 并继续循环, 不退出
   UserPromptSubmit 的返回值不参与控制流。
 
-回调用裸 fn 指针(Copy、零开销), 对应 Python "按名注册函数" 的风格,
-也免去 Box<dyn Fn> 的堆分配与 Send/Sync 约束。循环只调 trigger_*,
+回调用 trait 对象 (Box<dyn HookTrait + Send + Sync>): 每个事件一个 trait,
+钩子以结构体实现, 注册时装箱。相比裸 fn 指针多一次堆分配, 但换取了
+钩子可携带 owned 状态 (如 TodoReminderHook 的计数器, 不再依赖 static 全局),
+且 Send + Sync 超trait 保证 Box<dyn> 可跨 async 边界。循环只调 trigger_*,
 具体逻辑全在回调里 —— 这正是 s04 的要点。
 */
 
@@ -24,19 +26,27 @@ use crate::client::{ContentBlock, Message};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::workdir;
 
-// ---- 回调类型 ----
-pub type PromptHook = fn(&str);
-pub type PreToolHook = fn(&ToolRegistry, &str, &serde_json::Value) -> Option<String>;
-pub type PostToolHook = fn(&str, &serde_json::Value, &str) -> Option<String>;
-pub type StopHook = fn(&[Message]) -> Option<String>;
+// ---- 回调 trait ----
+pub trait PromptHook: Send + Sync {
+    fn on_prompt(&self, query: &str);
+}
+pub trait PreToolHook: Send + Sync {
+    fn on_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String>;
+}
+pub trait PostToolHook: Send + Sync {
+    fn on_post_tool(&self, name: &str, input: &serde_json::Value, output: &str) -> Option<String>;
+}
+pub trait StopHook: Send + Sync {
+    fn on_stop(&self, messages: &[Message]) -> Option<String>;
+}
 
 /// 钩子注册表: 事件 -> 回调列表。
 #[derive(Default)]
 pub struct Hooks {
-    user_prompt: Vec<PromptHook>,
-    pre_tool: Vec<PreToolHook>,
-    post_tool: Vec<PostToolHook>,
-    stop: Vec<StopHook>,
+    user_prompt: Vec<Box<dyn PromptHook>>,
+    pre_tool: Vec<Box<dyn PreToolHook>>,
+    post_tool: Vec<Box<dyn PostToolHook>>,
+    stop: Vec<Box<dyn StopHook>>,
 }
 
 impl Hooks {
@@ -44,30 +54,30 @@ impl Hooks {
         Self::default()
     }
 
-    pub fn on_prompt(&mut self, f: PromptHook) {
-        self.user_prompt.push(f);
+    pub fn on_prompt<H: PromptHook + 'static>(&mut self, h: H) {
+        self.user_prompt.push(Box::new(h));
     }
-    pub fn on_pre_tool(&mut self, f: PreToolHook) {
-        self.pre_tool.push(f);
+    pub fn on_pre_tool<H: PreToolHook + 'static>(&mut self, h: H) {
+        self.pre_tool.push(Box::new(h));
     }
-    pub fn on_post_tool(&mut self, f: PostToolHook) {
-        self.post_tool.push(f);
+    pub fn on_post_tool<H: PostToolHook + 'static>(&mut self, h: H) {
+        self.post_tool.push(Box::new(h));
     }
-    pub fn on_stop(&mut self, f: StopHook) {
-        self.stop.push(f);
+    pub fn on_stop<H: StopHook + 'static>(&mut self, h: H) {
+        self.stop.push(Box::new(h));
     }
 
     /// 用户输入后、进入 LLM 前触发。返回值不参与控制流。
     pub fn trigger_prompt(&self, query: &str) {
         for f in &self.user_prompt {
-            f(query);
+            f.on_prompt(query);
         }
     }
 
     /// 工具执行前触发。第一个返回 Some(reason) 的回调短路 -> 该工具被拦截。
     pub fn trigger_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
         for f in &self.pre_tool {
-            if let Some(reason) = f(registry, name, input) {
+            if let Some(reason) = f.on_pre_tool(registry, name, input) {
                 return Some(reason);
             }
         }
@@ -77,7 +87,7 @@ impl Hooks {
     /// 工具执行后触发。返回 Some(msg) -> 由调用方作为独立 user 消息注入（不覆盖 tool_result）。
     pub fn trigger_post_tool(&self, name: &str, input: &serde_json::Value, output: &str) -> Option<String> {
         for f in &self.post_tool {
-            if let Some(msg) = f(name, input, output) {
+            if let Some(msg) = f.on_post_tool(name, input, output) {
                 return Some(msg);
             }
         }
@@ -87,7 +97,7 @@ impl Hooks {
     /// 循环即将退出时触发。返回 Some(msg) -> 注入 msg 并继续, 不退出。
     pub fn trigger_stop(&self, messages: &[Message]) -> Option<String> {
         for f in &self.stop {
-            if let Some(msg) = f(messages) {
+            if let Some(msg) = f.on_stop(messages) {
                 return Some(msg);
             }
         }
@@ -138,63 +148,89 @@ pub fn assemble_post_tool_messages(
     out
 }
 
-/// 自上次 todo_write 以来的轮次计数器
-static ROUNDS_SINCE_TODO: AtomicUsize = AtomicUsize::new(0);
+// ---- 内置钩子 (Task 2 将迁至 builtins.rs; 权限检查见 permission::PermissionHook) ----
 
-/// PostToolUse: 在 3 轮未使用 todo_write 时注入提醒
-pub fn todo_reminder_hook(
-    name: &str,
-    _input: &serde_json::Value,
-    _output: &str,
-) -> Option<String> {
-    if name == "todo_write" {
-        ROUNDS_SINCE_TODO.store(0, Ordering::SeqCst);
-        None
-    } else {
-        let count = ROUNDS_SINCE_TODO.fetch_add(1, Ordering::SeqCst) + 1;
-        if count >= 3 {
-            ROUNDS_SINCE_TODO.store(0, Ordering::SeqCst);
-            Some("<reminder>Update your todos.</reminder>".to_string())
-        } else {
-            None
+/// PostToolUse: 在 3 轮未使用 todo_write 时注入提醒。
+/// 计数器为 owned 字段, 不再依赖 static 全局 —— 不同 Hooks 实例互不干扰。
+pub struct TodoReminderHook {
+    rounds_since_todo: AtomicUsize,
+}
+
+impl TodoReminderHook {
+    pub fn new() -> Self {
+        Self {
+            rounds_since_todo: AtomicUsize::new(0),
         }
     }
 }
 
-// ---- 示例 hook (权限检查见 permission::permission_hook) ----
+impl Default for TodoReminderHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PostToolHook for TodoReminderHook {
+    fn on_post_tool(&self, name: &str, _input: &serde_json::Value, _output: &str) -> Option<String> {
+        if name == "todo_write" {
+            self.rounds_since_todo.store(0, Ordering::SeqCst);
+            None
+        } else {
+            let count = self.rounds_since_todo.fetch_add(1, Ordering::SeqCst) + 1;
+            if count >= 3 {
+                self.rounds_since_todo.store(0, Ordering::SeqCst);
+                Some("<reminder>Update your todos.</reminder>".to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
 
 /// UserPromptSubmit: 记录当前工作目录。
-pub fn context_inject_hook(_query: &str) {
-    println!(
-        "\x1b[90m[HOOK] UserPromptSubmit: working in {}\x1b[0m",
-        workdir().display()
-    );
+pub struct ContextInjectHook;
+
+impl PromptHook for ContextInjectHook {
+    fn on_prompt(&self, _query: &str) {
+        println!(
+            "\x1b[90m[HOOK] UserPromptSubmit: working in {}\x1b[0m",
+            workdir().display()
+        );
+    }
 }
 
 /// PostToolUse: 输出过大时提醒。
-pub fn large_output_hook(name: &str, _input: &serde_json::Value, output: &str) -> Option<String> {
-    if output.len() > 100_000 {
-        println!(
-            "\x1b[33m[HOOK] Large output from {}: {} chars\x1b[0m",
-            name,
-            output.len()
-        );
+pub struct LargeOutputHook;
+
+impl PostToolHook for LargeOutputHook {
+    fn on_post_tool(&self, name: &str, _input: &serde_json::Value, output: &str) -> Option<String> {
+        if output.len() > 100_000 {
+            println!(
+                "\x1b[33m[HOOK] Large output from {}: {} chars\x1b[0m",
+                name,
+                output.len()
+            );
+        }
+        None
     }
-    None
 }
 
 /// Stop: 收尾统计本轮用过的工具次数。
-pub fn summary_hook(messages: &[Message]) -> Option<String> {
-    let tool_count = messages
-        .iter()
-        .flat_map(|m| m.content.iter())
-        .filter(|b| matches!(b, crate::client::ContentBlock::ToolResult { .. }))
-        .count();
-    println!(
-        "\x1b[90m[HOOK] Stop: session used {} tool calls\x1b[0m",
-        tool_count
-    );
-    None
+pub struct SummaryHook;
+
+impl StopHook for SummaryHook {
+    fn on_stop(&self, messages: &[Message]) -> Option<String> {
+        let tool_count = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            .count();
+        println!(
+            "\x1b[90m[HOOK] Stop: session used {} tool calls\x1b[0m",
+            tool_count
+        );
+        None
+    }
 }
 
 #[cfg(test)]
@@ -202,14 +238,23 @@ mod tests {
     use super::*;
     use crate::client::Message;
 
-    fn always_block(_r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
-        Some("nope".to_string())
+    struct AlwaysBlock;
+    impl PreToolHook for AlwaysBlock {
+        fn on_pre_tool(&self, _r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
+            Some("nope".to_string())
+        }
     }
-    fn never_block(_r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
-        None
+    struct NeverBlock;
+    impl PreToolHook for NeverBlock {
+        fn on_pre_tool(&self, _r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
+            None
+        }
     }
-    fn panic_if_called(_r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
-        panic!("second hook must not run after a block")
+    struct PanicIfCalled;
+    impl PreToolHook for PanicIfCalled {
+        fn on_pre_tool(&self, _r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
+            panic!("second hook must not run after a block")
+        }
     }
 
     #[test]
@@ -222,8 +267,8 @@ mod tests {
     #[test]
     fn pre_tool_first_some_short_circuits() {
         let mut h = Hooks::new();
-        h.on_pre_tool(always_block);
-        h.on_pre_tool(panic_if_called); // 没短路就会 panic
+        h.on_pre_tool(AlwaysBlock);
+        h.on_pre_tool(PanicIfCalled); // 没短路就会 panic
         let registry = ToolRegistry::new();
         assert_eq!(
             h.trigger_pre_tool(&registry, "command", &serde_json::json!({})),
@@ -234,8 +279,8 @@ mod tests {
     #[test]
     fn none_passes_through() {
         let mut h = Hooks::new();
-        h.on_pre_tool(never_block);
-        h.on_pre_tool(never_block);
+        h.on_pre_tool(NeverBlock);
+        h.on_pre_tool(NeverBlock);
         let registry = ToolRegistry::new();
         assert!(h.trigger_pre_tool(&registry, "command", &serde_json::json!({})).is_none());
     }
@@ -319,11 +364,14 @@ mod tests {
 
     #[test]
     fn stop_some_forces_continue() {
-        fn force(_m: &[Message]) -> Option<String> {
-            Some("keep going".to_string())
+        struct Force;
+        impl StopHook for Force {
+            fn on_stop(&self, _m: &[Message]) -> Option<String> {
+                Some("keep going".to_string())
+            }
         }
         let mut h = Hooks::new();
-        h.on_stop(force);
+        h.on_stop(Force);
         assert_eq!(h.trigger_stop(&[]), Some("keep going".to_string()));
     }
 }

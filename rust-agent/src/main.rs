@@ -37,8 +37,8 @@ Key insight: the loop stays the same; compaction runs transparently before each 
 use rust_agent::client::{Client, ContentBlock, Message};
 use rust_agent::compact::{ContextCompactor, MAX_REACTIVE_RETRIES};
 use rust_agent::error::AgentError;
-use rust_agent::hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
-use rust_agent::permission::permission_hook;
+use rust_agent::hooks::{assemble_post_tool_messages, ContextInjectHook, Hooks, LargeOutputHook, SummaryHook, TodoReminderHook};
+use rust_agent::permission::PermissionHook;
 use rust_agent::tools::{workdir, ToolContext, ToolRegistry};
 use dotenv::dotenv;
 use std::env;
@@ -234,11 +234,11 @@ async fn main() -> Result<(), AgentError> {
 
     // s04: 注册钩子 —— 循环只调 trigger_*, 具体逻辑全在回调里
     let mut hooks = Hooks::new();
-    hooks.on_prompt(context_inject_hook);
-    hooks.on_pre_tool(permission_hook); // s03 三道闸门, 搬成 PreToolUse 回调
-    hooks.on_post_tool(large_output_hook);
-    hooks.on_stop(summary_hook);
-    hooks.on_post_tool(todo_reminder_hook);
+    hooks.on_prompt(ContextInjectHook);
+    hooks.on_pre_tool(PermissionHook); // s03 三道闸门, 搬成 PreToolUse 回调
+    hooks.on_post_tool(LargeOutputHook);
+    hooks.on_stop(SummaryHook);
+    hooks.on_post_tool(TodoReminderHook::new());
 
     // Build tool registry
     let registry = rust_agent::tools::build_registry();
