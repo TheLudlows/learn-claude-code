@@ -3,7 +3,7 @@
 //! client 只负责收集完整 `MessagesResponse`，不碰 stdout；打印全在这里。
 //! `render` / `render_tool_result` 写到任意 `io::Write`，便于测试。
 //!
-//! 着色走 `owo_colors`（替掉裸 ANSI 转义码）；UX 行（提示符 / 状态 / 权限 / 标题
+//! 着色走 `colored`（替掉裸 ANSI 转义码）；UX 行（提示符 / 状态 / 权限 / 标题
 //! 等）经本模块的 helper 统一写 stdout，自动遵守 `NO_COLOR`。诊断行走 `tracing`
 //!（RUST_LOG 控制），不在此处。
 //!
@@ -164,7 +164,7 @@ pub fn render_tool_result_with<W: Write>(
 // ---- UX 输出（直接写 stdout，自动遵守 NO_COLOR） ----
 //
 // 散落在 main / builtins / subagent / todo 里的裸 println + \x1b 全收敛到这儿。
-// 交互 UX 行用 owo_colors 着色；诊断行（[memory]/[snip_compact] 等）走 tracing，
+// 交互 UX 行用 colored 着色；诊断行（[memory]/[snip_compact] 等）走 tracing，
 // 不在此处。
 
 /// 提示符 ` >> `（cyan，无换行，flush 后由调用方读 stdin）。

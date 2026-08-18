@@ -21,7 +21,7 @@ encoding_rs = "0.8"
 path-clean = "1"
 dunce = "1"
 thiserror = "2"
-colored = "3"
+owo-colors = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fastrand = "2.1"
