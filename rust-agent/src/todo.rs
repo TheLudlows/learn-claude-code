@@ -154,7 +154,7 @@ pub fn run_todo_write(todos: &serde_json::Value) -> String {
 
     match result {
         Ok(rendered) => {
-            println!("\n\x1b[33m## Current Tasks\x1b[0m\n{}", rendered);
+            crate::output::heading("Current Tasks", &rendered);
             rendered
         }
         Err(e) => format!("Error: {}", e),

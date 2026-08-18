@@ -29,7 +29,7 @@ pub(crate) fn glob_in(pattern: &str, base: &Path) -> Vec<String> {
     let paths = match glob::glob(&full_pattern) {
         Ok(paths) => paths,
         Err(e) => {
-            eprintln!("glob pattern error: {}", e);
+            tracing::warn!("glob pattern error: {}", e);
             return results;
         }
     };
@@ -46,7 +46,7 @@ pub(crate) fn glob_in(pattern: &str, base: &Path) -> Vec<String> {
                 }
             }
             Err(e) => {
-                eprintln!("glob entry error: {}", e);
+                tracing::warn!("glob entry error: {}", e);
             }
         }
     }

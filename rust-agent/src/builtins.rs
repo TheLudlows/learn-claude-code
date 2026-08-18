@@ -11,11 +11,11 @@ main.rs 默认注册的钩子集中于此(5 个内置钩子全部到位):
 均实现 hooks.rs 中对应 trait, 通过 hooks.on_* 注册。
 */
 
-use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::client::{ContentBlock, Message};
 use crate::hooks::{PostToolHook, PreToolHook, PromptHook, StopHook};
+use crate::output;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::trait_def::PermissionCheck;
 use crate::tools::workdir;
@@ -62,10 +62,7 @@ pub struct ContextInjectHook;
 
 impl PromptHook for ContextInjectHook {
     fn on_prompt(&self, _query: &str) {
-        println!(
-            "\x1b[90m[HOOK] UserPromptSubmit: working in {}\x1b[0m",
-            workdir().display()
-        );
+        tracing::info!("[HOOK] UserPromptSubmit: working in {}", workdir().display());
     }
 }
 
@@ -75,11 +72,7 @@ pub struct LargeOutputHook;
 impl PostToolHook for LargeOutputHook {
     fn on_post_tool(&self, name: &str, _input: &serde_json::Value, output: &str) -> Option<String> {
         if output.len() > 100_000 {
-            println!(
-                "\x1b[33m[HOOK] Large output from {}: {} chars\x1b[0m",
-                name,
-                output.len()
-            );
+            tracing::warn!("[HOOK] Large output from {}: {} chars", name, output.len());
         }
         None
     }
@@ -95,10 +88,7 @@ impl StopHook for SummaryHook {
             .flat_map(|m| m.content.iter())
             .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
             .count();
-        println!(
-            "\x1b[90m[HOOK] Stop: session used {} tool calls\x1b[0m",
-            tool_count
-        );
+        tracing::info!("[HOOK] Stop: session used {} tool calls", tool_count);
         None
     }
 }
@@ -119,12 +109,9 @@ fn check_deny_list(command: &str) -> Option<&'static str> {
 
 /// 闸门 3: 暂停等用户确认
 fn ask_user(name: &str, input: &serde_json::Value, reason: &str) -> bool {
-    println!("\n\x1b[33m[permission] {}\x1b[0m", reason);
-    println!("   Tool: {}({})", name, input);
-    print!("   Allow? [y/N] ");
-    io::stdout().flush().ok();
+    output::permission(reason, name, input);
     let mut line = String::new();
-    io::stdin().read_line(&mut line).ok();
+    std::io::stdin().read_line(&mut line).ok();
     matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
@@ -141,7 +128,7 @@ impl PreToolHook for PermissionHook {
         if name == "command" {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(p) = check_deny_list(cmd) {
-                println!("\n\x1b[31m[blocked] '{}' is on the deny list\x1b[0m", p);
+                output::blocked(p);
                 return Some(format!("Permission denied: '{}' on deny list", p));
             }
         }

@@ -1,19 +1,18 @@
-//! LLM 内容打印模块。
+//! LLM 内容打印模块 + 统一 UX 输出。
 //!
 //! client 只负责收集完整 `MessagesResponse`，不碰 stdout；打印全在这里。
-//! `render` 写到任意 `io::Write`，便于测试。
+//! `render` / `render_tool_result` 写到任意 `io::Write`，便于测试。
 //!
-//! 零依赖：用裸 ANSI 转义码着色，与 main.rs 的 `\x1b[36m You >>` 同一套。
+//! 着色走 `owo_colors`（替掉裸 ANSI 转义码）；UX 行（提示符 / 状态 / 权限 / 标题
+//! 等）经本模块的 helper 统一写 stdout，自动遵守 `NO_COLOR`。诊断行走 `tracing`
+//!（RUST_LOG 控制），不在此处。
+//!
 //! `render_with(.., color=false)` 路径不输出任何转义码，测试据此做确定性
 //! 断言；`NO_COLOR` 置位时公共入口 `render` / `render_tool_result` 自动关色。
 
 use crate::client::{ContentBlock, MessagesResponse};
-use std::io::Write;
-
-// ANSI 转义码（与 main.rs 的 `\x1b[36m You >>` 同一套）。
-const CYAN: &str = "\x1b[1;36m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
+use owo_colors::OwoColorize;
+use std::io::{self, Write};
 
 /// 超过此字符数的结果折叠成单行并截断。
 const TRUNCATE_AT: usize = 200;
@@ -21,15 +20,6 @@ const TRUNCATE_AT: usize = 200;
 /// `NO_COLOR` 置位时关掉颜色（https://no-color.org，零依赖，方便 CI）。
 fn colors_enabled() -> bool {
     std::env::var_os("NO_COLOR").is_none()
-}
-
-/// `color=true` 时给 `s` 套上 `code...RESET`，否则原样返回。
-fn paint(code: &str, s: &str, color: bool) -> String {
-    if color {
-        format!("{code}{s}{RESET}")
-    } else {
-        s.to_string()
-    }
 }
 
 /// 把字节数格式化成 `42 B` / `1.2 KB` 之类。
@@ -64,6 +54,8 @@ fn format_input(input: &serde_json::Value) -> String {
     }
 }
 
+// ---- LLM 内容渲染（写到任意 io::Write，可测试） ----
+
 /// 把一轮响应里的 LLM 内容写到 `out`（公共入口，按 `NO_COLOR` 自动开关颜色）。
 pub fn render<W: Write>(response: &MessagesResponse, out: &mut W) {
     render_with(response, out, colors_enabled());
@@ -80,17 +72,33 @@ pub fn render_with<W: Write>(response: &MessagesResponse, out: &mut W, color: bo
                     let _ = writeln!(out);
                 }
                 first = false;
-                let _ = writeln!(out, "{}{}", paint(DIM, "▍ ", color), text);
+                let bar = if color {
+                    format!("{}", "▍ ".dimmed())
+                } else {
+                    "▍ ".to_string()
+                };
+                let _ = writeln!(out, "{bar}{text}");
             }
             ContentBlock::ToolUse { name, input, .. } => {
                 if !first {
                     let _ = writeln!(out);
                 }
                 first = false;
-                let _ = writeln!(out, "{}", paint(CYAN, &format!("⚙ {name}"), color));
+                let label = format!("⚙ {name}");
+                let head = if color {
+                    format!("{}", label.cyan().bold())
+                } else {
+                    label
+                };
+                let _ = writeln!(out, "{head}");
                 let input_str = format_input(input);
                 if !input_str.is_empty() {
-                    let _ = writeln!(out, "{}", paint(DIM, &input_str, color));
+                    let dim_input = if color {
+                        format!("{}", input_str.dimmed())
+                    } else {
+                        input_str
+                    };
+                    let _ = writeln!(out, "{dim_input}");
                 }
             }
             ContentBlock::ToolResult { .. } => {}
@@ -104,7 +112,12 @@ pub fn render_tool_result<W: Write>(name: &str, result: &str, out: &mut W) {
 }
 
 /// 同 `render_tool_result`，但颜色由参数控制（测试传 `false`）。
-pub fn render_tool_result_with<W: Write>(name: &str, result: &str, out: &mut W, color: bool) {
+pub fn render_tool_result_with<W: Write>(
+    name: &str,
+    result: &str,
+    out: &mut W,
+    color: bool,
+) {
     let size = human_size(result.len());
     // 换行折叠成空格、去首尾空白；按字符截断，避免截断多字节 UTF-8。
     let collapsed: String = result
@@ -121,16 +134,123 @@ pub fn render_tool_result_with<W: Write>(name: &str, result: &str, out: &mut W, 
         (collapsed, false)
     };
 
+    let prefix = format!("↳ {name} 结果 ({size}): ");
     let _ = writeln!(out); // 与上方内容空一行
-    let _ = write!(out, "{}", paint(DIM, &format!("↳ {name} 结果 ({size}): "), color));
+    let _ = write!(
+        out,
+        "{}",
+        if color {
+            format!("{}", prefix.dimmed())
+        } else {
+            prefix
+        }
+    );
     let _ = write!(out, "{content}");
     let _ = writeln!(out);
     if truncated {
+        let trunc_msg = format!("  (已截断，共 {total} 字符)");
         let _ = writeln!(
             out,
             "{}",
-            paint(DIM, &format!("  (已截断，共 {total} 字符)"), color)
+            if color {
+                format!("{}", trunc_msg.dimmed())
+            } else {
+                trunc_msg
+            }
         );
+    }
+}
+
+// ---- UX 输出（直接写 stdout，自动遵守 NO_COLOR） ----
+//
+// 散落在 main / builtins / subagent / todo 里的裸 println + \x1b 全收敛到这儿。
+// 交互 UX 行用 owo_colors 着色；诊断行（[memory]/[snip_compact] 等）走 tracing，
+// 不在此处。
+
+/// 提示符 ` >> `（cyan，无换行，flush 后由调用方读 stdin）。
+pub fn prompt() {
+    let mut out = io::stdout().lock();
+    let _ = write!(
+        out,
+        "{}",
+        if colors_enabled() {
+            format!("{}", " >> ".cyan())
+        } else {
+            " >> ".to_string()
+        }
+    );
+    let _ = out.flush();
+}
+
+/// 普通横幅行（不着色）。
+pub fn banner(msg: &str) {
+    println!("{msg}");
+}
+
+/// 空行。
+pub fn blank() {
+    println!();
+}
+
+/// 黄色状态行（如 `[reactive compact]`、`[Subagent started]`）。
+pub fn status(msg: &str) {
+    if colors_enabled() {
+        println!("{}", msg.yellow());
+    } else {
+        println!("{msg}");
+    }
+}
+
+/// dim 的子 agent 工具跟踪行 `[sub] {name} {input:?}`。
+pub fn sub_trace(name: &str, input: &serde_json::Value) {
+    let line = format!("[sub] {} {:?}", name, input);
+    if colors_enabled() {
+        println!("{}", line.dimmed());
+    } else {
+        println!("{line}");
+    }
+}
+
+/// 权限确认三行：黄 `[permission] {reason}` + `   Tool: {name}({input})` +
+/// `   Allow? [y/N] `（末行无换行，flush 后由调用方读 stdin）。
+/// 仅 `[permission]` 行着色，与原实现一致。
+pub fn permission(reason: &str, name: &str, input: &serde_json::Value) {
+    let mut out = io::stdout().lock();
+    if colors_enabled() {
+        let _ = writeln!(out, "\n{}", format!("[permission] {reason}").yellow());
+    } else {
+        let _ = writeln!(out, "\n[permission] {reason}");
+    }
+    let _ = writeln!(out, "   Tool: {}({})", name, input);
+    let _ = write!(out, "   Allow? [y/N] ");
+    let _ = out.flush();
+}
+
+/// 红色 `[blocked] '{pattern}' is on the deny list`（前置空行）。
+pub fn blocked(pattern: &str) {
+    let msg = format!("[blocked] '{}' is on the deny list", pattern);
+    if colors_enabled() {
+        println!("\n{}", msg.red());
+    } else {
+        println!("\n{msg}");
+    }
+}
+
+/// 红色错误行。
+pub fn error(msg: &str) {
+    if colors_enabled() {
+        println!("{}", msg.red());
+    } else {
+        println!("{msg}");
+    }
+}
+
+/// 黄色标题 + 正文：`\n## {title}\n{body}`。
+pub fn heading(title: &str, body: &str) {
+    if colors_enabled() {
+        println!("\n{}\n{}", format!("## {title}").yellow(), body);
+    } else {
+        println!("\n## {title}\n{body}");
     }
 }
 

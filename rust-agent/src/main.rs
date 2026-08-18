@@ -48,8 +48,9 @@ use rust_agent::hooks::{assemble_post_tool_messages, Hooks};
 use rust_agent::tools::{workdir, ToolContext, ToolRegistry};
 use dotenv::dotenv;
 use std::env;
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
+use tracing_subscriber::EnvFilter;
 
 /// 执行单个工具调用（含 PreToolUse 拦截）。
 ///
@@ -123,7 +124,7 @@ async fn agent_loop(
             Err(e) => {
                 // s08: prompt_too_long 时尝试 reactive_compact 重试一次
                 if e.is_prompt_too_long() && reactive_retries < MAX_REACTIVE_RETRIES {
-                    println!("\x1b[33m[reactive compact]\x1b[0m");
+                    rust_agent::output::status("[reactive compact]");
                     compactor
                         .reactive_compact(client, messages, active_request)
                         .await?;
@@ -157,8 +158,8 @@ async fn agent_loop(
                 continue;
             }
             // s09: 真退出前提取持久记忆;有新写入再尝试整理(≥10 条才合并,失败恢复原文件)。
-            let stored = memory.extract_memories(client, messages).await;
-            if stored > 0 {
+            if memory.extract_memories(client, messages).await > 0
+            {
                 let _ = memory.consolidate_memories(client).await;
             }
             break;
@@ -193,14 +194,22 @@ async fn agent_loop(
 #[tokio::main]
 async fn main() -> Result<(), AgentError> {
     dotenv().ok();
-    println!("Enter a question, press Enter to send. Type q to quit.\n");
+    // 诊断日志（[memory]/[snip_compact]/[persist] 等）：默认 INFO（与改前可见性一致），
+    // RUST_LOG=warn 静默诊断，=debug 更细。UX 行不走 tracing，仍由 output.rs 着色。
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+    rust_agent::output::banner("Enter a question, press Enter to send. Type q to quit.\n");
 
     let api_key = env::var("ANTHROPIC_AUTH_TOKEN")
         .or_else(|_| env::var("ANTHROPIC_API_KEY"))?;
     let base_url = env::var("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
     let model = env::var("MODEL_ID")?;
-    println!("base_url: {}, model: {}, key: {}", base_url, model, "***".to_string());
+    rust_agent::output::banner(&format!("base_url: {}, model: {}, key: {}", base_url, model, "***"));
 
     let client = Client::new(api_key, base_url, model);
 
@@ -220,10 +229,7 @@ async fn main() -> Result<(), AgentError> {
     let loader = rust_agent::skills::SkillLoader::scan(PathBuf::from(&skills_dir));
     let skill_count = loader.len();
     rust_agent::skills::set_instance(loader);
-    println!(
-        "Loaded {} skill(s) from {}",
-        skill_count, skills_dir
-    );
+    rust_agent::output::banner(&format!("Loaded {} skill(s) from {}", skill_count, skills_dir));
 
     // 组装 system prompt：固定的 agent 指令 + 技能目录（非空才加）+ load_skill 提示。
     // 目录只在 system prompt 里（每次调用都付这点开销）；完整正文在 load_skill 的 tool_result 里按需加载。
@@ -260,8 +266,7 @@ async fn main() -> Result<(), AgentError> {
     rust_agent::todo::set_instance(todo_manager);
 
     loop {
-        print!("\x1b[36m >> \x1b[0m");
-        io::stdout().flush()?;
+        rust_agent::output::prompt();
 
         let mut query = String::new();
         io::stdin().read_line(&mut query)?;
@@ -296,10 +301,10 @@ async fn main() -> Result<(), AgentError> {
         )
         .await
         {
-            eprintln!("Error: {}", e);
+            rust_agent::output::error(&format!("Error: {}", e));
         }
 
-        println!();
+        rust_agent::output::blank();
     }
 
     Ok(())

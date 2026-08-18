@@ -8,8 +8,6 @@ but can migrate to `AgentError` incrementally.
 
 /// Unified error type for the agent.
 ///
-/// 使用 `thiserror` derive 宏自动生成 `Display`、`Error`、`From` 实现，
-/// 替代原来 72 行手写样板代码。
 ///
 /// Variants:
 /// - `Api`: HTTP-level error from the LLM provider (non-2xx status).
@@ -63,10 +61,6 @@ impl AgentError {
     }
 }
 
-// ---- From conversions (非 #[from] 可处理的类型) ----
-//
-// 以下 From 实现将各种错误类型统一转为 `Other(String)`，
-// 因为 `Other` 变体是 `String` 而非源错误类型，thiserror 的 `#[from]` 无法自动推导。
 
 impl From<std::io::Error> for AgentError {
     fn from(e: std::io::Error) -> Self {

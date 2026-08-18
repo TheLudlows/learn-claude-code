@@ -380,8 +380,8 @@ impl MemoryStore {
                         }
                     }
                 }
-                println!(
-                    "\x1b[33m[memory] recall: {} records in catalog, selected {}: [{}]\x1b[0m",
+                tracing::info!(
+                    "[memory] recall: {} records in catalog, selected {}: [{}]",
                     records.len(),
                     selected.len(),
                     selected.join(", ")
@@ -390,8 +390,8 @@ impl MemoryStore {
             }
             Err(_) => {
                 let selected = keyword_memory_selection(&records, &query, max_items);
-                println!(
-                    "\x1b[33m[memory] recall: LLM failed → keyword fallback, selected {}: [{}]\x1b[0m",
+                tracing::warn!(
+                    "[memory] recall: LLM failed → keyword fallback, selected {}: [{}]",
                     selected.len(),
                     selected.join(", ")
                 );
@@ -424,8 +424,8 @@ impl MemoryStore {
             .iter()
             .filter_map(|v| v.get("content").and_then(|c| c.as_str()).map(|s| s.chars().count()))
             .sum();
-        println!(
-            "\x1b[33m[memory] recall: loaded {} chars from {} files\x1b[0m",
+        tracing::info!(
+            "[memory] recall: loaded {} chars from {} files",
             total_chars,
             loaded.len()
         );
@@ -445,8 +445,8 @@ impl MemoryStore {
             return 0;
         }
         let existing_records = self.list_memory_files();
-        println!(
-            "\x1b[33m[memory] extract: {} chars dialogue, {} existing records\x1b[0m",
+        tracing::info!(
+            "[memory] extract: {} chars dialogue, {} existing records",
             dialogue.chars().count(),
             existing_records.len()
         );
@@ -484,16 +484,13 @@ impl MemoryStore {
         let response = match client.stream_messages("", &req, &[], 1000).await {
             Ok(r) => r,
             Err(e) => {
-                println!("\x1b[33m[Memory extraction skipped: {}]\x1b[0m", e);
+                tracing::warn!("[Memory extraction skipped: {}]", e);
                 return 0;
             }
         };
         let text = response_text(&response);
         let items = extract_json_array(&text);
-        println!(
-            "\x1b[33m[memory] extract: {} candidates from model\x1b[0m",
-            items.len()
-        );
+        tracing::info!("[memory] extract: {} candidates from model", items.len());
 
         let mut records = existing_records;
         let mut stored = 0;
@@ -521,17 +518,15 @@ impl MemoryStore {
                     });
                     stored += 1;
                 }
-                Err(e) => println!("\x1b[33m[Memory write failed: {}]\x1b[0m", e),
+                Err(e) => tracing::warn!("[Memory write failed: {}]", e),
             }
         }
         if stored > 0 {
-            println!("\x1b[33m[Memory: stored {} records]\x1b[0m", stored);
+            tracing::info!("[Memory: stored {} records]", stored);
         }
         stored
     }
-
-    // ---- 整理 ----
-
+    
     /// ≥10 条时让模型合并去重,快照 + 失败恢复。返回整理后条数;失败返回 0。
     pub async fn consolidate_memories(&self, client: &Client) -> usize {
         let records = self.list_memory_files();
@@ -549,11 +544,11 @@ impl MemoryStore {
             .collect::<Vec<_>>()
             .join("\n\n");
         if catalog.chars().count() > CONSOLIDATE_INPUT_CHAR_LIMIT {
-            println!("\x1b[33m[Memory consolidation skipped: store too large]\x1b[0m");
+            tracing::warn!("[Memory consolidation skipped: store too large]");
             return 0;
         }
-        println!(
-            "\x1b[33m[memory] consolidate: {} records (≥ threshold {}), catalog {} chars\x1b[0m",
+        tracing::info!(
+            "[memory] consolidate: {} records (≥ threshold {}), catalog {} chars",
             records.len(),
             CONSOLIDATE_THRESHOLD,
             catalog.chars().count()
@@ -573,7 +568,7 @@ impl MemoryStore {
         let response = match client.stream_messages("", &req, &[], 3000).await {
             Ok(r) => r,
             Err(e) => {
-                println!("\x1b[33m[Memory consolidation skipped: {}]\x1b[0m", e);
+                tracing::warn!("[Memory consolidation skipped: {}]", e);
                 return 0;
             }
         };
@@ -591,11 +586,11 @@ impl MemoryStore {
             slug_set.insert(s.clone());
         }
         if consolidated.is_empty() || slugs.len() != slug_set.len() {
-            println!("\x1b[33m[Memory consolidation skipped: empty or duplicate records]\x1b[0m");
+            tracing::warn!("[Memory consolidation skipped: empty or duplicate records]");
             return 0;
         }
-        println!(
-            "\x1b[33m[memory] consolidate: {} → {} records after validation\x1b[0m",
+        tracing::info!(
+            "[memory] consolidate: {} → {} records after validation",
             records.len(),
             consolidated.len()
         );
@@ -612,8 +607,8 @@ impl MemoryStore {
 
         match self.replace_records(&consolidated) {
             Ok(()) => {
-                println!(
-                    "\x1b[33m[Memory: consolidated {} to {} records]\x1b[0m",
+                tracing::info!(
+                    "[Memory: consolidated {} to {} records]",
                     records.len(),
                     consolidated.len()
                 );
@@ -621,7 +616,7 @@ impl MemoryStore {
             }
             Err(e) => {
                 self.restore_from_snapshot(&snapshot);
-                println!("\x1b[33m[Memory consolidation skipped: {}]\x1b[0m", e);
+                tracing::warn!("[Memory consolidation skipped: {}]", e);
                 0
             }
         }

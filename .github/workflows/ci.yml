@@ -1,34 +1,37 @@
 name: CI
 
+# 只关注 rust-agent:仅当 rust-agent/ 或本 workflow 文件变动时才跑。
+# web/ 与各 s0x 章节(Python)不再纳入 CI。
 on:
   push:
     branches: [main]
+    paths:
+      - rust-agent/**
+      - .github/workflows/ci.yml
   pull_request:
     branches: [main]
+    paths:
+      - rust-agent/**
+      - .github/workflows/ci.yml
 
 jobs:
-  build:
+  lint-build:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: web
+        working-directory: rust-agent
 
     steps:
       # actions/checkout@v6
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
-      # actions/setup-node@v6
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: web/package-lock.json
+      # ubuntu-latest 自带 Rust stable,rustc/cargo/rustfmt/clippy 都在 PATH 上,
+      # 无需额外安装 toolchain。若以后要锁版本,在 rust-agent/ 放 rust-toolchain.toml。
+      - name: Format check
+        run: cargo fmt --check
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Type check
-        run: npx tsc --noEmit
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        run: npm run build
+        run: cargo build --all-targets

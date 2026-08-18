@@ -1,49 +1,30 @@
 name: Test
 
+# 只关注 rust-agent:仅当 rust-agent/ 或本 workflow 文件变动时才跑。
+# 需要 API key 的 #[ignore] 测试不会被普通 cargo test 触发,CI 安全。
 on:
   push:
     branches: [main]
+    paths:
+      - rust-agent/**
+      - .github/workflows/test.yml
   pull_request:
     branches: [main]
+    paths:
+      - rust-agent/**
+      - .github/workflows/test.yml
 
 jobs:
-  python-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      # actions/checkout@v6
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      - name: Set up Python
-        # actions/setup-python@v6
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt pytest
-
-      - name: Run Python smoke tests
-        run: python -m pytest tests -q
-
-  web-build:
+  rust-test:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: web
+        working-directory: rust-agent
+
     steps:
       # actions/checkout@v6
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
-      - name: Set up Node.js
-        # actions/setup-node@v6
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: web/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
+      # ubuntu-latest 自带 Rust stable。
+      - name: Run tests
+        run: cargo test --all-targets

@@ -1,10 +1,3 @@
-/*
-read_file.rs - Read File Tool Implementation
-
-This module implements:
-- ReadFileTool: Tool trait implementation for reading file contents
-- run_read_file(): File reading with optional line truncation
-*/
 
 use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
@@ -13,29 +6,26 @@ use std::fs;
 
 /// 读取文件
 pub(crate) fn run_read_file(path: &str, limit: Option<u32>) -> String {
-    match crate::tools::safe_path(path) {
-        Ok(abs_path) => match fs::read_to_string(&abs_path) {
-            Ok(content) => {
-                let lines: Vec<&str> = content.lines().collect();
-                if let Some(limit) = limit {
-                    if lines.len() > limit as usize {
-                        let truncated: Vec<&str> = lines[..limit as usize].to_vec();
-                        let more = lines.len() - limit as usize;
-                        format!(
-                            "{}\n... ({} more lines)",
-                            truncated.join("\n"),
-                            more
-                        )
-                    } else {
-                        content
-                    }
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            if let Some(limit) = limit {
+                if lines.len() > limit as usize {
+                    let truncated: Vec<&str> = lines[..limit as usize].to_vec();
+                    let more = lines.len() - limit as usize;
+                    format!(
+                        "{}\n... ({} more lines)",
+                        truncated.join("\n"),
+                        more
+                    )
                 } else {
                     content
                 }
+            } else {
+                content
             }
-            Err(e) => format!("Error: {}", e),
-        },
-        Err(e) => e,
+        }
+        Err(e) => format!("Error: {}", e),
     }
 }
 

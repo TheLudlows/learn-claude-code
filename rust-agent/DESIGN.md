@@ -291,10 +291,6 @@ Agent 持续工作时，读过的文件、执行过的命令和模型回复都�
 
 字符数只能估算 token。`stream_messages` 包进 `match`：命中 `prompt_too_long`/`too many tokens`/`request_too_large` 且重试次数 < `MAX_REACTIVE_RETRIES`(=1) 时，`reactive_compact` 保留最近 5 条（配对保护）、摘要更早历史、重试一次。再失败则向上抛。
 
-### compact 工具
-
-模型可在一个阶段结束后主动调用 `compact`。与 `task` 同模式特殊处理（不走 `dispatch_tool`）：先记 flag、追加占位 `tool_result`，**批次闭合后**（每个 tool_use 都有对应 tool_result）再 `compact_history`——既不留孤立 tool_result，也不在文件写入后丢失执行记录导致模型重复副作用。仅父 agent 可用。
-
 ### 切点保护
 
 `snip_compact` 和 `reactive_compact` 的切点都保护 `assistant(tool_use)` 与 `user(tool_result)` 的配对：孤立的 tool_result 缺少对应调用，下一次 API 请求会被判定为无效。
@@ -307,7 +303,7 @@ Agent 持续工作时，读过的文件、执行过的命令和模型回复都�
 
 - `ContextCompactor` 只持目录（`.transcripts/`、`.task_outputs/tool-results/`），不持 `&Client`；需调 LLM 的方法单独收 `&Client`。
 - `estimate_chars` 用 `serde_json` 序列化长度（字符数，与 Python 同单位同阈值）；不引 tokenizer。
-- transcript 文件名用 `AtomicU64` 计数器，不引 uuid crate（与 `hooks.rs` 的 `AtomicUsize` 风格一致）。
+- transcript 用固定文件名 `transcript.jsonl` 覆盖写，只保留最近一次压缩前的快照（不无限增长，不引 uuid / 计数器）。
 - 估计单位是字符数，已知局限：字符 ≠ token；反应式补救兜底。
 
 ---

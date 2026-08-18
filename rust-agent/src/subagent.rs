@@ -11,6 +11,7 @@
 use crate::client::{Client, ContentBlock, Message};
 use crate::error::AgentError;
 use crate::hooks::{assemble_post_tool_messages, Hooks};
+use crate::output;
 use crate::tools::{ToolContext, ToolRegistry};
 
 /// 子 agent 的最大轮数限制
@@ -60,7 +61,7 @@ pub async fn run_subagent_loop(
         }],
     }];
 
-    println!("\x1b[33m[Subagent started]\x1b[0m");
+    output::status("[Subagent started]");
 
     for _turn in 1..=MAX_SUBAGENT_TURNS {
         let response = client
@@ -91,10 +92,10 @@ pub async fn run_subagent_loop(
 
             // 循环结束，提取并返回最终文本
             if let Some(text) = extract_final_text(&response.content) {
-                println!("\x1b[33m[Subagent done]\x1b[0m");
+                output::status("[Subagent done]");
                 return Ok(text);
             } else {
-                println!("\x1b[33m[Subagent done - no text]\x1b[0m");
+                output::status("[Subagent done - no text]");
                 return Ok("(no summary)".to_string());
             }
         }
@@ -104,7 +105,7 @@ pub async fn run_subagent_loop(
         let mut reminders: Vec<String> = Vec::new();
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                println!("\x1b[90m[sub] {} {:?}\x1b[0m", name, input);
+                output::sub_trace(name, input);
 
                 // 创建工具上下文
                 let ctx = ToolContext { client, hooks, registry };
@@ -138,10 +139,10 @@ pub async fn run_subagent_loop(
     }
 
     // 超过最大轮数
-    println!(
-        "\x1b[33m[Subagent stopped after {} turns without final answer]\x1b[0m",
+    output::status(&format!(
+        "[Subagent stopped after {} turns without final answer]",
         MAX_SUBAGENT_TURNS
-    );
+    ));
     Ok(format!(
         "Subagent stopped after {} turns without a final answer.",
         MAX_SUBAGENT_TURNS
