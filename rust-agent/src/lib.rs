@@ -7,6 +7,7 @@ pub mod memory;
 pub mod output;
 pub mod skills;
 pub mod subagent;
+pub mod task_system;
 pub mod todo;
 pub mod tools;
 
