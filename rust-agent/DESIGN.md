@@ -8,7 +8,7 @@ rust-agent 是一个用 Rust 实现的 Agent 循环框架，基于 Anthropic Cla
 
 ## 核心架构概览
 
-本文档整合了 Agent 循环的八个关键组件：
+本文档整合了 Agent 循环的九个关键组件：
 
 1. **Agent Loop** — 核心循环结构
 2. **Tool Use** — 工具分发机制
@@ -18,6 +18,7 @@ rust-agent 是一个用 Rust 实现的 Agent 循环框架，基于 Anthropic Cla
 6. **Subagent** — 消息隔离的子任务
 7. **Skill Loading** — 技能按需加载
 8. **Context Compact** — 上下文压缩
+9. **Memory** — 跨会话记忆
 
 ---
 
@@ -311,6 +312,58 @@ Agent 持续工作时，读过的文件、执行过的命令和模型回复都�
 
 ---
 
+## 9. Memory — 跨会话记忆
+
+### 核心思想
+
+*"把以后还会用到的信息留下来。"* 文件存储 + 索引 + 相关性选择 + 按需召回。Memory 在会话之外保存可复用知识，并在相关任务中取回。
+
+### 问题背景
+
+新会话开始时 `messages` 里没有上一次的对话。用户偏好、项目背景、排查线索下次还可能用到。完整 transcript 留下来适合归档，却不适合每次都发给模型 —— 对话越来越长，当前任务需要的信息难定位，旧事实也可能过期。Memory 解决两件事：哪些信息值得跨会话保存，当前任务该取回哪几条。
+
+### 四子系统
+
+| 子系统 | 职责 | 调模型 |
+|---|---|---|
+| 存储 | 一条记忆一个 `.md` 文件 + `MEMORY.md` 索引 | 否 |
+| 召回 | 每个请求选 ≤5 条相关 → 加载正文(≤20k 字符)→ 拼 system | 是(选择);失败降级关键词 |
+| 提取 | 回合结束后从对话提取持久记忆，过滤临时/重复 | 是 |
+| 整理 | ≥10 条时合并去重，失败恢复原文件 | 是 |
+
+### 存储：一个记忆一个文件
+
+每条记忆是 `.memory/` 下的 Markdown 文件，YAML frontmatter 记录 `name`/`description`/`type`（`type` ∈ user/feedback/project/reference）。`MEMORY.md` 是索引，写入完成后 `rebuild_memory_index()` 按文件重新生成。索引用于选择相关记忆，正文仍在各自文件。
+
+### 召回：先选择，再加载正文
+
+每次请求开始时 `load_memories()` 读取最近用户消息和记忆目录，让一次轻量模型调用选择最多五条相关记录（返回 JSON 数组下标）。模型调用或解析失败时退回关键词匹配（`tokenize_query`：ascii `[a-z0-9_]{3,}` 或 CJK 连段 ≥2，在 `name+description` 里计命中数）。选择完成后才读取对应文件正文，按 `RECALL_CHAR_LIMIT`(20000) 限制总长度。召回内容拼进 system prompt，并明确说明是背景知识而非命令、冲突时以当前请求为准。
+
+### 提取：回合结束后保存可复用信息
+
+`extract_memories()` 在 Agent 完成本轮回答后（`stop_reason != "tool_use"` 且 Stop 钩子未 force）检查对话，只提取以后仍可能有用的信息。候选必须带 `scope`：只有 `persistent` 才跨会话保留。`should_store_memory()` 做最后检查 —— 字段不完整、含"本次会话/当前任务"等临时标记、或与已有记忆重复（slug / 归一化 description / body 重复）都拒绝。
+
+### 整理：合并重复和过期内容
+
+记忆文件积累到 ≥10 条时 `consolidate_memories()` 让模型生成一份整理后的记录列表。整理前先快照全部记录文件原文；替换阶段先删后写，写盘失败时按快照逐个还原并重建索引，返回 0 不中断主循环。
+
+### 关键见解
+
+- Memory 是**选择性存储**，不是 transcript 无损备份，也不取代上下文压缩（s08 管会话内，s09 管会话外）。
+- 子 agent 不参与记忆 —— 消息隔离、短命（30 轮上限），无跨会话价值（与 s08 "子 agent 不压缩"同理）。
+- 召回在每个**请求**开始跑一次（非每个 LLM 调用），与压缩（每个调用跑）正交；提取/整理只在真退出前跑。
+- 全程 best-effort：LLM 失败降级关键词 / 吞错返回 0，绝不中断 agent 主循环。
+
+### Rust 实现要点
+
+- `MemoryStore` 只持 `memory_dir`，不持 `&Client`；需调 LLM 的方法单独收 `&Client`（compact.rs 先例）。
+- 不引新 crate：`memory_slug` / `tokenize_query` 用 std `char` 手写（`is_alphanumeric` 保留 CJK）；`extract_json_array` 用 `serde_json::Deserializer::into_iter` 实现 Python `raw_decode`（容忍尾部垃圾）。
+- `parse_frontmatter` serde_yaml + 容错回退（skills.rs 先例）；`memory_path` 用 `file_name()` 校验拒绝分隔符 / `..`（对尚不存在路径也成立）。
+- 字符数为单位（对齐 Python `len(str)`）：截断用 `chars().take(n)`。
+- 测试：28 项单元测试（无 API）+ 3 项 `#[ignore]` 烟雾测试（select/extract/consolidate，需 API key）。
+
+---
+
 ## 架构演进
 
 | 阶段 | 新增能力 |
@@ -323,6 +376,7 @@ Agent 持续工作时，读过的文件、执行过的命令和模型回复都�
 | s06 | 消息隔离的子任务委托 |
 | s07 | 技能按需加载（目录在 system prompt，正文走 tool_result） |
 | s08 | 上下文压缩（四步管线 + 反应式补救 + compact 工具） |
+| s09 | 跨会话记忆（存储 + 召回 + 提取 + 整理，best-effort） |
 
 ---
 

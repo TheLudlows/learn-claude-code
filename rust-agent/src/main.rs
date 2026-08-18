@@ -29,14 +29,20 @@ The agent loop from s07 gains a ContextCompactor that runs before every model ca
   + agent_loop gains compactor + active_request params
   + prompt_too_long triggers reactive_compact (1 retry)
 
-API 交互(请求构造 + 流式解析)在 client.rs;工具与分发在 tools.rs。
+  + memory.rs: recall into system per request + extract/consolidate on exit (s09)
+  + agent_loop gains memory param; system -> base_system, rebuilt per request
 
-Key insight: the loop stays the same; compaction runs transparently before each call.
+API 交互(请求构造 + 流式解析)在 client.rs;工具与分发在 tools.rs。
+记忆在 memory.rs(跨会话);压缩在 compact.rs(会话内)。
+
+Key insight: the loop stays the same; compaction runs transparently before each call,
+memory recall runs once per request, extract/consolidate run only on true exit.
 */
 
 use rust_agent::client::{Client, ContentBlock, Message};
 use rust_agent::compact::{ContextCompactor, MAX_REACTIVE_RETRIES};
 use rust_agent::error::AgentError;
+use rust_agent::memory::{build_system, MemoryStore};
 use rust_agent::builtins::{ContextInjectHook, LargeOutputHook, PermissionHook, SummaryHook, TodoReminderHook};
 use rust_agent::hooks::{assemble_post_tool_messages, Hooks};
 use rust_agent::tools::{workdir, ToolContext, ToolRegistry};
@@ -81,15 +87,24 @@ async fn execute_tool(
 ///
 /// s08 变化: 每次调用模型前先 compactor.prepare()（budget->snip->micro->超阈值才摘要）；
 /// stream_messages 包进 match, prompt_too_long 时 reactive_compact 重试一次。
+///
+/// s09 变化: 请求开始召回相关记忆拼进 system(每请求一次,非每调用),真退出前
+/// (Stop 钩子未 force)extract 持久记忆 + consolidate(≥10 条才合并)。
 async fn agent_loop(
     client: &Client,
     registry: &ToolRegistry,
-    system: &str,
+    base_system: &str,
     messages: &mut Vec<Message>,
     hooks: &Hooks,
     compactor: &ContextCompactor,
+    memory: &MemoryStore,
     active_request: &str,
 ) -> Result<(), AgentError> {
+    // s09: 召回相关记忆(模型,失败降级关键词)→ 拼进 system。每请求一次,与压缩正交。
+    let recalled = memory.load_memories(client, messages).await;
+    let index = memory.read_memory_index();
+    let system = build_system(base_system, &index, &recalled);
+
     let mut reactive_retries = 0u32;
     loop {
         // s08: 每次调用模型前运行压缩管线
@@ -98,7 +113,7 @@ async fn agent_loop(
             .await?;
 
         let response = match client
-            .stream_messages(system, messages, &registry.definitions(), 8000)
+            .stream_messages(&system, messages, &registry.definitions(), 8000)
             .await
         {
             Ok(r) => {
@@ -141,6 +156,11 @@ async fn agent_loop(
                 });
                 continue;
             }
+            // s09: 真退出前提取持久记忆;有新写入再尝试整理(≥10 条才合并,失败恢复原文件)。
+            let stored = memory.extract_memories(client, messages).await;
+            if stored > 0 {
+                let _ = memory.consolidate_memories(client).await;
+            }
             break;
         }
         let mut tool_results = Vec::new();
@@ -170,18 +190,6 @@ async fn agent_loop(
     Ok(())
 }
 
-/// 把 API key 打码：仅留前 4 与后 4 字符，避免完整密钥泄露到 stdout。
-fn mask_key(k: &str) -> String {
-    let chars: Vec<char> = k.chars().collect();
-    if chars.len() > 8 {
-        let head: String = chars[..4].iter().collect();
-        let tail: String = chars[chars.len() - 4..].iter().collect();
-        format!("{}…{}", head, tail)
-    } else {
-        "***".to_string()
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), AgentError> {
     dotenv().ok();
@@ -192,7 +200,7 @@ async fn main() -> Result<(), AgentError> {
     let base_url = env::var("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
     let model = env::var("MODEL_ID")?;
-    println!("base_url: {}, model: {}, key: {}", base_url, model, mask_key(&api_key));
+    println!("base_url: {}, model: {}, key: {}", base_url, model, "***".to_string());
 
     let client = Client::new(api_key, base_url, model);
 
@@ -203,6 +211,8 @@ async fn main() -> Result<(), AgentError> {
         PathBuf::from(&cwd).join(".transcripts"),
         PathBuf::from(&cwd).join(".task_outputs").join("tool-results"),
     );
+    // s09: 记忆存储。目录 .memory/ 与 Python s09 一致。
+    let memory = MemoryStore::new(PathBuf::from(&cwd).join(".memory"));
     let skills_dir = env::var("SKILLS_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -281,6 +291,7 @@ async fn main() -> Result<(), AgentError> {
             &mut messages,
             &hooks,
             &compactor,
+            &memory,
             &query,
         )
         .await
