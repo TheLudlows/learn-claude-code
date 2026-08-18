@@ -176,6 +176,30 @@ impl TaskStore {
         std::fs::write(&path, content)?;
         Ok(())
     }
+
+    pub fn list(&self) -> Result<Vec<Task>, TaskStoreError> {
+        if !self.directory.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut tasks = Vec::new();
+        for entry in std::fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if name_str.ends_with(".json") && self.id_pattern.is_match(&name_str.strip_suffix(".json").unwrap()) {
+                let task_id = name_str.trim_end_matches(".json");
+                match self.load(task_id) {
+                    Ok(task) => tasks.push(task),
+                    Err(_) => continue, // 跳过损坏的任务
+                }
+            }
+        }
+
+        tasks.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(tasks)
+    }
 }
 
 #[cfg(test)]
@@ -349,5 +373,53 @@ mod tests {
         let loaded = store.load(&task.id).unwrap();
         assert_eq!(loaded.status, TaskStatus::Completed);
         assert_eq!(loaded.owner, Some("agent".to_string()));
+    }
+
+    #[test]
+    fn test_list_returns_empty_for_no_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+
+        let tasks = store.list().unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn test_list_returns_all_tasks_sorted() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+
+        let t1 = store.create("First".to_string(), "".to_string(), vec![]).unwrap();
+        let t2 = store.create("Second".to_string(), "".to_string(), vec![]).unwrap();
+        let t3 = store.create("Third".to_string(), "".to_string(), vec![]).unwrap();
+
+        let tasks = store.list().unwrap();
+        assert_eq!(tasks.len(), 3);
+
+        // Collect all IDs
+        let ids = vec![t1.id.clone(), t2.id.clone(), t3.id.clone()];
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort();
+
+        // Tasks should be sorted by ID
+        for (i, task) in tasks.iter().enumerate() {
+            assert_eq!(task.id, sorted_ids[i]);
+        }
+    }
+
+    #[test]
+    fn test_list_skips_corrupted_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+
+        let valid = store.create("Valid".to_string(), "".to_string(), vec![]).unwrap();
+
+        // Create corrupted file
+        let corrupted_path = store.directory.join("task_deadbeef.json");
+        std::fs::write(&corrupted_path, "invalid json").unwrap();
+
+        let tasks = store.list().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, valid.id);
     }
 }
