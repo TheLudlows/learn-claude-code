@@ -28,13 +28,15 @@ pub mod glob_tool;
 pub mod load_skill;
 pub mod todo_write;
 pub mod task;
+mod compact;
 
 // Re-exports for convenient access
 pub use self::registry::ToolRegistry;
 pub use self::trait_def::{PermissionCheck, Tool, ToolContext};
 
 use std::env;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use path_clean::PathClean;
 
 /// 工作目录
 pub fn workdir() -> PathBuf {
@@ -43,48 +45,39 @@ pub fn workdir() -> PathBuf {
 
 /// 路径安全校验 - 确保路径在工作目录内
 ///
-/// 先对 `canonical_workdir/path` 做**词法归一化**（消解 `..`/`.`，不访问文件系统）
-/// 得到绝对路径，再用**canonical 对 canonical**的方式判越界——
-/// 因此**对尚不存在的路径（如 `write_file` 新建文件/目录）也成立**：
-/// 原实现对目标路径 `canonicalize()`，路径不存在时直接 `Err`，导致永远写不进去。
+/// 用 `path-clean` 做**词法归一化**（消解 `..`/`.`，不访问文件系统），
+/// 用 `dunce::canonicalize` 做越界比较——`dunce` 会剥除 Windows `\\?\` verbatim
+/// 前缀并展开 8.3 短名，使词法归一化路径与 canonical 路径可直接 `starts_with` 比较。
 ///
-/// 越界比较必须用 canonical 形式：Windows 下 `canonicalize()` 会给路径加 `\\?\`
-/// verbatim 前缀并展开 8.3 短名，而词法归一化结果（尤其当 `path_str` 是绝对路径时）
-/// 可能既无前缀又含短名——直接 `starts_with` 会把工作区内路径误判成越界（C3 回归）。
+/// **对尚不存在的路径（如 `write_file` 新建文件/目录）也成立**：
+/// 原实现对目标路径 `canonicalize()`，路径不存在时直接 `Err`，导致永远写不进去。
 pub fn safe_path_in(workdir: &Path, path_str: &str) -> Result<PathBuf, String> {
-    // canonicalize 工作目录本身：工作目录一定存在，不会失败。
-    // 以 canonical workdir 作 base 做词法归一化，避免 cwd 自身含符号链接
-    // 导致「词法路径 vs canonical 工作目录」误判越界。
-    let workdir_canonical = workdir
-        .canonicalize()
+    // dunce::canonicalize 工作目录：剥除 `\\?\` 前缀 + 展开短名 + 解析符号链接。
+    // 工作目录一定存在，不会失败。
+    let workdir_canonical = dunce::canonicalize(workdir)
         .map_err(|e| format!("Error: {}", e))?;
 
-    // 词法归一化：base.join(path) 后按 components 消解 `..`/`.`，不碰文件系统。
+    // 词法归一化：base.join(path) 后用 path-clean 消解 `..`/`.`，不碰文件系统。
     // 注意：path_str 为绝对路径时 join 会替换 base——这是预期行为（绝对路径本就不相对 base）。
-    let mut norm = PathBuf::new();
-    for c in workdir_canonical.join(path_str).components() {
-        match c {
-            Component::ParentDir => {
-                norm.pop();
-            }
-            Component::CurDir => {}
-            other => norm.push(other.as_os_str()),
-        }
-    }
+    let norm = workdir_canonical.join(path_str).clean();
 
-    // 越界检查：用 canonical 形式比较（见函数注释）。
+    // 越界检查：用 dunce canonical 形式比较。
     // 连祖先都无法 canonicalize 时按失败闭合处理（安全侧）。
     let within = match canonical_form_of(&norm) {
         Some(c) => c.starts_with(&workdir_canonical),
         None => false,
     };
     if !within {
-        return Err(format!("Error: path escapes workspace {:?}, {:?}", workdir_canonical, norm));
+        return Err(format!(
+            "Error: path escapes workspace {:?}, {:?}",
+            workdir_canonical, norm
+        ));
     }
 
-    // 返回值：已存在路径返回 canonical（解析符号链接/junction）；尚不存在的路径用词法结果放行。
+    // 返回值：已存在路径返回 canonical（解析符号链接/junction，剥除 `\\?\` 前缀）；
+    // 尚不存在的路径用词法结果放行。
     if norm.exists() {
-        norm.canonicalize().map_err(|e| format!("Error: {}", e))
+        dunce::canonicalize(&norm).map_err(|e| format!("Error: {}", e))
     } else {
         Ok(norm)
     }
@@ -92,20 +85,20 @@ pub fn safe_path_in(workdir: &Path, path_str: &str) -> Result<PathBuf, String> {
 
 /// 把路径归一成 canonical 形式，专供越界比较使用。
 ///
-/// - 路径本身存在：直接 `canonicalize()`。
-/// - 路径不存在：沿祖先上溯到第一个已存在的目录，`canonicalize()` 它，再拼回尚不存在的尾部。
+/// - 路径本身存在：`dunce::canonicalize()`（剥除 `\\?\` 前缀）。
+/// - 路径不存在：沿祖先上溯到第一个已存在的目录，canonicalize 后拼回尾部。
 ///   这样不存在的路径（`write_file` 新建文件/目录）也能得到与 canonical base 可比的形态。
-/// - 连根目录都无法 `canonicalize()`：返回 `None`（调用方按失败闭合处理）。
+/// - 连根目录都无法 canonicalize：返回 `None`（调用方按失败闭合处理）。
 fn canonical_form_of(path: &Path) -> Option<PathBuf> {
     // 快路径：路径本身存在。
-    if let Ok(c) = path.canonicalize() {
+    if let Ok(c) = dunce::canonicalize(path) {
         return Some(c);
     }
     // 路径不存在：上溯找第一个已存在的祖先，canonicalize 后拼回尾部。
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = path.to_path_buf();
     loop {
-        match cur.canonicalize() {
+        match dunce::canonicalize(&cur) {
             Ok(canon) => {
                 let mut full = canon;
                 for seg in tail.into_iter().rev() {
@@ -131,51 +124,33 @@ pub fn safe_path(path_str: &str) -> Result<PathBuf, String> {
 /// 词法检查路径是否可能越界（不访问文件系统）。
 ///
 /// 这是 `safe_path_in` 的轻量版本，用于在路径尚不存在时快速检查。
-/// 对路径做词法归一化后检查是否仍以工作目录开头。
+/// 用 `path-clean` 做词法归一化后检查是否仍以工作目录开头。
 pub fn escapes_workspace_lexical(path_str: &str) -> bool {
     let workdir = workdir();
-    let mut norm = PathBuf::new();
-    for c in workdir.join(path_str).components() {
-        match c {
-            Component::ParentDir => {
-                norm.pop();
-            }
-            Component::CurDir => {}
-            other => norm.push(other.as_os_str()),
-        }
-    }
+    let norm = workdir.join(path_str).clean();
     !norm.starts_with(&workdir)
 }
 
 /// 路径归一化（消解 `..`/`.`，不访问文件系统）。
 ///
 /// 对路径做词法归一化，返回一个不含 `.` 和 `..` 的路径。
+/// 底层使用 `path-clean` 的 `PathClean::clean()`。
 pub fn normalize(path_str: &str) -> PathBuf {
-    let mut norm = PathBuf::new();
-    for c in PathBuf::from(path_str).components() {
-        match c {
-            Component::ParentDir => {
-                norm.pop();
-            }
-            Component::CurDir => {}
-            other => norm.push(other.as_os_str()),
-        }
-    }
-    norm
+    Path::new(path_str).clean()
 }
 
 /// Build and return a tool registry with all tools registered.
 pub fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
-    registry.register(Box::new(crate::tools::command::CommandTool));
-    registry.register(Box::new(crate::tools::read_file::ReadFileTool));
-    registry.register(Box::new(crate::tools::write_file::WriteFileTool));
-    registry.register(Box::new(crate::tools::edit_file::EditFileTool));
-    registry.register(Box::new(crate::tools::glob_tool::GlobTool));
-    registry.register(Box::new(crate::tools::load_skill::LoadSkillTool));
-    registry.register(Box::new(crate::tools::todo_write::TodoWriteTool));
-    registry.register(Box::new(crate::tools::task::TaskTool));
+    registry.register(Box::new(command::CommandTool));
+    registry.register(Box::new(read_file::ReadFileTool));
+    registry.register(Box::new(write_file::WriteFileTool));
+    registry.register(Box::new(edit_file::EditFileTool));
+    registry.register(Box::new(glob_tool::GlobTool));
+    registry.register(Box::new(load_skill::LoadSkillTool));
+    registry.register(Box::new(todo_write::TodoWriteTool));
+    registry.register(Box::new(task::TaskTool));
 
     registry
 }

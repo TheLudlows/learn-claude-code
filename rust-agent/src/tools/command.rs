@@ -72,55 +72,19 @@ pub(crate) async fn run_bash(command: &str) -> String {
 }
 
 /// 把命令输出字节解码成字符串：先按 UTF-8（cargo 等现代程序直接用 UTF-8），
-/// 失败再按 OEM 代码页解码（cmd.exe 内建命令、git 等在中文 locale 下用 GBK），
+/// 失败再按 GBK 解码（cmd.exe 内建命令、git 等在中文 locale 下用 GBK/代码页 936），
 /// 都不行才退化为 lossy。避免非 ASCII 被替成 U+FFFD（乱码）。
+///
+/// 使用 `encoding_rs` 替代手写 Windows FFI（`GetOEMCP` / `MultiByteToWideChar`），
+/// 零 unsafe、零分配（返回 `Cow<str>`）、跨平台。
 pub(crate) fn decode_console(bytes: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
     }
-    #[cfg(windows)]
-    if let Some(s) = decode_with_oem_codepage(bytes) {
-        return s;
-    }
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// 按 OEM 代码页（中文 locale 为 936/GBK）把字节解成 UTF-16 再转 String。
-/// 失败返回 None，让调用方退化为 lossy。
-#[cfg(windows)]
-fn decode_with_oem_codepage(bytes: &[u8]) -> Option<String> {
-    use std::os::raw::{c_int, c_uchar};
-    extern "system" {
-        fn GetOEMCP() -> u32;
-        fn MultiByteToWideChar(
-            CodePage: u32,
-            dwFlags: u32,
-            lpMultiByteStr: *const c_uchar,
-            cbMultiByte: c_int,
-            lpWideCharStr: *mut u16,
-            cchWideChar: c_int,
-        ) -> c_int;
-    }
-    if bytes.is_empty() {
-        return Some(String::new());
-    }
-    let cp = unsafe { GetOEMCP() };
-    let n = bytes.len() as c_int;
-    let size = unsafe {
-        MultiByteToWideChar(cp, 0, bytes.as_ptr(), n, std::ptr::null_mut(), 0)
-    };
-    if size <= 0 {
-        return None;
-    }
-    let mut buf: Vec<u16> = vec![0u16; size as usize];
-    let written = unsafe {
-        MultiByteToWideChar(cp, 0, bytes.as_ptr(), n, buf.as_mut_ptr(), size)
-    };
-    if written <= 0 {
-        return None;
-    }
-    buf.truncate(written as usize);
-    Some(String::from_utf16_lossy(&buf))
+    // 中文 Windows OEM 代码页为 936 (GBK)；encoding_rs::GBK 覆盖所有 GBK 字符。
+    // 非中文 locale 下 GBK 解码可能产生乱码，但比 lossy 替换符（U+FFFD）好。
+    let (decoded, _encoding, _had_errors) = encoding_rs::GBK.decode(bytes);
+    decoded.into_owned()
 }
 
 /// Command Tool for executing shell commands

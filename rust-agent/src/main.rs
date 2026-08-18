@@ -1,15 +1,15 @@
 /*
-s04_hooks.rs - Hooks (Rust)
+s08_context_compact.rs - Context Compact (Rust)
 
-The agent loop from s03 does not change shape. The only change: the hard-coded
-`permission::check_permission()` call is replaced by `hooks.trigger_pre_tool()`,
-and three more extension points are wired in:
+The agent loop from s07 gains a ContextCompactor that runs before every model call:
 
     User prompt
          |
          v
     UserPromptSubmit            <- trigger_prompt()
          |
+    +---- compact.prepare() ----+   budget -> snip -> micro -> [compact_history]
+    |                            |
     +----------+      +-------+
     | messages | ---> |  LLM  |
     +----------+      +---+---+
@@ -24,17 +24,20 @@ and three more extension points are wired in:
                            dispatch_tool
                                |
                   PostToolUse <- trigger_post_tool()
+                               |
+                  [compact tool -> compact_history after batch]
 
-  + hooks.rs: registry + trigger_* + demo callbacks
-  + permission::permission_hook (s03 gates, now a PreToolUse callback)
-  + the loop only calls trigger_* — extension logic lives in callbacks
+  + compact.rs: four-step pipeline + reactive retry + compact tool
+  + agent_loop gains compactor + active_request params
+  + prompt_too_long triggers reactive_compact (1 retry)
 
 API 交互(请求构造 + 流式解析)在 client.rs;工具与分发在 tools.rs。
 
-Key insight: the loop stays the same; only the four trigger points are wired in.
+Key insight: the loop stays the same; compaction runs transparently before each call.
 */
 
 use rust_agent::client::{Client, ContentBlock, Message};
+use rust_agent::compact::{ContextCompactor, MAX_REACTIVE_RETRIES};
 use rust_agent::error::AgentError;
 use rust_agent::hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
 use rust_agent::permission::permission_hook;
@@ -80,17 +83,47 @@ async fn execute_tool(
 /// 循环结构不变: 调用 LLM -> 追加助手响应 -> 若 stop_reason 是 tool_use 就执行工具、
 /// 把 tool_result 喂回去 -> 直到模型说结束。s04 的变化是: 不再硬编码 check_permission,
 /// 而是在固定节点上 trigger_hooks(PreToolUse / PostToolUse / Stop)。
+///
+/// s08 变化: 每次调用模型前先 compactor.prepare()（budget->snip->micro->超阈值才摘要）；
+/// stream_messages 包进 match, prompt_too_long 时 reactive_compact 重试一次；
+/// compact 工具与 task 一样特殊处理 —— 先闭合整个 tool 批次再摘要。
 async fn agent_loop(
     client: &Client,
     registry: &ToolRegistry,
     system: &str,
     messages: &mut Vec<Message>,
     hooks: &Hooks,
+    compactor: &ContextCompactor,
+    active_request: &str,
 ) -> Result<(), AgentError> {
+    let mut reactive_retries = 0u32;
     loop {
-        let response = client
-            .stream_messages(system, messages, &registry.definitions(), 8000)
+        // s08: 每次调用模型前运行压缩管线
+        compactor
+            .prepare(client, messages, active_request)
             .await?;
+
+        let response = match client
+            .stream_messages(system, messages, &registry.definitions(), 8000)
+            .await
+        {
+            Ok(r) => {
+                reactive_retries = 0;
+                r
+            }
+            Err(e) => {
+                // s08: prompt_too_long 时尝试 reactive_compact 重试一次
+                if e.is_prompt_too_long() && reactive_retries < MAX_REACTIVE_RETRIES {
+                    println!("\x1b[33m[reactive compact]\x1b[0m");
+                    compactor
+                        .reactive_compact(client, messages, active_request)
+                        .await?;
+                    reactive_retries += 1;
+                    continue;
+                }
+                return Err(e);
+            }
+        };
 
         // 打印这一轮的 LLM 内容（text + tool_use）；client 自身不打印。
         {
@@ -116,13 +149,18 @@ async fn agent_loop(
             }
             break;
         }
-
-        // 执行工具调用
+        // compact 先记 flag、追加占位 tool_result，批次闭合后再 compact_history。
         let mut tool_results = Vec::new();
         let mut reminders: Vec<String> = Vec::new();
+        let mut compact_requested = false;
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                let tool_output = execute_tool(client, registry, name, input, hooks).await;
+                let tool_output = if name == "compact" {
+                    compact_requested = true;
+                    "Compaction requested after this tool batch.".to_string()
+                } else {
+                    execute_tool(client, registry, name, input, hooks).await
+                };
                 // 打印工具执行结果（此前只喂回 LLM，用户看不到工具返回了什么）
                 {
                     let mut out = io::stdout().lock();
@@ -139,8 +177,14 @@ async fn agent_loop(
             }
         }
 
-        // 添加工具结果（真实输出）+ PostToolUse 提醒（独立 user 消息）
         messages.extend(assemble_post_tool_messages(tool_results, reminders));
+
+        // s08: 批次已闭合（每个 tool_use 都有对应 tool_result）：再摘要，不留孤立结果。
+        if compact_requested {
+            compactor
+                .compact_history(client, messages, active_request)
+                .await?;
+        }
     }
 
     Ok(())
@@ -176,6 +220,12 @@ async fn main() -> Result<(), AgentError> {
         .unwrap_or_else(|_| ".".into())
         .to_string_lossy()
         .to_string();
+
+    // s08: 上下文压缩器。目录与 Python s08 一致：.transcripts/ 与 .task_outputs/tool-results/。
+    let compactor = ContextCompactor::new(
+        PathBuf::from(&cwd).join(".transcripts"),
+        PathBuf::from(&cwd).join(".task_outputs").join("tool-results"),
+    );
 
     // s07: 启动时扫描技能目录，把「名称+描述」编入 system prompt，完整正文按需 load_skill 取。
     // SKILLS_DIR 缺省（或空串）时回退到 cwd/skills；目录不存在则注册表为空（agent 仍可运行，只是无技能）。
@@ -226,12 +276,12 @@ async fn main() -> Result<(), AgentError> {
     rust_agent::todo::set_instance(todo_manager);
 
     loop {
-        print!("\x1b[36m You >> \x1b[0m");
+        print!("\x1b[36m >> \x1b[0m");
         io::stdout().flush()?;
 
         let mut query = String::new();
         io::stdin().read_line(&mut query)?;
-        let query = query.trim();
+        let query = query.trim().to_string();
 
         // 空输入用 continue 跳过（多数 REPL 忽略空行），只有 q/exit 才退出会话。
         if query.is_empty() {
@@ -242,16 +292,28 @@ async fn main() -> Result<(), AgentError> {
         }
 
         // s04: 用户输入后、进入 LLM 前触发 UserPromptSubmit
-        hooks.trigger_prompt(query);
+        hooks.trigger_prompt(&query);
 
         messages.push(Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
-                text: query.to_string(),
+                text: query.clone(),
             }],
         });
 
-        if let Err(e) = agent_loop(&client, &registry, &system, &mut messages, &hooks).await {
+        // s08: active_request 单独传入，因为 tool_result 也用 role=user，
+        // 压缩时无法从 messages 反推当前请求。
+        if let Err(e) = agent_loop(
+            &client,
+            &registry,
+            &system,
+            &mut messages,
+            &hooks,
+            &compactor,
+            &query,
+        )
+        .await
+        {
             eprintln!("Error: {}", e);
         }
 

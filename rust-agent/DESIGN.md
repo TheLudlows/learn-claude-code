@@ -8,13 +8,16 @@ rust-agent 是一个用 Rust 实现的 Agent 循环框架，基于 Anthropic Cla
 
 ## 核心架构概览
 
-本文档整合了 Agent 循环的五个关键组件：
+本文档整合了 Agent 循环的八个关键组件：
 
 1. **Agent Loop** — 核心循环结构
 2. **Tool Use** — 工具分发机制
 3. **Permission** — 权限检查系统
 4. **Hooks** — 扩展点机制
 5. **TodoWrite** — 规划能力
+6. **Subagent** — 消息隔离的子任务
+7. **Skill Loading** — 技能按需加载
+8. **Context Compact** — 上下文压缩
 
 ---
 
@@ -258,6 +261,56 @@ Agent 在修复 bug 时会读取大量文件追踪调用链，每个工具调用
 
 ---
 
+## 8. Context Compaction — 先整理，再总结
+
+### 核心思想
+
+*"上下文总会满，要有办法腾地方。"* 四步压缩管线，低成本的操作优先执行；只有前三步不够时才调用模型生成摘要。
+
+### 问题背景
+
+Agent 持续工作时，读过的文件、执行过的命令和模型回复都留在 `messages` 中。消息越积越多，最终超过模型上下文上限，API 返回 `prompt_too_long`。工具结果通常占据最多空间。
+
+### 四步管线（顺序固定）
+
+| 步骤 | 操作 | 调用模型 | 信息损失 |
+|------|------|----------|----------|
+| 1. tool_result_budget | 最新一批超大 tool_result 落盘，留路径+2000字预览 | 否 | 无（可重读） |
+| 2. snip_compact | >50 条消息时归档中间，留头3+尾47 | 否 | 中间消息（已留档） |
+| 3. micro_compact | 旧 tool_result 替换为占位符（最近3条完整） | 否 | 旧结果正文 |
+| 4. compact_history | 超阈值时生成事实摘要替换整个历史 | 是 | 最多 |
+
+顺序固定的理由：`tool_result_budget` 必须早于 `micro_compact`——大结果先落盘拿到路径，之后才允许旧结果变占位符，否则丢失可恢复的路径。前三步确定性、无额外 API 调用，第四步才产生调用。
+
+### active_request 单独传参
+
+`tool_result` 也用 `role=user`，压缩时无法从 `messages` 反推当前请求。`agent_loop` 收 `active_request: &str`，压缩后的 `[Compacted]` 消息把当前请求写在 `Current user request`、摘要写在 `Conversation summary (reference only)`，二者分开。
+
+### prompt_too_long 反应式补救
+
+字符数只能估算 token。`stream_messages` 包进 `match`：命中 `prompt_too_long`/`too many tokens`/`request_too_large` 且重试次数 < `MAX_REACTIVE_RETRIES`(=1) 时，`reactive_compact` 保留最近 5 条（配对保护）、摘要更早历史、重试一次。再失败则向上抛。
+
+### compact 工具
+
+模型可在一个阶段结束后主动调用 `compact`。与 `task` 同模式特殊处理（不走 `dispatch_tool`）：先记 flag、追加占位 `tool_result`，**批次闭合后**（每个 tool_use 都有对应 tool_result）再 `compact_history`——既不留孤立 tool_result，也不在文件写入后丢失执行记录导致模型重复副作用。仅父 agent 可用。
+
+### 切点保护
+
+`snip_compact` 和 `reactive_compact` 的切点都保护 `assistant(tool_use)` 与 `user(tool_result)` 的配对：孤立的 tool_result 缺少对应调用，下一次 API 请求会被判定为无效。
+
+### 边界
+
+子 agent（`run_subagent_loop`）不压缩、不含 `compact` 工具，保留 30 轮上限。s08 管当前会话有限上下文，压缩时允许舍弃可恢复细节；跨压缩、跨会话的记忆留给 s09。
+
+### Rust 实现要点
+
+- `ContextCompactor` 只持目录（`.transcripts/`、`.task_outputs/tool-results/`），不持 `&Client`；需调 LLM 的方法单独收 `&Client`。
+- `estimate_chars` 用 `serde_json` 序列化长度（字符数，与 Python 同单位同阈值）；不引 tokenizer。
+- transcript 文件名用 `AtomicU64` 计数器，不引 uuid crate（与 `hooks.rs` 的 `AtomicUsize` 风格一致）。
+- 估计单位是字符数，已知局限：字符 ≠ token；反应式补救兜底。
+
+---
+
 ## 架构演进
 
 | 阶段 | 新增能力 |
@@ -269,6 +322,7 @@ Agent 在修复 bug 时会读取大量文件追踪调用链，每个工具调用
 | s05 | 任务列表规划 |
 | s06 | 消息隔离的子任务委托 |
 | s07 | 技能按需加载（目录在 system prompt，正文走 tool_result） |
+| s08 | 上下文压缩（四步管线 + 反应式补救 + compact 工具） |
 
 ---
 
