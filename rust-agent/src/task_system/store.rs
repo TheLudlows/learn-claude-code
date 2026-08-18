@@ -41,7 +41,6 @@ pub struct TaskStore {
 }
 
 impl TaskStore {
-    const TASK_ID_PREFIX: &str = "task_";
     const MAX_ID_RETRIES: usize = 100;
 
     /// Creates a new TaskStore instance
