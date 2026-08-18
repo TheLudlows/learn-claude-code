@@ -4,7 +4,6 @@ pub mod compact;
 pub mod error;
 pub mod hooks;
 pub mod output;
-pub mod permission;
 pub mod skills;
 pub mod subagent;
 pub mod todo;
