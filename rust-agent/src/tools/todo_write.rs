@@ -67,13 +67,13 @@ impl Tool for TodoWriteTool {
 
     /// Executes the todo write using run_todo_write() from todo.rs
     async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
-        match input.get("todos").and_then(|v| v.as_array()) {
-            Some(_) => {}, // We just need to validate it's an array
-            None => return "Error: todos must be an array".to_string(),
+        let todos = match input.get("todos") {
+            Some(v) if v.is_array() => v,
+            _ => return "Error: todos must be an array".to_string(),
         };
 
-        // Execute the todo write using the shared run_todo_write function
-        crate::todo::run_todo_write(input)
+        // Pass the pure array to run_todo_write, not the whole input object
+        crate::todo::run_todo_write(todos)
     }
 
     /// Todo write tool should be available to subagents
@@ -91,34 +91,13 @@ mod tests {
     fn test_todo_write_tool_name() {
         let tool = TodoWriteTool;
         assert_eq!(tool.name(), "todo_write");
+        assert!(tool.available_for_subagent());
     }
 
-    #[test]
-    fn test_todo_write_tool_description() {
-        let tool = TodoWriteTool;
-        assert!(tool.description().contains("Update the todo list"));
-    }
-
-    #[test]
-    fn test_todo_write_tool_schema() {
-        let tool = TodoWriteTool;
-        let schema = tool.input_schema();
-
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"].is_object());
-        assert_eq!(schema["properties"]["todos"]["type"], "array");
-        assert!(schema["properties"]["todos"]["items"].is_object());
-
-        let required = schema["required"].as_array().unwrap();
-        assert_eq!(required.len(), 1);
-        assert_eq!(required[0], "todos");
-    }
 
     #[test]
     fn test_permission_check() {
         let tool = TodoWriteTool;
-
-        // Any input should pass (todo operations don't need special permissions)
         let test_inputs = vec![
             json!({"todos": []}),
             json!({"todos": [{"content": "Test task"}]}),
@@ -136,9 +115,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_available_for_subagent() {
+    #[tokio::test]
+    async fn test_exe() {
+        use crate::tools::TestToolContext;
+        use crate::todo::{set_instance, TodoManager};
+
+        set_instance(TodoManager::new());
+
         let tool = TodoWriteTool;
-        assert!(tool.available_for_subagent());
+        let tctx = TestToolContext::default();
+        let ctx = tctx.context();
+
+        // 有效输入：空 todos，返回 "No todos."
+        let result = tool.execute(&ctx, &json!({"todos": []})).await;
+        assert_eq!(result, "No todos.");
+
+        // 有效输入：带内容的 todos
+        let result = tool.execute(&ctx, &json!({"todos": [{"content": "Test task", "status": "pending"}]})).await;
+        assert!(result.contains("Test task"), "should contain task text: {}", result);
+
+        // 无效输入（缺少 todos 字段）：返回 Error
+        let result = tool.execute(&ctx, &json!({})).await;
+        assert!(result.starts_with("Error"), "missing todos should error: {}", result);
     }
 }

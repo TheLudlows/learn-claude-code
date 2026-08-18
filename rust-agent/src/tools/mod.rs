@@ -33,6 +33,9 @@ mod compact;
 // Re-exports for convenient access
 pub use self::registry::ToolRegistry;
 pub use self::trait_def::{PermissionCheck, Tool, ToolContext};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub use self::trait_def::test_helpers::TestToolContext;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -167,7 +170,7 @@ mod safe_path_tests {
         let dir = std::env::temp_dir().join("rust-agent-safe-path-nonexistent");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let dir_canon = dir.canonicalize().unwrap();
+        let dir_canon = dunce::canonicalize(&dir).unwrap();
 
         let got = safe_path_in(&dir, "subdir/newfile.txt");
         assert!(got.is_ok(), "non-existent path should be allowed: {:?}", got);
@@ -201,8 +204,8 @@ mod safe_path_tests {
         let got = safe_path_in(&dir, "real.txt");
         assert!(got.is_ok(), "existing in-workspace path should be allowed: {:?}", got);
         assert_eq!(
-            got.unwrap().canonicalize().unwrap(),
-            file.canonicalize().unwrap()
+            dunce::canonicalize(got.unwrap()).unwrap(),
+            dunce::canonicalize(&file).unwrap()
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -222,8 +225,8 @@ mod safe_path_tests {
         let abs = file.to_string_lossy().to_string();
         let got = safe_path_in(&dir, &abs);
         assert!(got.is_ok(), "absolute in-workspace path should be allowed: {:?}", got);
-        // 已存在路径应返回 canonical 形式（带 verbatim 前缀），与直接 canonicalize 一致。
-        assert_eq!(got.unwrap(), file.canonicalize().unwrap());
+        // 已存在路径应返回 canonical 形式（dunce 剥除 `\\?\` 前缀），与 dunce::canonicalize 一致。
+        assert_eq!(got.unwrap(), dunce::canonicalize(&file).unwrap());
 
         let _ = fs::remove_dir_all(&dir);
     }

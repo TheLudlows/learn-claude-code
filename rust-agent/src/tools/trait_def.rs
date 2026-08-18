@@ -100,6 +100,62 @@ pub trait Tool: Send + Sync {
 }
 
 #[cfg(test)]
+pub mod test_helpers {
+    use super::*;
+    use crate::client::Client;
+    use crate::hooks::Hooks;
+    use crate::tools::registry::ToolRegistry;
+
+    /// Test helper that owns the data needed by `ToolContext`.
+    ///
+    /// `ToolContext` holds references, so it can't implement `Default` on its own.
+    /// This struct creates and owns dummy `Client`, `Hooks`, and `ToolRegistry`
+    /// instances, then hands out a `ToolContext` that borrows from them.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let tctx = TestToolContext::new();
+    /// let ctx = tctx.context();
+    /// let result = tool.execute(&ctx, &input).await;
+    /// ```
+    pub struct TestToolContext {
+        client: Client,
+        hooks: Hooks,
+        registry: ToolRegistry,
+    }
+
+    impl TestToolContext {
+        /// Create a new test context with dummy client, empty hooks, and empty registry.
+        pub fn new() -> Self {
+            Self {
+                client: Client::new(
+                    "test-key".to_string(),
+                    "http://localhost".to_string(),
+                    "test-model".to_string(),
+                ),
+                hooks: Hooks::new(),
+                registry: ToolRegistry::new(),
+            }
+        }
+
+        /// Borrow a `ToolContext` from the owned test data.
+        pub fn context(&self) -> ToolContext<'_> {
+            ToolContext {
+                client: &self.client,
+                hooks: &self.hooks,
+                registry: &self.registry,
+            }
+        }
+    }
+
+    impl Default for TestToolContext {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;

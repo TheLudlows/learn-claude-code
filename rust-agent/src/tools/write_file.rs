@@ -100,11 +100,6 @@ mod tests {
     fn test_write_file_tool_name() {
         let tool = WriteFileTool;
         assert_eq!(tool.name(), "write_file");
-    }
-
-    #[test]
-    fn test_write_file_tool_description() {
-        let tool = WriteFileTool;
         assert!(tool.description().contains("Write content"));
     }
 

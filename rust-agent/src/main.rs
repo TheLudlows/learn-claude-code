@@ -41,7 +41,7 @@ use rust_agent::compact::{ContextCompactor, MAX_REACTIVE_RETRIES};
 use rust_agent::error::AgentError;
 use rust_agent::hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
 use rust_agent::permission::permission_hook;
-use rust_agent::tools::{ToolContext, ToolRegistry};
+use rust_agent::tools::{workdir, ToolContext, ToolRegistry};
 use dotenv::dotenv;
 use std::env;
 use std::io::{self, Write};
@@ -72,10 +72,7 @@ async fn execute_tool(
     };
 
     // 执行工具（PostToolUse 提醒由调用方注入，见 agent_loop）
-    match registry.dispatch(name, &ctx, input, false).await {
-        Some(result) => result,
-        None => "Error: tool not found".to_string(),
-    }
+    registry.dispatch(name, &ctx, input, false).await.unwrap_or_else(|| "Error: tool not found".to_string())
 }
 
 /// Agent 核心循环
@@ -216,19 +213,13 @@ async fn main() -> Result<(), AgentError> {
 
     let client = Client::new(api_key, base_url, model);
 
-    let cwd = env::current_dir()
-        .unwrap_or_else(|_| ".".into())
-        .to_string_lossy()
-        .to_string();
+    let cwd = workdir().to_string_lossy().to_string();
 
     // s08: 上下文压缩器。目录与 Python s08 一致：.transcripts/ 与 .task_outputs/tool-results/。
     let compactor = ContextCompactor::new(
         PathBuf::from(&cwd).join(".transcripts"),
         PathBuf::from(&cwd).join(".task_outputs").join("tool-results"),
     );
-
-    // s07: 启动时扫描技能目录，把「名称+描述」编入 system prompt，完整正文按需 load_skill 取。
-    // SKILLS_DIR 缺省（或空串）时回退到 cwd/skills；目录不存在则注册表为空（agent 仍可运行，只是无技能）。
     let skills_dir = env::var("SKILLS_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -283,7 +274,6 @@ async fn main() -> Result<(), AgentError> {
         io::stdin().read_line(&mut query)?;
         let query = query.trim().to_string();
 
-        // 空输入用 continue 跳过（多数 REPL 忽略空行），只有 q/exit 才退出会话。
         if query.is_empty() {
             continue;
         }
@@ -301,8 +291,6 @@ async fn main() -> Result<(), AgentError> {
             }],
         });
 
-        // s08: active_request 单独传入，因为 tool_result 也用 role=user，
-        // 压缩时无法从 messages 反推当前请求。
         if let Err(e) = agent_loop(
             &client,
             &registry,

@@ -112,12 +112,8 @@ mod tests {
     fn test_read_file_tool_name() {
         let tool = ReadFileTool;
         assert_eq!(tool.name(), "read_file");
-    }
-
-    #[test]
-    fn test_read_file_tool_description() {
-        let tool = ReadFileTool;
         assert!(tool.description().contains("Read the contents"));
+
     }
 
     #[test]
