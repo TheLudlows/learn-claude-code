@@ -1,16 +1,127 @@
 /*
 command.rs - Command Tool Implementation
 
-This module implements the CommandTool for executing shell commands.
-- Implements Tool trait for shell command execution
-- Uses run_bash() from tools/mod.rs
-- Has custom check_permission() for destructive commands
-- Returns "NeedsApproval" for destructive commands
+This module implements:
+- CommandTool: Tool trait implementation for shell command execution
+- run_bash(): Async cross-platform command execution with timeout
+- decode_console(): Console output decoding (UTF-8 → OEM codepage → lossy)
 */
 
 use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::time::{timeout, Duration};
+
+/// Command execution timeout in seconds.
+const COMMAND_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum output size in bytes before truncation.
+const MAX_OUTPUT_BYTES: usize = 50_000;
+
+/// 执行命令（跨平台，带超时）
+///
+/// - Windows: 使用 cmd.exe
+/// - Unix: 使用 bash
+///
+/// 危险命令的拦截已移至 permission::permission_hook 闸门(s03/s04),
+/// 在到达这里之前就已被拒; safe_path 仍是文件工具的工作区沙箱。
+pub(crate) async fn run_bash(command: &str) -> String {
+    let result = timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), async {
+        if cfg!(windows) {
+            tokio::process::Command::new("cmd.exe")
+                .args(["/C", command])
+                .current_dir(crate::tools::workdir())
+                .output()
+                .await
+        } else {
+            tokio::process::Command::new("bash")
+                .arg("-c")
+                .arg(command)
+                .current_dir(crate::tools::workdir())
+                .output()
+                .await
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = decode_console(&output.stdout);
+            let stderr = decode_console(&output.stderr);
+            let result = format!("{}\n{}", stdout, stderr).trim().to_string();
+            if result.is_empty() {
+                "(no output)".to_string()
+            } else if result.len() > MAX_OUTPUT_BYTES {
+                // 按字节上限截断，但必须落在 UTF-8 字符边界上，否则
+                // `result[..end]` 会在多字节序列（CJK 输出极常见）中间 panic。
+                let mut end = MAX_OUTPUT_BYTES;
+                while !result.is_char_boundary(end) {
+                    end -= 1;
+                }
+                result[..end].to_string()
+            } else {
+                result
+            }
+        }
+        Ok(Err(e)) => format!("Error: {}", e),
+        Err(_) => format!(
+            "Error: command timed out after {} seconds",
+            COMMAND_TIMEOUT_SECS
+        ),
+    }
+}
+
+/// 把命令输出字节解码成字符串：先按 UTF-8（cargo 等现代程序直接用 UTF-8），
+/// 失败再按 OEM 代码页解码（cmd.exe 内建命令、git 等在中文 locale 下用 GBK），
+/// 都不行才退化为 lossy。避免非 ASCII 被替成 U+FFFD（乱码）。
+pub(crate) fn decode_console(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    #[cfg(windows)]
+    if let Some(s) = decode_with_oem_codepage(bytes) {
+        return s;
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// 按 OEM 代码页（中文 locale 为 936/GBK）把字节解成 UTF-16 再转 String。
+/// 失败返回 None，让调用方退化为 lossy。
+#[cfg(windows)]
+fn decode_with_oem_codepage(bytes: &[u8]) -> Option<String> {
+    use std::os::raw::{c_int, c_uchar};
+    extern "system" {
+        fn GetOEMCP() -> u32;
+        fn MultiByteToWideChar(
+            CodePage: u32,
+            dwFlags: u32,
+            lpMultiByteStr: *const c_uchar,
+            cbMultiByte: c_int,
+            lpWideCharStr: *mut u16,
+            cchWideChar: c_int,
+        ) -> c_int;
+    }
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let cp = unsafe { GetOEMCP() };
+    let n = bytes.len() as c_int;
+    let size = unsafe {
+        MultiByteToWideChar(cp, 0, bytes.as_ptr(), n, std::ptr::null_mut(), 0)
+    };
+    if size <= 0 {
+        return None;
+    }
+    let mut buf: Vec<u16> = vec![0u16; size as usize];
+    let written = unsafe {
+        MultiByteToWideChar(cp, 0, bytes.as_ptr(), n, buf.as_mut_ptr(), size)
+    };
+    if written <= 0 {
+        return None;
+    }
+    buf.truncate(written as usize);
+    Some(String::from_utf16_lossy(&buf))
+}
 
 /// Command Tool for executing shell commands
 ///
@@ -21,17 +132,14 @@ pub struct CommandTool;
 
 #[async_trait]
 impl Tool for CommandTool {
-    /// Returns the tool's name
     fn name(&self) -> &str {
         "command"
     }
 
-    /// Returns a human-readable description
     fn description(&self) -> &str {
         "Execute a shell command and return its output. Commands are run in a workspace-isolated environment with safety checks."
     }
 
-    /// Returns the JSON schema for command input
     fn input_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -48,7 +156,6 @@ impl Tool for CommandTool {
     /// Checks if the command requires approval for potentially destructive actions
     fn check_permission(&self, input: &Value) -> PermissionCheck {
         if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-            // Check for destructive patterns
             let command_lower = command.to_lowercase();
 
             // Recursive operations on root
@@ -123,25 +230,17 @@ impl Tool for CommandTool {
             }
         }
 
-        // Default: allow safe commands
         PermissionCheck::Pass
     }
 
-    /// Executes the command using run_bash() from tools/mod.rs
     async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
         if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-            // Log the command execution (if hooks are available)
-            // Note: In production, this would be handled through the hooks system
-            // For now, we'll just execute the command
-
-            // Execute the command using the shared run_bash function
-            crate::tools::run_bash(command)
+            run_bash(command).await
         } else {
             "Error: No command provided".to_string()
         }
     }
 
-    /// Commands should be available to subagents with appropriate permission checks
     fn available_for_subagent(&self) -> bool {
         true
     }
@@ -150,7 +249,10 @@ impl Tool for CommandTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::trait_def::PermissionCheck;
     use serde_json::json;
+
+    // ---- CommandTool tests ----
 
     #[test]
     fn test_command_tool_name() {
@@ -182,7 +284,6 @@ mod tests {
     fn test_permission_check_safe_commands() {
         let tool = CommandTool;
 
-        // Safe commands should pass
         let safe_commands = vec![
             json!({"command": "ls -la"}),
             json!({"command": "git status"}),
@@ -190,13 +291,13 @@ mod tests {
             json!({"command": "echo hello world"}),
             json!({"command": "cat file.txt"}),
             json!({"command": "mkdir test_dir"}),
-            json!({"command": "rm file.txt"}), // Single file removal
-            json!({"command": "chmod 644 file.txt"}), // Safe permission change
+            json!({"command": "rm file.txt"}),
+            json!({"command": "chmod 644 file.txt"}),
         ];
 
         for cmd in safe_commands {
             match tool.check_permission(&cmd) {
-                PermissionCheck::Pass => {} // Expected
+                PermissionCheck::Pass => {}
                 PermissionCheck::NeedsApproval(reason) => {
                     panic!("Safe command was rejected: {:?} - {}", cmd, reason);
                 }
@@ -208,7 +309,6 @@ mod tests {
     fn test_permission_check_destructive_commands() {
         let tool = CommandTool;
 
-        // Destructive commands should need approval
         let destructive_commands = vec![
             json!({"command": "rm -rf /"}),
             json!({"command": "rm -rf /usr"}),
@@ -223,7 +323,6 @@ mod tests {
         for cmd in destructive_commands {
             match tool.check_permission(&cmd) {
                 PermissionCheck::NeedsApproval(reason) => {
-                    // Should contain approval-related text
                     assert!(reason.contains("approval") || reason.contains("explicit approval"),
                            "Destructive command should mention approval: {:?}", cmd);
                 }
@@ -238,17 +337,16 @@ mod tests {
     fn test_permission_case_insensitive() {
         let tool = CommandTool;
 
-        // Test case sensitivity
         let cmd1 = json!({"command": "RM -rf /etc"});
         let cmd2 = json!({"command": "chmod 777 /usr"});
 
         match tool.check_permission(&cmd1) {
-            PermissionCheck::NeedsApproval(_) => {} // Expected
+            PermissionCheck::NeedsApproval(_) => {}
             PermissionCheck::Pass => panic!("Case sensitive check failed"),
         }
 
         match tool.check_permission(&cmd2) {
-            PermissionCheck::NeedsApproval(_) => {} // Expected
+            PermissionCheck::NeedsApproval(_) => {}
             PermissionCheck::Pass => panic!("Case sensitive check failed"),
         }
     }
@@ -257,7 +355,6 @@ mod tests {
     fn test_permission_subdir_protection() {
         let tool = CommandTool;
 
-        // Test that critical subdirectories are protected
         let protected_commands = vec![
             json!({"command": "rm /etc/passwd"}),
             json!({"command": "rm -rf /usr/local"}),
@@ -268,7 +365,7 @@ mod tests {
 
         for cmd in protected_commands {
             match tool.check_permission(&cmd) {
-                PermissionCheck::NeedsApproval(_) => {} // Expected
+                PermissionCheck::NeedsApproval(_) => {}
                 PermissionCheck::Pass => {
                     panic!("Protected command was approved: {:?}", cmd);
                 }
@@ -280,7 +377,6 @@ mod tests {
     fn test_permission_dev_null_allowed() {
         let tool = CommandTool;
 
-        // Commands that redirect to /dev/null should be safe
         let dev_null_commands = vec![
             json!({"command": "echo 'test' > /dev/null"}),
             json!({"command": "some_command > /dev/null"}),
@@ -288,11 +384,73 @@ mod tests {
 
         for cmd in dev_null_commands {
             match tool.check_permission(&cmd) {
-                PermissionCheck::Pass => {} // Expected
+                PermissionCheck::Pass => {}
                 PermissionCheck::NeedsApproval(reason) => {
                     panic!("/dev/null redirect was rejected: {:?} - {}", cmd, reason);
                 }
             }
         }
+    }
+
+    // ---- run_bash async tests ----
+
+    /// 回归：cmd.exe 在中文 locale 默认按 GBK(936) 输出，`from_utf8_lossy` 会把
+    /// 非 ASCII（如 `ver` 输出里的 "版本"）替换成 U+FFFD（乱码）。强制 UTF-8 后
+    /// 应为合法 UTF-8 中文，不含替换符。
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn decodes_non_ascii_without_replacement_chars() {
+        let out = run_bash("ver").await;
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "命令输出不应含 U+FFFD 替换符（应为合法 UTF-8）: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bash_executes_simple_command() {
+        let out = run_bash("echo hello_from_rust_agent").await;
+        assert!(
+            out.contains("hello_from_rust_agent"),
+            "expected 'hello_from_rust_agent' in output, got: {}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bash_timeout_kills_long_command() {
+        // Use a command that sleeps longer than COMMAND_TIMEOUT_SECS.
+        // On Windows: ping -n sends one ping per second; -w 1000 waits 1s per ping.
+        // On Unix: sleep N sleeps for N seconds.
+        let cmd = if cfg!(windows) {
+            "ping -n 120 127.0.0.1"
+        } else {
+            "sleep 120"
+        };
+        let out = run_bash(cmd).await;
+        assert!(
+            out.contains("timed out"),
+            "expected timeout message, got: {}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bash_truncates_large_output() {
+        // Generate output larger than MAX_OUTPUT_BYTES (50,000 bytes).
+        // On Windows: use a for loop in cmd.exe.
+        // On Unix: use head -c or python/yes.
+        let cmd = if cfg!(windows) {
+            "for /L %i in (1,1,10000) do @echo LINE_%i_PADDING_DATA_TO_MAKE_IT_LONGER_AAAAAAAAAAAAAAAAAAAAAAA"
+        } else {
+            "python3 -c \"print('A' * 100 * 1000)\""
+        };
+        let out = run_bash(cmd).await;
+        // Output should be truncated to at most MAX_OUTPUT_BYTES
+        assert!(
+            out.len() <= MAX_OUTPUT_BYTES + 100, // small margin for UTF-8 boundary adjustment
+            "output should be truncated, got {} bytes",
+            out.len()
+        );
     }
 }

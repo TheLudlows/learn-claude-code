@@ -1,10 +1,18 @@
 /*
-tools/mod.rs - Tool system module
+tools/mod.rs - Tool system module hub
 
-This module contains the tool system infrastructure:
-- trait_def: Core abstractions (Tool trait, ToolContext, PermissionCheck)
-- registry: Tool registry for tool management and dispatch
-- (Future modules will contain individual tool implementations)
+Responsibilities:
+- Module declarations and re-exports
+- Shared utilities: workdir(), path safety (safe_path, safe_path_in)
+- Tool registry construction (build_registry)
+
+Tool implementations live in their own submodules:
+- command:   Shell command execution (run_bash with timeout)
+- read_file: File reading
+- write_file: File writing
+- edit_file: File editing (text replacement)
+- glob:      File pattern matching (via glob crate)
+- load_skill, todo_write, task: Higher-level tools
 */
 
 // Core modules
@@ -16,7 +24,7 @@ pub mod command;
 pub mod read_file;
 pub mod write_file;
 pub mod edit_file;
-pub mod glob;
+pub mod glob_tool;
 pub mod load_skill;
 pub mod todo_write;
 pub mod task;
@@ -24,12 +32,9 @@ pub mod task;
 // Re-exports for convenient access
 pub use self::registry::ToolRegistry;
 pub use self::trait_def::{PermissionCheck, Tool, ToolContext};
-pub 
 
 use std::env;
-use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 /// 工作目录
 pub fn workdir() -> PathBuf {
@@ -91,7 +96,7 @@ pub fn safe_path_in(workdir: &Path, path_str: &str) -> Result<PathBuf, String> {
 /// - 路径不存在：沿祖先上溯到第一个已存在的目录，`canonicalize()` 它，再拼回尚不存在的尾部。
 ///   这样不存在的路径（`write_file` 新建文件/目录）也能得到与 canonical base 可比的形态。
 /// - 连根目录都无法 `canonicalize()`：返回 `None`（调用方按失败闭合处理）。
-pub fn canonical_form_of(path: &Path) -> Option<PathBuf> {
+fn canonical_form_of(path: &Path) -> Option<PathBuf> {
     // 快路径：路径本身存在。
     if let Ok(c) = path.canonicalize() {
         return Some(c);
@@ -121,266 +126,6 @@ pub fn canonical_form_of(path: &Path) -> Option<PathBuf> {
 /// 路径安全校验 - 确保路径在当前工作目录内。
 pub fn safe_path(path_str: &str) -> Result<PathBuf, String> {
     safe_path_in(&workdir(), path_str)
-}
-
-/// 把命令输出字节解码成字符串：先按 UTF-8（cargo 等现代程序直接用 UTF-8），
-/// 失败再按 OEM 代码页解码（cmd.exe 内建命令、git 等在中文 locale 下用 GBK），
-/// 都不行才退化为 lossy。避免非 ASCII 被替成 U+FFFD（乱码）。
-pub fn decode_console(bytes: &[u8]) -> String {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        return s.to_string();
-    }
-    #[cfg(windows)]
-    if let Some(s) = decode_with_oem_codepage(bytes) {
-        return s;
-    }
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// 按 OEM 代码页（中文 locale 为 936/GBK）把字节解成 UTF-16 再转 String。
-/// 失败返回 None，让调用方退化为 lossy。
-#[cfg(windows)]
-pub fn decode_with_oem_codepage(bytes: &[u8]) -> Option<String> {
-    use std::os::raw::{c_int, c_uchar};
-    extern "system" {
-        fn GetOEMCP() -> u32;
-        fn MultiByteToWideChar(
-            CodePage: u32,
-            dwFlags: u32,
-            lpMultiByteStr: *const c_uchar,
-            cbMultiByte: c_int,
-            lpWideCharStr: *mut u16,
-            cchWideChar: c_int,
-        ) -> c_int;
-    }
-    if bytes.is_empty() {
-        return Some(String::new());
-    }
-    let cp = unsafe { GetOEMCP() };
-    let n = bytes.len() as c_int;
-    let size = unsafe {
-        MultiByteToWideChar(cp, 0, bytes.as_ptr(), n, std::ptr::null_mut(), 0)
-    };
-    if size <= 0 {
-        return None;
-    }
-    let mut buf: Vec<u16> = vec![0u16; size as usize];
-    let written = unsafe {
-        MultiByteToWideChar(cp, 0, bytes.as_ptr(), n, buf.as_mut_ptr(), size)
-    };
-    if written <= 0 {
-        return None;
-    }
-    buf.truncate(written as usize);
-    Some(String::from_utf16_lossy(&buf))
-}
-
-/// 执行命令（跨平台）
-///
-/// - Windows: 使用 cmd.exe
-/// - Unix: 使用 bash
-///
-/// 危险命令的拦截已移至 permission::permission_hook 闸门(s03/s04),
-/// 在到达这里之前就已被拒; safe_path 仍是文件工具的工作区沙箱。
-const MAX_OUTPUT_BYTES: usize = 50_000;
-
-pub fn run_bash(command: &str) -> String {
-    let result = if cfg!(windows) {
-        Command::new("cmd.exe")
-            .args(["/C", command])
-            .current_dir(workdir())
-            .output()
-    } else {
-        Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .current_dir(workdir())
-            .output()
-    };
-
-    match result {
-        Ok(output) => {
-            let stdout = decode_console(&output.stdout);
-            let stderr = decode_console(&output.stderr);
-            let result = format!("{}\n{}", stdout, stderr).trim().to_string();
-            if result.is_empty() {
-                "(no output)".to_string()
-            } else if result.len() > MAX_OUTPUT_BYTES {
-                // 按字节上限截断，但必须落在 UTF-8 字符边界上，否则
-                // `result[..end]` 会在多字节序列（CJK 输出极常见）中间 panic。
-                let mut end = MAX_OUTPUT_BYTES;
-                while !result.is_char_boundary(end) {
-                    end -= 1;
-                }
-                result[..end].to_string()
-            } else {
-                result
-            }
-        }
-        Err(e) => format!("Error: {}", e),
-    }
-}
-
-/// 读取文件
-pub fn run_read_file(path: &str, limit: Option<u32>) -> String {
-    match safe_path(path) {
-        Ok(abs_path) => {
-            match fs::read_to_string(&abs_path) {
-                Ok(content) => {
-                    let lines: Vec<&str> = content.lines().collect();
-                    if let Some(limit) = limit {
-                        if lines.len() > limit as usize {
-                            let truncated: Vec<&str> = lines[..limit as usize].to_vec();
-                            let more = lines.len() - limit as usize;
-                            format!("{}\n... ({} more lines)",
-                                truncated.join("\n"), more)
-                        } else {
-                            content
-                        }
-                    } else {
-                        content
-                    }
-                }
-                Err(e) => format!("Error: {}", e),
-            }
-        }
-        Err(e) => e,
-    }
-}
-
-/// 写入文件
-pub fn run_write_file(path: &str, content: &str) -> String {
-    match safe_path(path) {
-        Ok(abs_path) => {
-            if let Some(parent) = abs_path.parent() {
-                fs::create_dir_all(parent).ok();
-            }
-            match fs::write(&abs_path, content) {
-                Ok(_) => format!("Wrote {} bytes to {}", content.len(), path),
-                Err(e) => format!("Error: {}", e),
-            }
-        }
-        Err(e) => e,
-    }
-}
-
-/// 编辑文件（替换文本）
-pub fn run_edit_file(path: &str, old_text: &str, new_text: &str) -> String {
-    match safe_path(path) {
-        Ok(abs_path) => {
-            match fs::read_to_string(&abs_path) {
-                Ok(content) => {
-                    if !content.contains(old_text) {
-                        return format!("Error: text not found in {}", path);
-                    }
-                    let new_content = content.replacen(old_text, new_text, 1);
-                    match fs::write(&abs_path, &new_content) {
-                        Ok(_) => format!("Edited {}", path),
-                        Err(e) => format!("Error: {}", e),
-                    }
-                }
-                Err(e) => format!("Error: {}", e),
-            }
-        }
-        Err(e) => e,
-    }
-}
-
-/// 把路径分隔符统一成 `/`（Windows 上 `strip_prefix` 给的是 `\`），方便做 glob 匹配。
-pub fn to_unix_path(p: &str) -> String {
-    p.replace('\\', "/")
-}
-
-/// 单个路径段是否匹配单个模式段（段内不含 `/`）。
-/// `*` 匹配任意长度（含空）的字符；`?` 匹配单个字符；其余按字面量。
-pub fn seg_match(pat: &[u8], text: &[u8]) -> bool {
-    let (mut pi, mut ti) = (0, 0);
-    let mut star_pi: Option<usize> = None;
-    let mut star_ti = 0;
-    while ti < text.len() {
-        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == text[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < pat.len() && pat[pi] == b'*' {
-            star_pi = Some(pi);
-            star_ti = ti;
-            pi += 1;
-        } else if let Some(sp) = star_pi {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-    while pi < pat.len() && pat[pi] == b'*' {
-        pi += 1;
-    }
-    pi == pat.len()
-}
-
-/// 判断 `path`（`/` 分隔的相对路径）是否匹配 glob `pattern`。
-/// `*` 匹配一段内的任意字符；`**` 作为独立段时匹配零或多个整段路径。
-pub fn glob_match(pattern: &str, path: &str) -> bool {
-    fn rec(pat: &[&str], txt: &[&str]) -> bool {
-        if pat.is_empty() {
-            return txt.is_empty();
-        }
-        if pat[0] == "**" {
-            // ** 匹配零或多个整段：先试零段，失败再吃掉一段 txt
-            if rec(&pat[1..], txt) {
-                return true;
-            }
-            if !txt.is_empty() {
-                return rec(pat, &txt[1..]);
-            }
-            false
-        } else {
-            // 普通段必须恰好匹配一个 txt 段
-            if txt.is_empty() || !seg_match(pat[0].as_bytes(), txt[0].as_bytes()) {
-                return false;
-            }
-            rec(&pat[1..], &txt[1..])
-        }
-    }
-    let pat: Vec<&str> = pattern.split('/').collect();
-    let txt: Vec<&str> = path.split('/').collect();
-    rec(&pat, &txt)
-}
-
-/// 在 `base` 下递归收集所有匹配 glob `pattern` 的相对路径（`/` 分隔）。
-pub fn glob_in(pattern: &str, base: &Path) -> Vec<String> {
-    let mut results: Vec<String> = Vec::new();
-
-    fn walk(dir: &Path, base: &Path, pattern: &str, results: &mut Vec<String>) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Ok(rel) = path.strip_prefix(base) {
-                    let rel = to_unix_path(&rel.to_string_lossy());
-                    if glob_match(pattern, &rel) {
-                        results.push(rel);
-                    }
-                }
-                if path.is_dir() {
-                    walk(&path, base, pattern, results);
-                }
-            }
-        }
-    }
-
-    walk(base, base, pattern, &mut results);
-    results
-}
-
-/// 查找匹配的文件（按 glob 规则匹配相对路径，递归整个工作区）
-pub fn run_glob(pattern: &str) -> String {
-    let results = glob_in(pattern, &workdir());
-    if results.is_empty() {
-        "Error: no matches".to_string()
-    } else {
-        results.join("\n")
-    }
 }
 
 /// 词法检查路径是否可能越界（不访问文件系统）。
@@ -420,127 +165,19 @@ pub fn normalize(path_str: &str) -> PathBuf {
 }
 
 /// Build and return a tool registry with all tools registered.
-///
-/// This function populates the registry with individual tool implementations.
-/// Additional tools will be added in Tasks 6-12.
 pub fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
-    // Task 5: Command tool for shell command execution
     registry.register(Box::new(crate::tools::command::CommandTool));
-
-    // Task 6: Read file tool for reading file contents
     registry.register(Box::new(crate::tools::read_file::ReadFileTool));
-
-    // Task 7: Write file tool for writing file contents
     registry.register(Box::new(crate::tools::write_file::WriteFileTool));
-
-    // Task 8: Edit file tool for editing file contents
     registry.register(Box::new(crate::tools::edit_file::EditFileTool));
-
-    // Task 9: Glob tool for file pattern matching
-    registry.register(Box::new(crate::tools::glob::GlobTool));
-
-    // Task 10: Load skill tool for loading skill definitions
+    registry.register(Box::new(crate::tools::glob_tool::GlobTool));
     registry.register(Box::new(crate::tools::load_skill::LoadSkillTool));
-
-    // Task 11: Todo write tool for updating todo tasks
     registry.register(Box::new(crate::tools::todo_write::TodoWriteTool));
-
-    // Task 12: Task tool for running subagents
     registry.register(Box::new(crate::tools::task::TaskTool));
 
     registry
-}
-
-// Tests moved from tools_legacy.rs
-
-#[cfg(test)]
-mod glob_match_tests {
-    use super::*;
-
-    #[test]
-    fn literal_exact() {
-        assert!(glob_match("a.rs", "a.rs"));
-        assert!(!glob_match("a.rs", "b.rs"));
-        assert!(!glob_match("src", "src_backup")); // 段必须整体匹配，不做子串
-        assert!(!glob_match("src", "src/a.rs"));   // 段数不等
-    }
-
-    #[test]
-    fn star_within_segment() {
-        assert!(glob_match("*.rs", "a.rs"));
-        assert!(glob_match("*.rs", "tools.rs"));
-        assert!(!glob_match("*.rs", "src"));        // 缺 .rs
-        assert!(!glob_match("*.rs", "src/a.rs"));  // * 不跨段
-        assert!(glob_match("a*.rs", "abc.rs"));
-        assert!(glob_match("a*z", "abcxyz"));
-        assert!(!glob_match("a*.rs", "abc.txt"));
-    }
-
-    #[test]
-    fn question_mark() {
-        assert!(glob_match("?.rs", "a.rs"));
-        assert!(glob_match("?.rs", "b.rs"));
-        assert!(!glob_match("?.rs", "ab.rs"));     // ? 只配一个字符
-        assert!(!glob_match("?.rs", ".rs"));        // ? 至少要有一个
-    }
-
-    #[test]
-    fn double_star_recursive() {
-        assert!(glob_match("**", "a.rs"));
-        assert!(glob_match("**", "src/a.rs"));
-        assert!(glob_match("**", "src/sub/a.rs"));
-        assert!(glob_match("**/*.rs", "a.rs"));      // ** 匹配零段
-        assert!(glob_match("**/*.rs", "src/a.rs"));
-        assert!(glob_match("**/*.rs", "src/sub/a.rs"));
-        assert!(glob_match("src/**/*.rs", "src/a.rs"));
-        assert!(glob_match("src/**/*.rs", "src/sub/a.rs"));
-        assert!(!glob_match("src/**/*.rs", "a.rs"));      // 不在 src 下
-        assert!(!glob_match("src/**/*.rs", "test/a.rs")); // 前缀不符
-    }
-
-    #[test]
-    fn glob_in_walks_tree() {
-        let dir = std::env::temp_dir().join("rust-agent-glob-test-walk");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("a.rs"), b"").unwrap();
-        std::fs::write(dir.join("b.txt"), b"").unwrap();
-        std::fs::write(dir.join("src").join("c.rs"), b"").unwrap();
-
-        let mut got = glob_in("**/*.rs", &dir);
-        got.sort();
-        let mut want = vec!["a.rs".to_string(), "src/c.rs".to_string()];
-        want.sort();
-        assert_eq!(got, want);
-
-        let mut top = glob_in("*.rs", &dir);
-        top.sort();
-        assert_eq!(top, vec!["a.rs".to_string()]);
-
-        assert_eq!(glob_in("zzz", &dir), Vec::<String>::new());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[cfg(test)]
-mod run_bash_tests {
-    use super::run_bash;
-
-    /// 回归：cmd.exe 在中文 locale 默认按 GBK(936) 输出，`from_utf8_lossy` 会把
-    /// 非 ASCII（如 `ver` 输出里的 "版本"）替换成 U+FFFD（乱码）。强制 UTF-8 后
-    /// 应为合法 UTF-8 中文，不含替换符。
-    #[test]
-    #[cfg(windows)]
-    fn decodes_non_ascii_without_replacement_chars() {
-        let out = run_bash("ver");
-        assert!(
-            !out.contains('\u{FFFD}'),
-            "命令输出不应含 U+FFFD 替换符（应为合法 UTF-8）: {out:?}"
-        );
-    }
 }
 
 #[cfg(test)]

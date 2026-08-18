@@ -9,6 +9,7 @@
 */
 
 use crate::client::{Client, ContentBlock, Message};
+use crate::error::AgentError;
 use crate::hooks::{assemble_post_tool_messages, Hooks};
 use crate::tools::{ToolContext, ToolRegistry};
 
@@ -50,7 +51,7 @@ pub async fn run_subagent_loop(
     registry: &ToolRegistry,
     prompt: &str,
     hooks: &Hooks,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, AgentError> {
     // 子 agent 从全新的消息列表开始
     let mut messages: Vec<Message> = vec![Message {
         role: "user".to_string(),
@@ -108,8 +109,9 @@ pub async fn run_subagent_loop(
                 // 创建工具上下文
                 let ctx = ToolContext { client, hooks, registry };
 
-                // 使用 registry.dispatch
-                match registry.dispatch(name, &ctx, input).await {
+                // 使用 registry.dispatch（for_subagent=true：派发层再挡 task 等不可用工具，
+                // 防止模型幻觉出 task 调用导致子 agent 递归委托）
+                match registry.dispatch(name, &ctx, input, true).await {
                     Some(output) => {
                         // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
                         if let Some(msg) = hooks.trigger_post_tool(name, input, &output) {

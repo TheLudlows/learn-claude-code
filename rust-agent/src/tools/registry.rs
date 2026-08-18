@@ -37,22 +37,34 @@ impl ToolRegistry {
 
     /// Dispatch a tool call by name
     ///
+    /// `for_subagent` 为 `true` 时（子 agent 上下文），对 `available_for_subagent() == false`
+    /// 的工具返回错误串而非执行——`definitions_for_subagent` 已在**声明层**过滤掉这类工具，
+    /// 此处在**派发层**再挡一道，防止模型幻觉出 `task` 调用导致子 agent 递归委托。
+    ///
     /// # Arguments
     /// * `name` - The name of the tool to dispatch
     /// * `ctx` - The execution context
     /// * `input` - The parsed input JSON for the tool call
+    /// * `for_subagent` - 是否在子 agent 上下文中派发
     ///
     /// # Returns
-    /// * `Some(result)` - The tool's output if the tool was found
+    /// * `Some(result)` - The tool's output if the tool was found (含子 agent 拒绝时的错误串)
     /// * `None` - If no tool with the given name was registered
     pub async fn dispatch(
         &self,
         name: &str,
         ctx: &ToolContext<'_>,
         input: &Value,
+        for_subagent: bool,
     ) -> Option<String> {
         for tool in &self.tools {
             if tool.name() == name {
+                if for_subagent && !tool.available_for_subagent() {
+                    return Some(format!(
+                        "Error: Tool '{}' is not available in subagent context",
+                        name
+                    ));
+                }
                 return Some(tool.execute(ctx, input).await);
             }
         }
@@ -242,7 +254,7 @@ mod tests {
             registry: &registry_for_ctx,
         };
 
-        let result = registry.dispatch("known_tool", &ctx, &input).await;
+        let result = registry.dispatch("known_tool", &ctx, &input, false).await;
 
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "TestTool executed with: Object {\"input\": String(\"test_value\")}");
@@ -272,7 +284,7 @@ mod tests {
             registry: &registry_for_ctx,
         };
 
-        let result = registry.dispatch("unknown_tool", &ctx, &input).await;
+        let result = registry.dispatch("unknown_tool", &ctx, &input, false).await;
 
         assert!(result.is_none());
     }
@@ -455,7 +467,7 @@ mod tests {
     //     let input = json!({"input": "test_value"});
     //     let ctx = create_mock_context();
 
-    //     let result = registry.dispatch("dispatch_test", &ctx, &input).await;
+    //     let result = registry.dispatch("dispatch_test", &ctx, &input, false).await;
 
     //     assert!(result.is_some());
     //     assert!(result.unwrap().contains("dispatch_test"));
@@ -468,7 +480,7 @@ mod tests {
     //     let input = json!({"test": "value"});
     //     let ctx = create_mock_context();
 
-    //     let result = registry.dispatch("unknown_tool", &ctx, &input).await;
+    //     let result = registry.dispatch("unknown_tool", &ctx, &input, false).await;
 
     //     assert!(result.is_none());
     // }
@@ -565,6 +577,56 @@ mod tests {
         assert!(subagent_definitions.iter().any(|def| def.name == "command"));
         assert!(subagent_definitions.iter().any(|def| def.name == "read_file"));
         assert!(!subagent_definitions.iter().any(|def| def.name == "task"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_for_subagent_rejects_task() {
+        // A1 残留回归：definitions_for_subagent 只在「声明层」过滤掉 task，
+        // dispatch 的 for_subagent=true 必须在「派发层」再挡一道——
+        // 否则模型幻觉出 task 调用时，子 agent 仍会递归委托。
+        use crate::tools::task::TaskTool;
+        use crate::tools::trait_def::ToolContext;
+        use crate::client::Client;
+        use crate::hooks::Hooks;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaskTool));
+
+        let client = Client::new(
+            "test-key".to_string(),
+            "https://api.example.com".to_string(),
+            "claude-3".to_string(),
+        );
+        let hooks = Hooks::new();
+        let registry_for_ctx = ToolRegistry::new();
+        let ctx = ToolContext {
+            client: &client,
+            hooks: &hooks,
+            registry: &registry_for_ctx,
+        };
+
+        // 子 agent 上下文派发 task：返回错误串，不执行（不触发递归）
+        let result = registry
+            .dispatch("task", &ctx, &json!({"prompt": "recurse"}), true)
+            .await;
+        assert!(result.is_some(), "dispatch should return an error string, not None");
+        let out = result.unwrap();
+        assert!(
+            out.contains("not available in subagent context"),
+            "subagent dispatch of task must be rejected, got: {}",
+            out
+        );
+
+        // 父 agent 上下文派发 task：不在此挡（真实执行由上层 ctx.client 决定，
+        // 这里只确认 for_subagent=false 不会走到拒绝分支——返回串不含拒绝措辞）
+        let parent_result = registry
+            .dispatch("task", &ctx, &json!({"prompt": "ok"}), false)
+            .await;
+        assert!(parent_result.is_some());
+        assert!(
+            !parent_result.unwrap().contains("not available in subagent context"),
+            "parent dispatch must not hit the subagent-reject branch"
+        );
     }
 
     #[test]

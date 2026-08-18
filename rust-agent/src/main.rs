@@ -35,6 +35,7 @@ Key insight: the loop stays the same; only the four trigger points are wired in.
 */
 
 use rust_agent::client::{Client, ContentBlock, Message};
+use rust_agent::error::AgentError;
 use rust_agent::hooks::{assemble_post_tool_messages, context_inject_hook, large_output_hook, summary_hook, todo_reminder_hook, Hooks};
 use rust_agent::permission::permission_hook;
 use rust_agent::tools::{ToolContext, ToolRegistry};
@@ -68,7 +69,7 @@ async fn execute_tool(
     };
 
     // 执行工具（PostToolUse 提醒由调用方注入，见 agent_loop）
-    match registry.dispatch(name, &ctx, input).await {
+    match registry.dispatch(name, &ctx, input, false).await {
         Some(result) => result,
         None => "Error: tool not found".to_string(),
     }
@@ -85,7 +86,7 @@ async fn agent_loop(
     system: &str,
     messages: &mut Vec<Message>,
     hooks: &Hooks,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), AgentError> {
     loop {
         let response = client
             .stream_messages(system, messages, &registry.definitions(), 8000)
@@ -158,7 +159,7 @@ fn mask_key(k: &str) -> String {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), AgentError> {
     dotenv().ok();
     println!("Enter a question, press Enter to send. Type q to quit.\n");
 
@@ -232,7 +233,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdin().read_line(&mut query)?;
         let query = query.trim();
 
-        if query.eq_ignore_ascii_case("q") || query == "exit" || query.is_empty() {
+        // 空输入用 continue 跳过（多数 REPL 忽略空行），只有 q/exit 才退出会话。
+        if query.is_empty() {
+            continue;
+        }
+        if query.eq_ignore_ascii_case("q") || query == "exit" {
             break;
         }
 

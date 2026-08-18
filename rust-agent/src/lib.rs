@@ -1,4 +1,5 @@
 pub mod client;
+pub mod error;
 pub mod hooks;
 pub mod output;
 pub mod permission;

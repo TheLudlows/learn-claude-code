@@ -24,7 +24,10 @@ const DENY_LIST: &[&str] = &[
 ];
 
 fn check_deny_list(command: &str) -> Option<&'static str> {
-    DENY_LIST.iter().copied().find(|p| command.contains(p))
+    // 与 command.rs::check_permission 对齐：命令先转小写再匹配。
+    // DENY_LIST 条目均为小写，不转小写会让 "Sudo" / "RM -rf /" 绕过闸门 1。
+    let command_lower = command.to_lowercase();
+    DENY_LIST.iter().copied().find(|p| command_lower.contains(p))
 }
 
 
@@ -81,6 +84,16 @@ mod tests {
         assert_eq!(check_deny_list("sudo apt update"), Some("sudo"));
         assert!(check_deny_list("rm -rf /").is_some());
         assert!(check_deny_list("ls -la").is_none());
+    }
+
+    #[test]
+    fn deny_list_case_insensitive() {
+        // N4 回归：闸门 1 必须与 command.rs 对齐走 to_lowercase，
+        // 否则 "Sudo" / "RM -rf /" 能绕过硬拒绝。
+        assert_eq!(check_deny_list("Sudo apt update"), Some("sudo"));
+        assert_eq!(check_deny_list("SUDO reboot"), Some("sudo"));
+        assert!(check_deny_list("RM -rf /").is_some());
+        assert!(check_deny_list("Reboot now").is_some());
     }
 
     #[test]

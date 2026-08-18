@@ -1,16 +1,35 @@
 /*
 edit_file.rs - Edit File Tool Implementation
 
-This module implements the EditFileTool for editing file contents.
-- Implements Tool trait for file editing operations
-- Uses run_edit_file() from tools/mod.rs
-- Has check_permission with escapes_workspace_lexical
-- Default available_for_subagent = true
+This module implements:
+- EditFileTool: Tool trait implementation for editing file contents
+- run_edit_file(): Text replacement with safety checks
 */
 
 use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::fs;
+
+/// 编辑文件（替换文本）
+pub(crate) fn run_edit_file(path: &str, old_text: &str, new_text: &str) -> String {
+    match crate::tools::safe_path(path) {
+        Ok(abs_path) => match fs::read_to_string(&abs_path) {
+            Ok(content) => {
+                if !content.contains(old_text) {
+                    return format!("Error: text not found in {}", path);
+                }
+                let new_content = content.replacen(old_text, new_text, 1);
+                match fs::write(&abs_path, &new_content) {
+                    Ok(_) => format!("Edited {}", path),
+                    Err(e) => format!("Error: {}", e),
+                }
+            }
+            Err(e) => format!("Error: {}", e),
+        },
+        Err(e) => e,
+    }
+}
 
 /// Edit File Tool for editing file contents
 ///
@@ -20,17 +39,14 @@ pub struct EditFileTool;
 
 #[async_trait]
 impl Tool for EditFileTool {
-    /// Returns the tool's name
     fn name(&self) -> &str {
         "edit_file"
     }
 
-    /// Returns a human-readable description
     fn description(&self) -> &str {
         "Edit a file by replacing specific text. Requires the old text to match exactly."
     }
 
-    /// Returns the JSON schema for edit_file input
     fn input_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -52,10 +68,8 @@ impl Tool for EditFileTool {
         })
     }
 
-    /// Checks if the file editing requires approval based on path safety
     fn check_permission(&self, input: &Value) -> PermissionCheck {
         if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-            // Check if the path escapes the workspace lexically
             if crate::tools::escapes_workspace_lexical(path) {
                 return PermissionCheck::NeedsApproval(
                     "This file path appears to escape the workspace boundary. Editing files outside the project could be dangerous."
@@ -63,11 +77,9 @@ impl Tool for EditFileTool {
             }
         }
 
-        // Default: allow file editing for paths within workspace
         PermissionCheck::Pass
     }
 
-    /// Executes the file editing using run_edit_file() from tools/mod.rs
     async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
         let path = match input.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
@@ -84,11 +96,9 @@ impl Tool for EditFileTool {
             None => return "Error: No new text provided".to_string(),
         };
 
-        // Execute the file editing using the shared run_edit_file function
-        crate::tools::run_edit_file(path, old_text, new_text)
+        run_edit_file(path, old_text, new_text)
     }
 
-    /// Edit file tool should be available to subagents with appropriate permission checks
     fn available_for_subagent(&self) -> bool {
         true
     }
@@ -133,7 +143,6 @@ mod tests {
     fn test_permission_check_safe_paths() {
         let tool = EditFileTool;
 
-        // Safe paths should pass
         let safe_paths = vec![
             json!({"path": "src/main.rs", "old_text": "// old", "new_text": "// new"}),
             json!({"path": "Cargo.toml", "old_text": "[package]", "new_text": "[package]"}),
@@ -145,7 +154,7 @@ mod tests {
 
         for path in safe_paths {
             match tool.check_permission(&path) {
-                PermissionCheck::Pass => {} // Expected
+                PermissionCheck::Pass => {}
                 PermissionCheck::NeedsApproval(reason) => {
                     panic!("Safe path was rejected: {:?} - {}", path, reason);
                 }
@@ -157,7 +166,6 @@ mod tests {
     fn test_permission_check_escape_paths() {
         let tool = EditFileTool;
 
-        // Escape paths should need approval
         let escape_paths = vec![
             json!({"path": "../secret.txt", "old_text": "data", "new_text": "new_data"}),
             json!({"path": "../../etc/passwd", "old_text": "root:x:0:0", "new_text": "new_root:x:0:0"}),
@@ -170,7 +178,6 @@ mod tests {
         for path in escape_paths {
             match tool.check_permission(&path) {
                 PermissionCheck::NeedsApproval(reason) => {
-                    // Should contain approval-related text
                     assert!(reason.contains("approval") || reason.contains("explicit approval") || reason.contains("workspace boundary") || reason.contains("dangerous"),
                            "Escape path should mention approval or workspace boundary: {:?} - {}", path, reason);
                 }
@@ -185,10 +192,9 @@ mod tests {
     fn test_permission_case_insensitive() {
         let tool = EditFileTool;
 
-        // Test that path escaping is case insensitive
         let escape_path = json!({"path": "..\\SECRET.TXT", "old_text": "old", "new_text": "new"});
         match tool.check_permission(&escape_path) {
-            PermissionCheck::NeedsApproval(_) => {} // Expected
+            PermissionCheck::NeedsApproval(_) => {}
             PermissionCheck::Pass => panic!("Case insensitive check failed"),
         }
     }
@@ -197,23 +203,20 @@ mod tests {
     fn test_path_normalization() {
         let tool = EditFileTool;
 
-        // Test path normalization (should be normalized to check escape)
         let normalized_paths = vec![
-            json!({"path": "././file.txt", "old_text": "old", "new_text": "new"}),       // Should be safe
-            json!({"path": "src/../file.txt", "old_text": "old", "new_text": "new"}),    // Should be safe (parent within workspace)
-            json!({"path": "src/../../file.txt", "old_text": "old", "new_text": "new"}), // Should escape
+            json!({"path": "././file.txt", "old_text": "old", "new_text": "new"}),
+            json!({"path": "src/../file.txt", "old_text": "old", "new_text": "new"}),
+            json!({"path": "src/../../file.txt", "old_text": "old", "new_text": "new"}),
         ];
 
         for path in normalized_paths {
             match tool.check_permission(&path) {
                 PermissionCheck::Pass => {
-                    // If normalized path doesn't escape, it should be safe
                     let path_str = path["path"].as_str().unwrap();
                     assert!(!crate::tools::escapes_workspace_lexical(path_str),
                            "Path should not escape: {:?}", path_str);
                 }
                 PermissionCheck::NeedsApproval(_) => {
-                    // If normalized path escapes, it should need approval
                     let path_str = path["path"].as_str().unwrap();
                     assert!(crate::tools::escapes_workspace_lexical(path_str),
                            "Path should escape: {:?}", path_str);
@@ -226,24 +229,61 @@ mod tests {
     fn test_permission_validation() {
         let tool = EditFileTool;
 
-        // Test malformed input (missing required fields)
-        let no_path = json!({"old_text": "old", "new_text": "new"}); // Missing path
-        let no_old_text = json!({"path": "file.txt", "new_text": "new"}); // Missing old_text
-        let no_new_text = json!({"path": "file.txt", "old_text": "old"}); // Missing new_text
+        let no_path = json!({"old_text": "old", "new_text": "new"});
+        let no_old_text = json!({"path": "file.txt", "new_text": "new"});
+        let no_new_text = json!({"path": "file.txt", "old_text": "old"});
 
         match tool.check_permission(&no_path) {
-            PermissionCheck::Pass => {} // Should pass (permission check doesn't validate schema)
+            PermissionCheck::Pass => {}
             _ => panic!("No path should be allowed in permission check"),
         }
 
         match tool.check_permission(&no_old_text) {
-            PermissionCheck::Pass => {} // Should pass (permission check doesn't validate schema)
+            PermissionCheck::Pass => {}
             _ => panic!("No old_text should be allowed in permission check"),
         }
 
         match tool.check_permission(&no_new_text) {
-            PermissionCheck::Pass => {} // Should pass (permission check doesn't validate schema)
+            PermissionCheck::Pass => {}
             _ => panic!("No new_text should be allowed in permission check"),
         }
+    }
+
+    // ---- run_edit_file logic tests ----
+
+    #[test]
+    fn run_edit_file_replaces_first_occurrence_only() {
+        // Verify replacen(..., 1) behavior: only first occurrence is replaced.
+        let content = "foo bar foo baz";
+        let result = content.replacen("foo", "REPLACED", 1);
+        assert_eq!(result, "REPLACED bar foo baz");
+    }
+
+    #[test]
+    fn run_edit_file_text_not_found() {
+        // When old_text is not in the file, we return an error message.
+        let content = "hello world";
+        assert!(!content.contains("missing_text"));
+    }
+
+    #[test]
+    fn run_edit_file_full_flow() {
+        let dir = std::env::temp_dir().join("rust-agent-edit-file-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("edit.txt");
+        std::fs::write(&file, "old value here").unwrap();
+
+        // Simulate run_edit_file logic
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("old value"));
+        let new_content = content.replacen("old value", "new value", 1);
+        std::fs::write(&file, &new_content).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "new value here"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

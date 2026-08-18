@@ -203,7 +203,7 @@ mod tests {
 
         assert_eq!(tool.name(), "test_tool");
         assert_eq!(tool.description(), "A test tool");
-        assert_eq!(tool.available_for_subagent(), true);
+        assert!(tool.available_for_subagent());
     }
 
     #[test]
@@ -242,7 +242,7 @@ mod tests {
             name: "restricted".to_string(),
         };
 
-        assert_eq!(tool.available_for_subagent(), false);
+        assert!(!tool.available_for_subagent());
     }
 
     #[test]

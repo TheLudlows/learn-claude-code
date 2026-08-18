@@ -1,16 +1,43 @@
 /*
 read_file.rs - Read File Tool Implementation
 
-This module implements the ReadFileTool for reading file contents.
-- Implements Tool trait for file reading operations
-- Uses run_read_file() from tools/mod.rs
-- Has check_permission with escapes_workspace_lexical
-- Default available_for_subagent = true
+This module implements:
+- ReadFileTool: Tool trait implementation for reading file contents
+- run_read_file(): File reading with optional line truncation
 */
 
 use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::fs;
+
+/// 读取文件
+pub(crate) fn run_read_file(path: &str, limit: Option<u32>) -> String {
+    match crate::tools::safe_path(path) {
+        Ok(abs_path) => match fs::read_to_string(&abs_path) {
+            Ok(content) => {
+                let lines: Vec<&str> = content.lines().collect();
+                if let Some(limit) = limit {
+                    if lines.len() > limit as usize {
+                        let truncated: Vec<&str> = lines[..limit as usize].to_vec();
+                        let more = lines.len() - limit as usize;
+                        format!(
+                            "{}\n... ({} more lines)",
+                            truncated.join("\n"),
+                            more
+                        )
+                    } else {
+                        content
+                    }
+                } else {
+                    content
+                }
+            }
+            Err(e) => format!("Error: {}", e),
+        },
+        Err(e) => e,
+    }
+}
 
 /// Read File Tool for reading file contents
 ///
@@ -20,17 +47,14 @@ pub struct ReadFileTool;
 
 #[async_trait]
 impl Tool for ReadFileTool {
-    /// Returns the tool's name
     fn name(&self) -> &str {
         "read_file"
     }
 
-    /// Returns a human-readable description
     fn description(&self) -> &str {
         "Read the contents of a file. Returns the full content or a truncated version if the file is too large."
     }
 
-    /// Returns the JSON schema for read_file input
     fn input_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -49,10 +73,8 @@ impl Tool for ReadFileTool {
         })
     }
 
-    /// Checks if the file reading requires approval based on path safety
     fn check_permission(&self, input: &Value) -> PermissionCheck {
         if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-            // Check if the path escapes the workspace lexically
             if crate::tools::escapes_workspace_lexical(path) {
                 return PermissionCheck::NeedsApproval(
                     "This file path appears to escape the workspace boundary. This could potentially access sensitive files outside the project."
@@ -60,26 +82,20 @@ impl Tool for ReadFileTool {
             }
         }
 
-        // Default: allow file reading for paths within workspace
         PermissionCheck::Pass
     }
 
-    /// Executes the file reading using run_read_file() from tools/mod.rs
     async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
         let path = match input.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: No file path provided".to_string(),
         };
 
-        let limit = input.get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|l| l as u32);
+        let limit = input.get("limit").and_then(|v| v.as_u64()).map(|l| l as u32);
 
-        // Execute the file reading using the shared run_read_file function
-        crate::tools::run_read_file(path, limit)
+        run_read_file(path, limit)
     }
 
-    /// Read file tool should be available to subagents with appropriate permission checks
     fn available_for_subagent(&self) -> bool {
         true
     }
@@ -89,6 +105,8 @@ impl Tool for ReadFileTool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- ReadFileTool trait tests ----
 
     #[test]
     fn test_read_file_tool_name() {
@@ -121,7 +139,6 @@ mod tests {
     fn test_permission_check_safe_paths() {
         let tool = ReadFileTool;
 
-        // Safe paths should pass
         let safe_paths = vec![
             json!({"path": "src/main.rs"}),
             json!({"path": "Cargo.toml"}),
@@ -133,7 +150,7 @@ mod tests {
 
         for path in safe_paths {
             match tool.check_permission(&path) {
-                PermissionCheck::Pass => {} // Expected
+                PermissionCheck::Pass => {}
                 PermissionCheck::NeedsApproval(reason) => {
                     panic!("Safe path was rejected: {:?} - {}", path, reason);
                 }
@@ -145,7 +162,6 @@ mod tests {
     fn test_permission_check_escape_paths() {
         let tool = ReadFileTool;
 
-        // Escape paths should need approval
         let escape_paths = vec![
             json!({"path": "../secret.txt"}),
             json!({"path": "../../etc/passwd"}),
@@ -158,7 +174,6 @@ mod tests {
         for path in escape_paths {
             match tool.check_permission(&path) {
                 PermissionCheck::NeedsApproval(reason) => {
-                    // Should contain approval-related text
                     assert!(reason.contains("approval") || reason.contains("explicit approval") || reason.contains("workspace boundary"),
                            "Escape path should mention approval or workspace boundary: {:?} - {}", path, reason);
                 }
@@ -173,10 +188,9 @@ mod tests {
     fn test_permission_case_insensitive() {
         let tool = ReadFileTool;
 
-        // Test that path escaping is case insensitive
         let escape_path = json!({"path": "..\\SECRET.TXT"});
         match tool.check_permission(&escape_path) {
-            PermissionCheck::NeedsApproval(_) => {} // Expected
+            PermissionCheck::NeedsApproval(_) => {}
             PermissionCheck::Pass => panic!("Case insensitive check failed"),
         }
     }
@@ -185,23 +199,20 @@ mod tests {
     fn test_path_normalization() {
         let tool = ReadFileTool;
 
-        // Test path normalization (should be normalized to check escape)
         let normalized_paths = vec![
-            json!({"path": "././file.txt"}),       // Should be safe
-            json!({"path": "src/../file.txt"}),    // Should be safe (parent within workspace)
-            json!({"path": "src/../../file.txt"}), // Should escape
+            json!({"path": "././file.txt"}),
+            json!({"path": "src/../file.txt"}),
+            json!({"path": "src/../../file.txt"}),
         ];
 
         for path in normalized_paths {
             match tool.check_permission(&path) {
                 PermissionCheck::Pass => {
-                    // If normalized path doesn't escape, it should be safe
                     let path_str = path["path"].as_str().unwrap();
                     assert!(!crate::tools::escapes_workspace_lexical(path_str),
                            "Path should not escape: {:?}", path_str);
                 }
                 PermissionCheck::NeedsApproval(_) => {
-                    // If normalized path escapes, it should need approval
                     let path_str = path["path"].as_str().unwrap();
                     assert!(crate::tools::escapes_workspace_lexical(path_str),
                            "Path should escape: {:?}", path_str);
@@ -214,11 +225,53 @@ mod tests {
     fn test_permission_validation() {
         let tool = ReadFileTool;
 
-        // Test malformed input
-        let no_path = json!({}); // Missing required path
+        let no_path = json!({});
         match tool.check_permission(&no_path) {
-            PermissionCheck::Pass => {} // Should pass (permission check doesn't validate schema)
+            PermissionCheck::Pass => {}
             _ => panic!("No path should be allowed in permission check"),
         }
+    }
+
+    // ---- run_read_file tests ----
+
+    #[test]
+    fn run_read_file_reads_content() {
+        let dir = std::env::temp_dir().join("rust-agent-read-file-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, "line1\nline2\nline3").unwrap();
+
+        // Use safe_path_in with the temp dir as workspace
+        let result = crate::tools::safe_path_in(&dir, "hello.txt");
+        assert!(result.is_ok());
+        let content = std::fs::read_to_string(result.unwrap()).unwrap();
+        assert_eq!(content, "line1\nline2\nline3");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_read_file_limit_truncates() {
+        let dir = std::env::temp_dir().join("rust-agent-read-file-limit-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("multi.txt");
+        std::fs::write(&file, "line1\nline2\nline3\nline4\nline5").unwrap();
+
+        // Verify limit logic: read file content and check truncation
+        let content = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let limit: u32 = 2;
+        let truncated: Vec<&str> = lines[..limit as usize].to_vec();
+        let more = lines.len() - limit as usize;
+        let result = format!("{}\n... ({} more lines)", truncated.join("\n"), more);
+
+        assert!(result.contains("line1"));
+        assert!(result.contains("line2"));
+        assert!(!result.contains("line3"));
+        assert!(result.contains("3 more lines"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

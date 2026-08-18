@@ -1,3 +1,4 @@
+use crate::error::AgentError;
 use crate::tools::trait_def::ToolDefinition;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -77,7 +78,7 @@ impl Client {
         messages: &[Message],
         tools: &[ToolDefinition],
         max_tokens: u32,
-    ) -> Result<MessagesResponse, Box<dyn std::error::Error>> {
+    ) -> Result<MessagesResponse, AgentError> {
         // base_url 末尾的 '/' 会拼出 `//v1/messages`，先 trim 掉。
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let request = MessagesRequest {
@@ -104,7 +105,10 @@ impl Client {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("HTTP {} {} — {}", status, self.base_url, body).into());
+            return Err(AgentError::Api {
+                status: status.as_u16(),
+                body: format!("{} — {}", self.base_url, body),
+            });
         }
 
         // 流式解析 SSE（手写，不引 SSE crate，符合项目极简依赖风格）。
@@ -114,7 +118,10 @@ impl Client {
         let mut event_data = String::new();
 
         let mut content: Vec<ContentBlock> = Vec::new();
-        let mut stop_reason = String::new();
+        // 初始化为 "unknown" 而非空串：若流异常结束且未收到 message_delta 事件，
+        // 空串会因 `"" != "tool_use"` 静默退出循环，掩盖协议错误。
+        // "unknown" 同样不触发工具分支，但留下可识别的哨兵值，便于上层诊断。
+        let mut stop_reason = String::from("unknown");
 
         // 当前正在累加的 content block
         enum BlockAcc {
@@ -150,11 +157,10 @@ impl Client {
                     let ev: serde_json::Value = match serde_json::from_str(&event_data) {
                         Ok(v) => v,
                         Err(e) => {
-                            return Err(format!(
-                                "invalid SSE event JSON: {} (raw: {})",
+                            return Err(AgentError::InvalidResponse(format!(
+                                "SSE JSON parse error: {} (raw: {})",
                                 e, event_data
-                            )
-                            .into());
+                            )));
                         }
                     };
                     event_data.clear();
@@ -257,7 +263,7 @@ impl Client {
                                 .and_then(|e| e.get("message"))
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("stream error");
-                            return Err(format!("stream error: {}", msg).into());
+                            return Err(AgentError::Stream(msg.to_string()));
                         }
                         _ => {}
                     }
@@ -275,7 +281,7 @@ impl Client {
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("stream error");
-                    return Err(format!("stream error: {}", msg).into());
+                    return Err(AgentError::Stream(msg.to_string()));
                 }
             }
         }
