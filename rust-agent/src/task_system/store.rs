@@ -154,6 +154,28 @@ impl TaskStore {
 
         Err(TaskStoreError::InvalidId("failed to allocate unique ID".into()))
     }
+
+    pub fn load(&self, task_id: &str) -> Result<Task, TaskStoreError> {
+        let path = self.task_path(task_id)?;
+        let content = std::fs::read_to_string(&path)?;
+        let task: Task = serde_json::from_str(&content)?;
+
+        // 验证 ID 匹配
+        if task.id != task_id {
+            return Err(TaskStoreError::InvalidId(format!(
+                "ID mismatch: file={}, loaded={}", task_id, task.id
+            )));
+        }
+
+        Ok(task)
+    }
+
+    pub fn save(&self, task: &Task) -> Result<(), TaskStoreError> {
+        let path = self.task_path(&task.id)?;
+        let content = serde_json::to_string_pretty(task)?;
+        std::fs::write(&path, content)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +300,54 @@ mod tests {
 
         assert_eq!(task.blocked_by.len(), 1);
         assert_eq!(task.blocked_by[0], dep.id);
+    }
+
+    #[test]
+    fn test_load_retrieves_task() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+
+        let created = store.create(
+            "Original".to_string(),
+            "Description".to_string(),
+            vec![],
+        ).unwrap();
+
+        let loaded = store.load(&created.id).unwrap();
+        assert_eq!(loaded.id, created.id);
+        assert_eq!(loaded.subject, "Original");
+    }
+
+    #[test]
+    fn test_load_validates_id_match() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+
+        let task = store.create("Test".to_string(), "".to_string(), vec![]).unwrap();
+
+        // Corrupt the file ID
+        let path = store.task_path(&task.id).unwrap();
+        let mut data = std::fs::read_to_string(&path).unwrap();
+        data = data.replace(&task.id, "task_wrongid");
+        std::fs::write(&path, data).unwrap();
+
+        let result = store.load(&task.id);
+        assert!(matches!(result, Err(TaskStoreError::InvalidId(_))));
+    }
+
+    #[test]
+    fn test_save_persists_changes() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+
+        let mut task = store.create("Test".to_string(), "".to_string(), vec![]).unwrap();
+        task.status = TaskStatus::Completed;
+        task.owner = Some("agent".to_string());
+
+        store.save(&task).unwrap();
+
+        let loaded = store.load(&task.id).unwrap();
+        assert_eq!(loaded.status, TaskStatus::Completed);
+        assert_eq!(loaded.owner, Some("agent".to_string()));
     }
 }
