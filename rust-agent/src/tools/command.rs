@@ -23,7 +23,7 @@ const MAX_OUTPUT_BYTES: usize = 50_000;
 /// - Windows: 使用 cmd.exe
 /// - Unix: 使用 bash
 ///
-/// 危险命令的拦截已移至 permission::permission_hook 闸门(s03/s04),
+/// 危险命令的拦截已移至 builtins::PermissionHook 闸门(s03/s04),
 /// 在到达这里之前就已被拒; safe_path 仍是文件工具的工作区沙箱。
 pub(crate) async fn run_bash(command: &str) -> String {
     let result = timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), async {
