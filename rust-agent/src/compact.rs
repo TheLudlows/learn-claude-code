@@ -137,6 +137,12 @@ impl ContextCompactor {
             if !path.exists() {
                 let _ = fs::write(&path, output);
             }
+            println!(
+                "\x1b[33m[persist] {} ({} chars) -> {}\x1b[0m",
+                tool_use_id,
+                output.len(),
+                path.display()
+            );
             let preview: String = output.chars().take(2000).collect();
             return format!(
                 "<persisted-output>\nFull output: {}\nPreview:\n{}\n</persisted-output>",
@@ -145,6 +151,10 @@ impl ContextCompactor {
             );
         }
         // 目录创建失败：退化为只给预览，不丢上下文。
+        println!(
+            "\x1b[33m[persist] dir creation failed for {}, showing preview only\x1b[0m",
+            tool_use_id
+        );
         let preview: String = output.chars().take(2000).collect();
         format!(
             "<persisted-output>\nPreview:\n{}\n</persisted-output>",
@@ -176,8 +186,13 @@ impl ContextCompactor {
         if total <= TOOL_RESULT_BATCH_CHAR_LIMIT {
             return;
         }
+        println!(
+            "\x1b[33m[tool_result_budget] total {} chars exceeds limit {}, persisting large results\x1b[0m",
+            total, TOOL_RESULT_BATCH_CHAR_LIMIT
+        );
         // 按大小降序替换，直到总量降到上限以下或没有可转存的块。
         let mut current_total = total;
+        let mut persisted_count = 0;
         for (idx, len) in &indexed {
             if current_total <= TOOL_RESULT_BATCH_CHAR_LIMIT {
                 break;
@@ -199,7 +214,12 @@ impl ContextCompactor {
                 content: replaced.clone(),
             };
             current_total = current_total - len + replaced.len();
+            persisted_count += 1;
         }
+        println!(
+            "\x1b[33m[tool_result_budget] persisted {} blocks, total now {} chars\x1b[0m",
+            persisted_count, current_total
+        );
     }
 
     /// 第二步：消息数 > SNIP_MAX_MESSAGES 时，先写完整 transcript，再保留头 SNIP_HEAD
@@ -236,6 +256,7 @@ impl ContextCompactor {
 
         let transcript = self.write_transcript(messages)?;
         let archived_count = tail_start - head_end;
+        let before_count = messages.len();
         let marker = Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
@@ -251,7 +272,15 @@ impl ContextCompactor {
         new_messages.extend_from_slice(&messages[..head_end]);
         new_messages.push(marker);
         new_messages.extend_from_slice(&messages[tail_start..]);
+        let after_count = new_messages.len();
         *messages = new_messages;
+        println!(
+            "\x1b[33m[snip_compact] {} messages -> {} (archived {} to {})\x1b[0m",
+            before_count,
+            after_count,
+            archived_count,
+            transcript.display()
+        );
         Ok(())
     }
 
@@ -277,6 +306,7 @@ impl ContextCompactor {
         // 保留最后 KEEP_RECENT_RESULTS 条，更早的处理。
         let old_count = locations.len() - KEEP_RECENT_RESULTS;
         let old_locs = &locations[..old_count];
+        let mut replaced_count = 0;
         for &(mi, bi) in old_locs {
             let content = match &messages[mi].content[bi] {
                 ContentBlock::ToolResult { content, .. } => content.clone(),
@@ -301,6 +331,14 @@ impl ContextCompactor {
                 tool_use_id,
                 content: placeholder,
             };
+            replaced_count += 1;
+        }
+        if replaced_count > 0 {
+            println!(
+                "\x1b[33m[micro_compact] replaced {} old tool results (kept {} recent)\x1b[0m",
+                replaced_count,
+                KEEP_RECENT_RESULTS
+            );
         }
     }
 
@@ -446,11 +484,24 @@ impl ContextCompactor {
         messages: &mut Vec<Message>,
         active_request: &str,
     ) -> Result<(), AgentError> {
+        let chars_before = Self::estimate_chars(messages);
+        let msgs_before = messages.len();
         self.tool_result_budget(messages);
         self.snip_compact(messages, SNIP_MAX_MESSAGES)?;
         self.micro_compact(messages);
-        if Self::estimate_chars(messages) > CONTEXT_CHAR_LIMIT {
-            println!("\x1b[33m[auto compact]\x1b[0m");
+        let chars_after = Self::estimate_chars(messages);
+        println!(
+            "\x1b[33m[prepare] messages: {} -> {}, chars: {} -> {}\x1b[0m",
+            msgs_before,
+            messages.len(),
+            chars_before,
+            chars_after
+        );
+        if chars_after > CONTEXT_CHAR_LIMIT {
+            println!(
+                "\x1b[33m[auto compact] {} chars exceeds limit {}, compacting history\x1b[0m",
+                chars_after, CONTEXT_CHAR_LIMIT
+            );
             self.compact_history(client, messages, active_request)
                 .await?;
         }

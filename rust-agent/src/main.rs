@@ -24,10 +24,8 @@ The agent loop from s07 gains a ContextCompactor that runs before every model ca
                            dispatch_tool
                                |
                   PostToolUse <- trigger_post_tool()
-                               |
-                  [compact tool -> compact_history after batch]
 
-  + compact.rs: four-step pipeline + reactive retry + compact tool
+  + compact.rs: four-step pipeline + reactive retry
   + agent_loop gains compactor + active_request params
   + prompt_too_long triggers reactive_compact (1 retry)
 
@@ -82,8 +80,7 @@ async fn execute_tool(
 /// 而是在固定节点上 trigger_hooks(PreToolUse / PostToolUse / Stop)。
 ///
 /// s08 变化: 每次调用模型前先 compactor.prepare()（budget->snip->micro->超阈值才摘要）；
-/// stream_messages 包进 match, prompt_too_long 时 reactive_compact 重试一次；
-/// compact 工具与 task 一样特殊处理 —— 先闭合整个 tool 批次再摘要。
+/// stream_messages 包进 match, prompt_too_long 时 reactive_compact 重试一次。
 async fn agent_loop(
     client: &Client,
     registry: &ToolRegistry,
@@ -146,18 +143,11 @@ async fn agent_loop(
             }
             break;
         }
-        // compact 先记 flag、追加占位 tool_result，批次闭合后再 compact_history。
         let mut tool_results = Vec::new();
         let mut reminders: Vec<String> = Vec::new();
-        let mut compact_requested = false;
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                let tool_output = if name == "compact" {
-                    compact_requested = true;
-                    "Compaction requested after this tool batch.".to_string()
-                } else {
-                    execute_tool(client, registry, name, input, hooks).await
-                };
+                let tool_output = execute_tool(client, registry, name, input, hooks).await;
                 // 打印工具执行结果（此前只喂回 LLM，用户看不到工具返回了什么）
                 {
                     let mut out = io::stdout().lock();
@@ -175,13 +165,6 @@ async fn agent_loop(
         }
 
         messages.extend(assemble_post_tool_messages(tool_results, reminders));
-
-        // s08: 批次已闭合（每个 tool_use 都有对应 tool_result）：再摘要，不留孤立结果。
-        if compact_requested {
-            compactor
-                .compact_history(client, messages, active_request)
-                .await?;
-        }
     }
 
     Ok(())

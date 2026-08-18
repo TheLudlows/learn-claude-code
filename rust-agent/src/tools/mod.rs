@@ -28,7 +28,6 @@ pub mod glob_tool;
 pub mod load_skill;
 pub mod todo_write;
 pub mod task;
-mod compact;
 
 // Re-exports for convenient access
 pub use self::registry::ToolRegistry;

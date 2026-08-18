@@ -269,21 +269,21 @@ mod tests {
     #[test]
     fn run_edit_file_full_flow() {
         let dir = std::env::temp_dir().join("rust-agent-edit-file-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
         let file = dir.join("edit.txt");
-        std::fs::write(&file, "old value here").unwrap();
+        fs::write(&file, "old value here").unwrap();
 
         // Simulate run_edit_file logic
-        let content = std::fs::read_to_string(&file).unwrap();
+        let content = fs::read_to_string(&file).unwrap();
         assert!(content.contains("old value"));
         let new_content = content.replacen("old value", "new value", 1);
-        std::fs::write(&file, &new_content).unwrap();
+        fs::write(&file, &new_content).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
+            fs::read_to_string(&file).unwrap(),
             "new value here"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
