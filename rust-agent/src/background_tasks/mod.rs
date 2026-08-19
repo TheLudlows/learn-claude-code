@@ -7,6 +7,8 @@ background_tasks/mod.rs - 后台任务模块 (s11)
 
 pub mod manager;
 pub mod task;
+pub mod tools;
 
 pub use manager::BackgroundManager;
 pub use task::{BackgroundTask, TaskStatus};
+pub use tools::{collect_and_inject, get_manager, BackgroundStopHook, TaskOutputTool, TaskStopTool};

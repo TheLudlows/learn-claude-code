@@ -88,6 +88,12 @@ impl BackgroundManager {
         // 两次 start 并发时不会抽出同一个未插入的 id 再互相覆盖。
         let (id, output_file) = {
             let mut state = self.state.lock().expect("state mutex poisoned");
+            if state.running_count() >= MAX_CONCURRENT {
+                return Err(format!(
+                    "Error: too many concurrent background tasks ({}). Wait for some to finish via TaskOutput.",
+                    MAX_CONCURRENT
+                ));
+            }
             let id = generate_id_locked(&state);
             if id.is_empty() {
                 return Err("Error: failed to allocate task id".to_string());
@@ -133,6 +139,58 @@ impl BackgroundManager {
         out
     }
 
+    /// 取后台任务输出与状态。
+    ///
+    /// - block=false: 立即返回状态 + output_file 当前内容 (截断 MAX_OUTPUT_BYTES)。
+    /// - block=true: 轮询至任务非 Running 或 timeout_ms 到; 超时不取消 task。
+    pub async fn output(&self, task_id: &str, block: bool, timeout_ms: u64) -> String {
+        if block {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            loop {
+                let done = {
+                    let state = self.state.lock().expect("state mutex poisoned");
+                    state
+                        .tasks
+                        .get(task_id)
+                        .map(|t| t.status != TaskStatus::Running)
+                        .unwrap_or(true) // 不存在 -> 视为 done (下面返回 not found)
+                };
+                if done || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        let (status, output_file, exit_code, command) = {
+            let state = self.state.lock().expect("state mutex poisoned");
+            match state.tasks.get(task_id) {
+                Some(t) => (
+                    t.status,
+                    t.output_file.clone(),
+                    t.exit_code,
+                    t.command.clone(),
+                ),
+                None => return format!("Error: task {} not found", task_id),
+            }
+        };
+        let body = std::fs::read_to_string(&output_file)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let body = truncate_chars(&body, MAX_OUTPUT_BYTES);
+        format!(
+            "task_id: {}\nstatus: {}\ncommand: {}\nexit_code: {}\noutput:\n{}",
+            task_id,
+            status_word(status),
+            command,
+            exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            body
+        )
+    }
+
     /// 取消后台任务: 触发 cancel Notify -> worker 走取消分支 -> kill 进程树 -> Cancelled -> 入 ready。
     /// 已完成/不存在的任务返回提示, no-op。
     pub fn stop(&self, task_id: &str) -> String {
@@ -167,15 +225,10 @@ fn generate_id_locked(state: &State) -> String {
     String::new() // 极低概率; 调用方按错误处理
 }
 
-/// worker: 执行命令, 落盘输出, finalize。
+/// worker: 把执行体 spawn 为内部 task, 外层 await JoinHandle 守卫 panic。
 ///
-/// tokio::select! 三臂 biased 竞速: cancel.notified() / sleep(timeout) / child.wait()+drain。
-/// - cancel 臂: stop() 触发 Notify → kill_tree 杀进程树 + reap + Cancelled/None + "Cancelled by TaskStop"。
-/// - timeout 臂: sleep 到期 → kill_tree + reap + Failed/None + "Error: Timeout (Ns)"。
-/// - wait 臂: child.wait() (借 &mut child, 非 move) 与 drain_pipe 并发 (tokio::join!); 完成 →
-///   Completed/Failed + 输出正文。wait_with_output 会 move child, 无法在其他臂复用 child 调
-///   kill_tree, 故用 wait() + 独立 drain_pipe。wait 臂的 join! 包在 async {} 块里, &mut child
-/// 借用封闭在该 future 内; 另一臂胜出时该 future 被 drop, 借用释放, 胜出臂可再拿 &mut child。
+/// 正常: 内部 task 执行 select! + 落盘 + finalize。
+/// panic: JoinHandle.await 返回 Err -> 兜底 finalize(Failed), task 不卡 Running。
 async fn run_worker(
     mgr: BackgroundManager,
     id: String,
@@ -183,71 +236,75 @@ async fn run_worker(
     output_file: PathBuf,
     cancel: Arc<Notify>,
 ) {
-    let mut cmd = build_command(&command);
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let text = format!("Error: spawn failed: {}", e);
-            let _ = std::fs::write(&output_file, &text);
-            finalize(&mgr, &id, TaskStatus::Failed, None);
-            return;
-        }
-    };
-    let timeout_secs = mgr.timeout_secs;
-    // 先 take 管道: drain future 拥有所有权, 不与 child.wait() 的 &mut child 借用冲突。
-    // 用 tokio::join! 让管道与 wait 并发推进, 避免子进程输出超过管道缓冲 (Windows 低至 4KB)
-    // 时阻塞在 write()、wait 永不返回的死锁。wait 臂的 join! 包在 async {} 块里, &mut child
-    // 借用封闭在该 future 内; cancel/timeout 臂胜出时该 future 被 drop, 借用释放, 胜出臂
-    // 可再拿 &mut child 调 kill_tree。stdout_pipe/stderr_pipe 被 move 进 wait 臂的 async 块,
-    // 其他臂胜出时随该 future 一起 drop (反正子进程已被 kill, 管道无需再读)。
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let (status, exit_code, text) = tokio::select! {
-        biased;
-        _ = cancel.notified() => {
-            kill_tree(&mut child).await;
-            let _ = child.wait().await;
-            (TaskStatus::Cancelled, None, "Cancelled by TaskStop".to_string())
-        }
-        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-            kill_tree(&mut child).await;
-            let _ = child.wait().await;
-            (TaskStatus::Failed, None, format!("Error: Timeout ({}s)", timeout_secs))
-        }
-        (exit_status, stdout, stderr) = async {
-            tokio::join!(
-                child.wait(),
-                drain_pipe(stdout_pipe),
-                drain_pipe(stderr_pipe),
-            )
-        } => match exit_status {
-            Ok(es) => {
-                let code = es.code();
-                let status = if code == Some(0) {
-                    TaskStatus::Completed
-                } else {
-                    TaskStatus::Failed
-                };
-                let body = format!("{}\n{}", stdout, stderr).trim().to_string();
-                let body = if body.is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    truncate_chars(&body, MAX_OUTPUT_BYTES)
-                };
-                (status, code, body)
+    let output_file_for_body = output_file.clone();
+    let mgr_panic = mgr.clone();
+    let id_panic = id.clone();
+    let handle = tokio::spawn(async move {
+        let mut cmd = build_command(&command);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let text = format!("Error: spawn failed: {}", e);
+                let _ = std::fs::write(&output_file_for_body, &text);
+                finalize(&mgr, &id, TaskStatus::Failed, None);
+                return;
             }
-            Err(e) => (
-                TaskStatus::Failed,
-                None,
-                format!("Error: wait failed: {}", e),
-            ),
-        }
-    };
-    let _ = std::fs::write(&output_file, &text);
-    finalize(&mgr, &id, status, exit_code);
+        };
+        let timeout_secs = mgr.timeout_secs;
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let (status, exit_code, text) = tokio::select! {
+            biased;
+            _ = cancel.notified() => {
+                kill_tree(&mut child).await;
+                let _ = child.wait().await;
+                (TaskStatus::Cancelled, None, "Cancelled by TaskStop".to_string())
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+                kill_tree(&mut child).await;
+                let _ = child.wait().await;
+                (TaskStatus::Failed, None, format!("Error: Timeout ({}s)", timeout_secs))
+            }
+            (exit_status, stdout, stderr) = async {
+                tokio::join!(
+                    child.wait(),
+                    drain_pipe(stdout_pipe),
+                    drain_pipe(stderr_pipe),
+                )
+            } => match exit_status {
+                Ok(es) => {
+                    let code = es.code();
+                    let status = if code == Some(0) {
+                        TaskStatus::Completed
+                    } else {
+                        TaskStatus::Failed
+                    };
+                    let body = format!("{}\n{}", stdout, stderr).trim().to_string();
+                    let body = if body.is_empty() {
+                        "(no output)".to_string()
+                    } else {
+                        truncate_chars(&body, MAX_OUTPUT_BYTES)
+                    };
+                    (status, code, body)
+                }
+                Err(e) => (
+                    TaskStatus::Failed,
+                    None,
+                    format!("Error: wait failed: {}", e),
+                ),
+            }
+        };
+        let _ = std::fs::write(&output_file_for_body, &text);
+        finalize(&mgr, &id, status, exit_code);
+    });
+    // panic 兜底: 内部 task 崩了, 仍把 task 置 Failed + 入 ready, 不卡 Running。
+    if let Err(_join_err) = handle.await {
+        let _ = std::fs::write(&output_file, "Error: worker panicked");
+        finalize(&mgr_panic, &id_panic, TaskStatus::Failed, None);
+    }
 }
 
 /// 读取子进程管道 (stdout/stderr) 全部内容并解码。wait 完成后调用:
@@ -306,7 +363,7 @@ fn build_command(command: &str) -> tokio::process::Command {
 ///
 /// - Unix: `kill -KILL -{pgid}` (负 PID = 进程组; child 经 process_group(0) 自成一组)。
 /// - Windows: `taskkill /T /F /PID {pid}` (`/T` 终止整棵子树)。
-/// 最后兜底 child.kill() (直接子进程)。
+///   最后兜底 child.kill() (直接子进程)。
 async fn kill_tree(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
         let mut kill_cmd = if cfg!(windows) {
@@ -533,6 +590,7 @@ mod tests {
         // 轮询第二次 stop 直到命中 "already" 分支 (finalize 完成, 状态非 Running)。
         // 用轮询而非固定 sleep: 并行测试时 CPU 争用会让 finalize 慢于固定 sleep, 造成 flake。
         // 重复 stop 对 Running 任务只是再 fire notify_one (worker 已离开 select cancel 臂), 无副作用。
+        #[allow(unused_assignments)]
         let mut second = String::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

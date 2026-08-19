@@ -208,7 +208,7 @@ impl ContextCompactor {
 
     /// 第二步：消息数 > SNIP_MAX_MESSAGES 时，先写完整 transcript，再保留头 SNIP_HEAD
     /// + 尾 (max_messages - SNIP_HEAD)，中间插一条 marker user 消息（写明删了多少条、
-    /// 完整记录在哪）。切点保护 tool_use/tool_result 配对，避免孤立 tool_result。
+    ///   完整记录在哪）。切点保护 tool_use/tool_result 配对，避免孤立 tool_result。
     pub fn snip_compact(
         &self,
         messages: &mut Vec<Message>,
@@ -730,6 +730,7 @@ mod tests {
             .collect();
         c.micro_compact(&mut msgs);
         // 最近 3 条（t2,t3,t4）完整
+        #[allow(clippy::needless_range_loop)]
         for i in 2..5 {
             match &msgs[i].content[0] {
                 ContentBlock::ToolResult { content, .. } => assert_eq!(content.len(), 200),
@@ -737,6 +738,7 @@ mod tests {
             }
         }
         // 更早的 t0,t1 被替换为 omitted（未转存）
+        #[allow(clippy::needless_range_loop)]
         for i in 0..2 {
             match &msgs[i].content[0] {
                 ContentBlock::ToolResult { content, .. } => {
@@ -877,11 +879,11 @@ mod tests {
         assert!(msgs
             .iter()
             .take(4)
-            .any(|m| ContextCompactor::has_tool_use(m)));
+            .any(ContextCompactor::has_tool_use));
         assert!(msgs
             .iter()
             .take(4)
-            .any(|m| ContextCompactor::is_tool_result(m)));
+            .any(ContextCompactor::is_tool_result));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -902,10 +904,10 @@ mod tests {
         // tail_start 应从 14 前借到 13，使 tool_use+tool_result 都进保留区
         let tail_has_tool_use = msgs
             .iter()
-            .any(|m| ContextCompactor::has_tool_use(m));
+            .any(ContextCompactor::has_tool_use);
         let tail_has_tool_result = msgs
             .iter()
-            .any(|m| ContextCompactor::is_tool_result(m));
+            .any(ContextCompactor::is_tool_result);
         assert!(tail_has_tool_use && tail_has_tool_result);
         let _ = std::fs::remove_dir_all(&dir);
     }

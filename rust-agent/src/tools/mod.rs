@@ -160,6 +160,9 @@ pub fn build_registry() -> ToolRegistry {
     registry.register(Box::new(crate::task_system::ClaimTaskTool));
     registry.register(Box::new(crate::task_system::CompleteTaskTool));
 
+    registry.register(Box::new(crate::background_tasks::TaskOutputTool));
+    registry.register(Box::new(crate::background_tasks::TaskStopTool));
+
     registry
 }
 

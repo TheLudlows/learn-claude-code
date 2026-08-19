@@ -6,7 +6,7 @@ use std::fs;
 
 /// 读取文件
 pub(crate) fn run_read_file(path: &str, limit: Option<u32>) -> String {
-    match fs::read_to_string(&path) {
+    match fs::read_to_string(path) {
         Ok(content) => {
             let lines: Vec<&str> = content.lines().collect();
             if let Some(limit) = limit {

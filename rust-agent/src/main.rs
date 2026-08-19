@@ -91,6 +91,7 @@ async fn execute_tool(
 ///
 /// s09 变化: 请求开始召回相关记忆拼进 system(每请求一次,非每调用),真退出前
 /// (Stop 钩子未 force)extract 持久记忆 + consolidate(≥10 条才合并)。
+#[allow(clippy::too_many_arguments)]
 async fn agent_loop(
     client: &Client,
     registry: &ToolRegistry,
@@ -108,6 +109,9 @@ async fn agent_loop(
 
     let mut reactive_retries = 0u32;
     loop {
+        // s11: 循环顶部收集已完成后台任务通知 (被动兜底)
+        let _ = rust_agent::background_tasks::collect_and_inject(messages);
+
         // s08: 每次调用模型前运行压缩管线
         compactor
             .prepare(client, messages, active_request)
@@ -255,6 +259,7 @@ async fn main() -> Result<(), AgentError> {
     hooks.on_post_tool(LargeOutputHook);
     hooks.on_stop(SummaryHook);
     hooks.on_post_tool(TodoReminderHook::new());
+    hooks.on_stop(rust_agent::background_tasks::BackgroundStopHook);
 
     // Build tool registry
     let registry = rust_agent::tools::build_registry();

@@ -194,7 +194,7 @@ impl TaskStore {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
 
-            if name_str.ends_with(".json") && self.id_pattern.is_match(&name_str.strip_suffix(".json").unwrap()) {
+            if name_str.ends_with(".json") && self.id_pattern.is_match(name_str.strip_suffix(".json").unwrap()) {
                 let task_id = name_str.trim_end_matches(".json");
                 match self.load(task_id) {
                     Ok(task) => tasks.push(task),

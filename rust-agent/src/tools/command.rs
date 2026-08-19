@@ -87,6 +87,25 @@ pub(crate) fn decode_console(bytes: &[u8]) -> String {
     decoded.into_owned()
 }
 
+/// 启动后台任务并返回占位 tool_result (供 CommandTool::execute 分流)。
+///
+/// 成功: "[Background task {bg_id} started] The result will be collected on a later turn. Use TaskOutput to poll, TaskStop to cancel."
+/// 失败 (空命令/并发超限/ID 耗尽): 返回 "Error: ..."。
+///
+/// 注: tool_use_id 传空串 — 主循环 execute_tool 未把 tool_use_id 传入 execute,
+/// 占位 tool_result 由 agent_loop 用原 id 构造; 此字段仅做关联记录, 空串可接受
+/// (通知不复用 tool_use_id, 见 spec 设计)。
+pub(crate) async fn start_background(command: &str) -> String {
+    let mgr = crate::background_tasks::get_manager();
+    match mgr.start(command, "") {
+        Ok(id) => format!(
+            "[Background task {} started] The result will be collected on a later turn. Use TaskOutput to poll, TaskStop to cancel.",
+            id
+        ),
+        Err(e) => e,
+    }
+}
+
 /// Command Tool for executing shell commands
 ///
 /// This tool allows the AI agent to execute shell commands in a controlled
@@ -111,6 +130,10 @@ impl Tool for CommandTool {
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute (e.g., 'ls -la', 'git status')"
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "若 true，命令在后台执行，立即返回 bg_id；完成后在后续轮次以 <task_notification> 注入。仅用于独立的慢命令（install/build/test）。"
                 }
             },
             "required": ["command"]
@@ -198,10 +221,17 @@ impl Tool for CommandTool {
     }
 
     async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
-        if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-            run_bash(command).await
+        let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
+            return "Error: No command provided".to_string();
+        };
+        let bg = input
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if bg {
+            start_background(command).await
         } else {
-            "Error: No command provided".to_string()
+            run_bash(command).await
         }
     }
 
@@ -416,5 +446,43 @@ mod tests {
             "output should be truncated, got {} bytes",
             out.len()
         );
+    }
+
+    #[test]
+    fn command_tool_schema_has_run_in_background() {
+        let tool = CommandTool;
+        let schema = tool.input_schema();
+        assert_eq!(schema["properties"]["run_in_background"]["type"], "boolean");
+        // command 仍是 required, run_in_background 非 required
+        let required = schema["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "command");
+    }
+
+    #[tokio::test]
+    async fn execute_run_in_background_true_returns_placeholder() {
+        // 会向全局 BG_MANAGER 注册 (写入 cwd 的 .task_outputs/background/)。
+        // 用快命令, 末尾 collect 清理内存态。输出文件残留于 cwd, 属可接受测试副作用。
+        use crate::tools::trait_def::test_helpers::TestToolContext;
+        let tool = CommandTool;
+        let tctx = TestToolContext::new();
+        let ctx = tctx.context();
+        let input = json!({"command": "echo bg_split_test", "run_in_background": true});
+        let out = tool.execute(&ctx, &input).await;
+        assert!(out.contains("Background task"), "expected placeholder, got: {}", out);
+        assert!(out.contains("bg_"), "expected bg_id, got: {}", out);
+        // 清理全局内存态
+        let _ = crate::background_tasks::collect_and_inject(&mut Vec::new());
+    }
+
+    #[tokio::test]
+    async fn execute_run_in_background_false_uses_sync_path() {
+        use crate::tools::trait_def::test_helpers::TestToolContext;
+        let tool = CommandTool;
+        let tctx = TestToolContext::new();
+        let ctx = tctx.context();
+        let input = json!({"command": "echo sync_path_ok", "run_in_background": false});
+        let out = tool.execute(&ctx, &input).await;
+        assert!(out.contains("sync_path_ok"), "false should use sync run_bash, got: {}", out);
     }
 }
