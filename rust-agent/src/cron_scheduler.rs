@@ -4,6 +4,7 @@ cron_scheduler.rs - Cron Scheduler (s12)
 定时任务调度器：使用 cron 表达式在指定时间将 prompt 注入到 agent 循环。
 */
 
+use chrono::{DateTime, Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -100,4 +101,64 @@ pub fn validate_cron(cron_expr: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// 检查单个 cron 字段是否匹配指定值
+fn cron_field_matches(field: &str, value: u32) -> bool {
+    if field == "*" {
+        return true;
+    }
+    if field.starts_with("*/") {
+        let step = field[2..].parse::<u32>().unwrap_or(1);
+        return value % step == 0;
+    }
+    if field.contains(',') {
+        return field.split(',').any(|part| cron_field_matches(part.trim(), value));
+    }
+    if field.contains('-') {
+        let parts: Vec<&str> = field.split('-').collect();
+        if parts.len() == 2 {
+            if let (Ok(start), Ok(end)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                return value >= start && value <= end;
+            }
+        }
+        return false;
+    }
+    field.parse::<u32>().map(|v| v == value).unwrap_or(false)
+}
+
+/// 检查 cron 表达式是否匹配给定时间
+pub fn cron_matches(cron_expr: &str, moment: &chrono::DateTime<chrono::Local>) -> bool {
+    let fields: Vec<&str> = cron_expr.trim().split_whitespace().collect();
+    if fields.len() != 5 {
+        return false;
+    }
+
+    let (minute, hour, day, month, weekday) = (
+        fields[0], fields[1], fields[2], fields[3], fields[4]
+    );
+
+    // chrono weekday: Mon=0..Sun=6, cron: Sun=0..Sat=6
+    let cron_weekday = (moment.weekday().num_days_from_monday() + 1) % 7;
+
+    if !cron_field_matches(minute, moment.minute()) {
+        return false;
+    }
+    if !cron_field_matches(hour, moment.hour()) {
+        return false;
+    }
+    if !cron_field_matches(month, moment.month()) {
+        return false;
+    }
+
+    let day_matches = cron_field_matches(day, moment.day());
+    let weekday_matches = cron_field_matches(weekday, cron_weekday);
+
+    // day 和 weekday 是 OR 关系
+    match (day, weekday) {
+        ("*", "*") => true,
+        ("*", _) => weekday_matches,
+        (_, "*") => day_matches,
+        _ => day_matches || weekday_matches,
+    }
 }

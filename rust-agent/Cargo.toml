@@ -8,6 +8,7 @@ path = "src/lib.rs"
 
 [dependencies]
 dotenv = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -26,6 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fastrand = "2.1"
 regex = "1"
+
 
 [dev-dependencies]
 tempfile = "3"
