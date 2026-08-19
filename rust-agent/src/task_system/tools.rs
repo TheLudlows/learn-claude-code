@@ -3,7 +3,7 @@ tools.rs - Tool implementations for s10 Task System
 
 Implements create_task, list_tasks, get_task, claim_task, complete_task tools.
 The global TaskStore is held in an Arc behind a OnceLock for thread-safe
-shared state, initialized once at startup via init_task_store().
+shared state, lazily initialized on first tool use via get_store().
 */
 
 use crate::task_system::store::{TaskStore, TaskStoreError};
@@ -12,61 +12,32 @@ use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
+use crate::tools::workdir;
 
-/// 全局任务存储（Arc 共享，OnceLock 保证只初始化一次）
-static TASK_STORE: std::sync::OnceLock<Arc<TaskStore>> = std::sync::OnceLock::new();
-
-/// 测试专用全局存储覆盖（feature `testing`）。
+/// 全局任务存储（Arc 共享，LazyLock 懒初始化）。
 ///
-/// `get_store` 优先返回此项；为 `None` 时回退到 `OnceLock` 中的生产存储。
-/// 这样集成测试可为每个用例注入独立的临时存储，避免 `OnceLock` 的
-/// “首次调用即固化”导致的跨用例污染，也无需改动 `current_dir`。
-#[cfg(feature = "testing")]
-static TEST_STORE: std::sync::Mutex<Option<Arc<TaskStore>>> =
-    std::sync::Mutex::new(None);
+/// 存 `Result` 是因为 `LazyLock::new` 的初始化闭包不能失败——把构造结果
+/// 整体存进去，首次失败也固化，避免每次访问都重试 IO。`get_store` 据此返回
+/// Ok/Err，交由调用方转成工具输出，而非 panic。
+static TASK_STORE: std::sync::LazyLock<Arc<TaskStore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(TaskStore::new(workdir()).unwrap())
+    });
 
-/// 初始化全局任务存储。
-///
-/// 在工作目录下建立 `.tasks/` 目录。使用 OnceLock，因此多次调用幂等：
-/// 仅首次调用真正构造 TaskStore，后续调用直接返回已有实例。
-pub fn init_task_store() -> Result<(), TaskStoreError> {
-    let workdir = std::env::current_dir()
-        .map_err(|_| TaskStoreError::EscapesWorkspace)?;
-    let tasks_dir = workdir.join(".tasks");
-    let store = TaskStore::new(tasks_dir)?;
-    TASK_STORE.get_or_init(|| Arc::new(store));
-    Ok(())
-}
-
-/// 获取全局任务存储的句柄。
-///
-/// 调用前必须先调用 `init_task_store`，否则 panic。
-/// 启用 `testing` feature 时，优先返回 `TEST_STORE` 覆盖项。
 fn get_store() -> Arc<TaskStore> {
-    #[cfg(feature = "testing")]
-    if let Some(s) = TEST_STORE.lock().unwrap().clone() {
-        return s;
-    }
-    TASK_STORE
-        .get()
-        .expect("TaskStore not initialized. Call init_task_store() first.")
-        .clone()
-}
-
-/// 测试专用：注入全局存储覆盖项（feature `testing`）。
-#[cfg(feature = "testing")]
-pub fn set_store_for_test(store: TaskStore) {
-    *TEST_STORE.lock().unwrap() = Some(Arc::new(store));
-}
-
-/// 测试专用：清除全局存储覆盖项（feature `testing`）。
-#[cfg(feature = "testing")]
-pub fn clear_store_for_test() {
-    *TEST_STORE.lock().unwrap() = None;
+    TASK_STORE.clone()
 }
 
 /// 把 TaskStoreError 转成工具输出字符串。
 fn error_to_output(e: TaskStoreError) -> String {
+    error_str(&e)
+}
+
+/// 按引用转输出字符串。
+///
+/// 供 `get_store` 返回的 `Arc<TaskStoreError>` 使用（TaskStoreError 不 Clone，
+/// 无法按值交给 error_to_output）。
+fn error_str(e: &TaskStoreError) -> String {
     format!("Error: {}", e)
 }
 
@@ -465,9 +436,9 @@ impl Tool for CompleteTaskTool {
 #[cfg(test)]
 mod tool_tests {
     use super::*;
-    use crate::task_system::store::create_test_store;
     use serde_json::json;
     use tempfile::TempDir;
+    use crate::task_system::store::create_test_store;
 
     #[test]
     fn test_create_tool_name_and_description() {

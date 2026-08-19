@@ -10,6 +10,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::path::Path;
 use std::env;
+use std::fs::create_dir;
 use fastrand;
 
 use crate::task_system::task::{Task, TaskStatus};
@@ -47,9 +48,11 @@ impl TaskStore {
 
     /// Creates a new TaskStore instance
     pub fn new(directory: PathBuf) -> Result<Self, TaskStoreError> {
-        let directory = directory.canonicalize()
+        tracing::info!("Creating new task store path: {}", directory.display());
+        let mut directory = directory.canonicalize()
             .map_err(|_| TaskStoreError::EscapesWorkspace)?;
-
+        directory = directory.join(".tasks");
+        create_dir(&directory)?;
         let workdir = env::current_dir()
             .map_err(|_| TaskStoreError::EscapesWorkspace)?
             .canonicalize()
@@ -198,26 +201,6 @@ impl TaskStore {
 
         tasks.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(tasks)
-    }
-}
-
-/// 测试专用构造器（feature `testing`）：绕过工作区校验直接装配 TaskStore。
-///
-/// 集成测试（`tests/`）是外部 crate，无法访问 `#[cfg(test)]` 的 `create_test_store`，
-/// 因此通过 feature 门控暴露此构造器，供其针对任意临时目录构造存储。
-/// 生产构建（未启用 `testing`）不编译此项，不会泄露越界构造能力。
-#[cfg(feature = "testing")]
-impl TaskStore {
-    pub fn new_for_test(directory: PathBuf) -> Self {
-        TaskStore {
-            directory,
-            id_pattern: Regex::new(r"^task_[0-9a-f]{8}$").unwrap(),
-        }
-    }
-
-    /// 测试专用：返回存储目录，供集成测试断言构造结果。
-    pub fn directory(&self) -> &std::path::Path {
-        &self.directory
     }
 }
 

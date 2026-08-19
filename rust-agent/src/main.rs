@@ -259,10 +259,8 @@ async fn main() -> Result<(), AgentError> {
     // Build tool registry
     let registry = rust_agent::tools::build_registry();
 
-    // s10: 初始化全局任务存储（.tasks/）。失败仅告警，不阻断主循环。
-    if let Err(e) = rust_agent::task_system::init_task_store() {
-        eprintln!("Warning: Failed to initialize task store: {}", e);
-    }
+    // s10: 任务存储在首次工具调用时懒初始化（见 task_system/tools.rs 的 get_store），
+    // 无需在此手动启动；构造失败会以错误信息形式返回给工具，不阻断主循环。
 
     let mut messages: Vec<Message> = Vec::new();
 
