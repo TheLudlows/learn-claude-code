@@ -919,9 +919,11 @@ Expected: FAIL — `method stop not found`
     }
 ```
 
-- [ ] **Step 4: run_worker 加 cancel 臂 (替换 sleep 占位)**
+- [ ] **Step 4: run_worker 加 cancel 臂**
 
-把 `run_worker` 的 select! 块中, `biased;` 之后、`sleep` 臂之前插入 cancel 臂。把 `_cancel: Arc<Notify>` 参数改为 `cancel: Arc<Notify>` (去掉下划线), 并移除 `#[allow(unused_variables)]`。select! 块替换为：
+Task 4 实现的 `run_worker` 当前用 `match tokio::time::timeout(dur, child.wait())`（**不是** `tokio::select!`）——因为 `child.wait_with_output()` 取 `self` by value（move），无法在 select 多臂间共享 `&mut child`；而 `child.wait()` 借 `&mut self`，超时/取消后 inner future 被 drop 释放借用，才可在本臂调 `kill_tree(&mut child)`。**保持这个 `child.wait()`（非 `wait_with_output`）模式**，把超时 `match` 改为三臂 `tokio::select!`：cancel / timeout / child.wait()。
+
+把 `_cancel: Arc<Notify>` 参数改为 `cancel: Arc<Notify>`（去掉下划线），移除 `#[allow(unused_variables)]`。把当前的 `match tokio::time::timeout(...)` 块替换为（注意：用 `child.wait()`，正常完成臂在 select 之外/之后用既有 `drain_pipe` 读管道，因为 `select!` 的 `child.wait()` 臂只拿到 exit_status 不含 output）：
 
 ```rust
     let (status, exit_code, text) = tokio::select! {
@@ -936,24 +938,27 @@ Expected: FAIL — `method stop not found`
             let _ = child.wait().await;
             (TaskStatus::Failed, None, format!("Error: Timeout ({}s)", timeout_secs))
         }
-        out = child.wait_with_output() => match out {
-            Ok(output) => {
-                let stdout = crate::tools::command::decode_console(&output.stdout);
-                let stderr = crate::tools::command::decode_console(&output.stderr);
+        exit_status = child.wait() => match exit_status {
+            Ok(status) => {
+                let code = status.code();
+                let st = if code == Some(0) { TaskStatus::Completed } else { TaskStatus::Failed };
+                // wait 返回后借用释放, 用既有 drain_pipe 读管道 (Task 4 已建):
+                let stdout = drain_pipe(child.stdout.take()).await;
+                let stderr = drain_pipe(child.stderr.take()).await;
                 let body = format!("{}\n{}", stdout, stderr).trim().to_string();
                 let body = if body.is_empty() {
                     "(no output)".to_string()
                 } else {
                     truncate_chars(&body, MAX_OUTPUT_BYTES)
                 };
-                let code = output.status.code();
-                let status = if code == Some(0) { TaskStatus::Completed } else { TaskStatus::Failed };
-                (status, code, body)
+                (st, code, body)
             }
             Err(e) => (TaskStatus::Failed, None, format!("Error: wait failed: {}", e)),
         }
     };
 ```
+
+注：`select!` 的 `child.wait()` 臂借 `&mut child`，被选中后该 future drop、借用释放，臂体内 `child.stdout.take()`/`child.stderr.take()` 可用——与 Task 4 的 `drain_pipe` 模式一致。若编译器对 `&mut child` 在 select 臂内有异议，回退方案：在 `child.wait()` 臂内只产出 exit_status，select 之后再 `drain_pipe`（与 Task 4 的 `match` 结构同形）。
 
 - [ ] **Step 5: 运行测试验证通过**
 

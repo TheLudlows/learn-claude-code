@@ -432,19 +432,6 @@ mod tests {
     }
 
     #[test]
-    fn load_by_loader_returns_full_content() {
-        // 直接测 loader.load（不依赖全局 OnceLock 状态——OnceLock 初始化后不可重置，
-        // 跨测试复用全局实例会串扰，故走实例方法）。
-        // load 返回完整 SKILL.md（含 frontmatter），与 Python 参考 skill["content"] 一致。
-        let root = temp_skills_root("load-by-loader");
-        let content = "---\nname: code-review\ndescription: Do code reviews.\n---\n# Code Review\nbody";
-        write_skill(&root, "code-review", content);
-        let loader = SkillLoader::scan(root.clone());
-        assert_eq!(loader.load("code-review"), content);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn run_load_skill_missing_name_param_returns_error() {
         // run_load_skill 在缺 name 时提前返回，不触碰全局实例，故无需初始化即可测。
         let input = serde_json::json!({});

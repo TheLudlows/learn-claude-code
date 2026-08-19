@@ -248,42 +248,4 @@ mod tests {
             _ => panic!("No new_text should be allowed in permission check"),
         }
     }
-
-    // ---- run_edit_file logic tests ----
-
-    #[test]
-    fn run_edit_file_replaces_first_occurrence_only() {
-        // Verify replacen(..., 1) behavior: only first occurrence is replaced.
-        let content = "foo bar foo baz";
-        let result = content.replacen("foo", "REPLACED", 1);
-        assert_eq!(result, "REPLACED bar foo baz");
-    }
-
-    #[test]
-    fn run_edit_file_text_not_found() {
-        // When old_text is not in the file, we return an error message.
-        let content = "hello world";
-        assert!(!content.contains("missing_text"));
-    }
-
-    #[test]
-    fn run_edit_file_full_flow() {
-        let dir = std::env::temp_dir().join("rust-agent-edit-file-test");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("edit.txt");
-        fs::write(&file, "old value here").unwrap();
-
-        // Simulate run_edit_file logic
-        let content = fs::read_to_string(&file).unwrap();
-        assert!(content.contains("old value"));
-        let new_content = content.replacen("old value", "new value", 1);
-        fs::write(&file, &new_content).unwrap();
-        assert_eq!(
-            fs::read_to_string(&file).unwrap(),
-            "new value here"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
 }

@@ -380,7 +380,8 @@ impl ContextCompactor {
         }];
         let response: MessagesResponse = client
             .stream_messages(SUMMARY_SYSTEM, &req, &[], 2000)
-            .await?;
+            .await
+            .into_response()?;
         let summary: String = response
             .content
             .iter()

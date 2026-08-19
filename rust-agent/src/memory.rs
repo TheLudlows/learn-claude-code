@@ -361,7 +361,7 @@ impl MemoryStore {
             role: "user".to_string(),
             content: vec![ContentBlock::Text { text: prompt }],
         }];
-        match client.stream_messages("", &req, &[], 200).await {
+        match client.stream_messages("", &req, &[], 200).await.into_response() {
             Ok(response) => {
                 let text = response_text(&response);
                 let indices = extract_json_array(&text);
@@ -481,7 +481,7 @@ impl MemoryStore {
             role: "user".to_string(),
             content: vec![ContentBlock::Text { text: prompt }],
         }];
-        let response = match client.stream_messages("", &req, &[], 1000).await {
+        let response = match client.stream_messages("", &req, &[], 1000).await.into_response() {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("[Memory extraction skipped: {}]", e);
@@ -565,7 +565,7 @@ impl MemoryStore {
             role: "user".to_string(),
             content: vec![ContentBlock::Text { text: prompt }],
         }];
-        let response = match client.stream_messages("", &req, &[], 3000).await {
+        let response = match client.stream_messages("", &req, &[], 3000).await.into_response() {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("[Memory consolidation skipped: {}]", e);

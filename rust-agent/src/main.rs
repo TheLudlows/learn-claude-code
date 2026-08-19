@@ -39,13 +39,13 @@ Key insight: the loop stays the same; compaction runs transparently before each 
 memory recall runs once per request, extract/consolidate run only on true exit.
 */
 
-use rust_agent::client::{Client, ContentBlock, Message};
+use rust_agent::client::{CallResult, Client, ContentBlock, Message};
 use rust_agent::compact::{ContextCompactor, MAX_REACTIVE_RETRIES};
 use rust_agent::error::AgentError;
 use rust_agent::memory::{build_system, MemoryStore};
 use rust_agent::builtins::{ContextInjectHook, LargeOutputHook, PermissionHook, SummaryHook, TodoReminderHook};
 use rust_agent::hooks::{assemble_post_tool_messages, Hooks};
-use rust_agent::tools::{workdir, ToolContext, ToolRegistry};
+use rust_agent::tools::{workdir, ToolContext, ToolRegistry, ToolResult};
 use dotenv::dotenv;
 use std::env;
 use std::io;
@@ -54,7 +54,12 @@ use tracing_subscriber::EnvFilter;
 
 /// 执行单个工具调用（含 PreToolUse 拦截）。
 ///
-/// 返回真实工具输出（被 PreToolUse 拦截时返回拦截原因作为 tool_result）。
+/// 返回 ToolResult，区分四种情况：
+/// - Denied: pre_tool hook 拦截（权限拒绝等）
+/// - Output: 工具真正执行了（成功或内部报错）
+/// - Rejected: 子 agent 上下文调用受限工具（此处 for_subagent=false，不会发生）
+/// - NotFound: registry 里找不到这个工具
+///
 /// PostToolUse 不在此处理：其返回值由 agent_loop 经 assemble_post_tool_messages
 /// 作为独立 user 消息注入，不再覆盖 tool_result。
 async fn execute_tool(
@@ -63,10 +68,10 @@ async fn execute_tool(
     name: &str,
     input: &serde_json::Value,
     hooks: &Hooks,
-) -> String {
+) -> ToolResult {
     // PreToolUse 拦截
     if let Some(reason) = hooks.trigger_pre_tool(registry, name, input) {
-        return reason;
+        return ToolResult::Denied(reason);
     }
 
     // Create ToolContext for tool execution
@@ -75,9 +80,7 @@ async fn execute_tool(
         hooks,
         registry,
     };
-
-    // 执行工具（PostToolUse 提醒由调用方注入，见 agent_loop）
-    registry.dispatch(name, &ctx, input, false).await.unwrap_or_else(|| "Error: tool not found".to_string())
+    registry.dispatch(name, &ctx, input, false).await
 }
 
 /// Agent 核心循环
@@ -121,20 +124,21 @@ async fn agent_loop(
             .stream_messages(&system, messages, &registry.definitions(), 8000)
             .await
         {
-            Ok(r) => {
+            CallResult::Success(r) => {
                 reactive_retries = 0;
                 r
             }
-            Err(e) => {
-                // s08: prompt_too_long 时尝试 reactive_compact 重试一次
-                if e.is_prompt_too_long() && reactive_retries < MAX_REACTIVE_RETRIES {
-                    rust_agent::output::status("[reactive compact]");
-                    compactor
-                        .reactive_compact(client, messages, active_request)
-                        .await?;
-                    reactive_retries += 1;
-                    continue;
-                }
+            // prompt_too_long 且还有重试预算：压缩后重试
+            CallResult::PromptTooLong(_) if reactive_retries < MAX_REACTIVE_RETRIES => {
+                rust_agent::output::status("[reactive compact]");
+                compactor
+                    .reactive_compact(client, messages, active_request)
+                    .await?;
+                reactive_retries += 1;
+                continue;
+            }
+            // prompt_too_long 耗尽重试 或 其他错误：直接返回
+            CallResult::PromptTooLong(e) | CallResult::Failure(e) => {
                 return Err(e);
             }
         };
@@ -172,19 +176,22 @@ async fn agent_loop(
         let mut reminders: Vec<String> = Vec::new();
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                let tool_output = execute_tool(client, registry, name, input, hooks).await;
+                let tool_result = execute_tool(client, registry, name, input, hooks).await;
                 // 打印工具执行结果（此前只喂回 LLM，用户看不到工具返回了什么）
                 {
                     let mut out = io::stdout().lock();
-                    rust_agent::output::render_tool_result(name, &tool_output, &mut out);
+                    rust_agent::output::render_tool_result(name, tool_result.as_content(), &mut out);
                 }
                 // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
-                if let Some(msg) = hooks.trigger_post_tool(name, input, &tool_output) {
-                    reminders.push(msg);
+                // 只有工具真正执行过才触发 hook（Denied/NotFound 不触发）
+                if tool_result.was_executed() {
+                    if let Some(msg) = hooks.trigger_post_tool(name, input, tool_result.as_content()) {
+                        reminders.push(msg);
+                    }
                 }
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: tool_output,
+                    content: tool_result.as_content().to_string(),
                 });
             }
         }

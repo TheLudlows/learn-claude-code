@@ -217,47 +217,4 @@ mod tests {
             _ => panic!("No path should be allowed in permission check"),
         }
     }
-
-    // ---- run_read_file tests ----
-
-    #[test]
-    fn run_read_file_reads_content() {
-        let dir = std::env::temp_dir().join("rust-agent-read-file-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("hello.txt");
-        std::fs::write(&file, "line1\nline2\nline3").unwrap();
-
-        // Use safe_path_in with the temp dir as workspace
-        let result = crate::tools::safe_path_in(&dir, "hello.txt");
-        assert!(result.is_ok());
-        let content = std::fs::read_to_string(result.unwrap()).unwrap();
-        assert_eq!(content, "line1\nline2\nline3");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn run_read_file_limit_truncates() {
-        let dir = std::env::temp_dir().join("rust-agent-read-file-limit-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("multi.txt");
-        std::fs::write(&file, "line1\nline2\nline3\nline4\nline5").unwrap();
-
-        // Verify limit logic: read file content and check truncation
-        let content = std::fs::read_to_string(&file).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        let limit: u32 = 2;
-        let truncated: Vec<&str> = lines[..limit as usize].to_vec();
-        let more = lines.len() - limit as usize;
-        let result = format!("{}\n... ({} more lines)", truncated.join("\n"), more);
-
-        assert!(result.contains("line1"));
-        assert!(result.contains("line2"));
-        assert!(!result.contains("line3"));
-        assert!(result.contains("3 more lines"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

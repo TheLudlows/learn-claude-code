@@ -1,6 +1,6 @@
 use crate::error::AgentError;
 use crate::tools::trait_def::ToolDefinition;
-use eventsource_stream::{EventStreamError, Eventsource};
+use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,37 @@ pub struct MessagesResponse {
     pub stop_reason: String,
 }
 
+/// `stream_messages` 的三态返回值。
+///
+/// 将成功、上下文超限、其他错误分开，调用方可直接 pattern match：
+/// - `Success` — 模型正常响应
+/// - `PromptTooLong` — API 拒绝（上下文过长），调用方可压缩后重试
+/// - `Failure` — 其他错误（网络、认证、解析等）
+///
+/// 不需要区分 prompt-too-long 的调用方用 `.into_response()?` 即可。
+#[derive(Debug)]
+pub enum CallResult {
+    Success(MessagesResponse),
+    PromptTooLong(AgentError),
+    Failure(AgentError),
+}
+
+impl CallResult {
+    /// 转为 `Result<MessagesResponse, AgentError>`，不区分 prompt-too-long。
+    pub fn into_response(self) -> Result<MessagesResponse, AgentError> {
+        match self {
+            Self::Success(r) => Ok(r),
+            Self::PromptTooLong(e) => Err(e),
+            Self::Failure(e) => Err(e),
+        }
+    }
+
+    /// 是否为上下文超限（O(1) 判别，不扫字符串）。
+    pub fn is_prompt_too_long(&self) -> bool {
+        matches!(self, Self::PromptTooLong(_))
+    }
+}
+
 /// 封装 Anthropic API 交互。
 pub struct Client {
     http: reqwest::Client,
@@ -68,9 +99,19 @@ impl Client {
             model,
         }
     }
+
+    /// 把 AgentError 分类为 CallResult（prompt_too_long → PromptTooLong，否则 Failure）。
+    fn classify_error(&self, err: AgentError) -> CallResult {
+        if err.is_prompt_too_long() {
+            CallResult::PromptTooLong(err)
+        } else {
+            CallResult::Failure(err)
+        }
+    }
+
     /// 流式调用 /v1/messages。
     ///
-    /// 累加 text 与 tool_use 的 input_json delta，最后返回 `MessagesResponse`。
+    /// 累加 text 与 tool_use 的 input_json delta，最后返回 `CallResult`。
     /// 本函数不打印任何内容——展示交给 `output::render`，由调用方拿到响应后调用。
     /// `agent_loop` 拿到后照旧判断 stop_reason。
     pub async fn stream_messages(
@@ -79,7 +120,7 @@ impl Client {
         messages: &[Message],
         tools: &[ToolDefinition],
         max_tokens: u32,
-    ) -> Result<MessagesResponse, AgentError> {
+    ) -> CallResult {
         // base_url 末尾的 '/' 会拼出 `//v1/messages`，先 trim 掉。
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let request = MessagesRequest {
@@ -99,7 +140,7 @@ impl Client {
             max_tokens
         );
 
-        let response = self
+        let response = match self
             .http
             .post(&url)
             .header("x-api-key", &self.api_key)
@@ -107,14 +148,18 @@ impl Client {
             .header("content-type", "application/json")
             .json(&request)
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return self.classify_error(e.into()),
+        };
 
         // 非成功状态：先把 body 原样打出来，别让 serde 的 "error decoding response body"
         // 把真正的错误信息盖掉。那 92 字节里才写着 400 的真实原因。
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(AgentError::Api {
+            return self.classify_error(AgentError::Api {
                 status: status.as_u16(),
                 body: format!("{} — {}", self.base_url, body),
             });
@@ -143,15 +188,17 @@ impl Client {
         let mut current: Option<BlockAcc> = None;
 
         while let Some(event) = es.next().await {
-            let event = event
-                .map_err(|e: EventStreamError<reqwest::Error>| AgentError::Stream(e.to_string()))?;
+            let event = match event {
+                Ok(ev) => ev,
+                Err(e) => return self.classify_error(AgentError::Stream(e.to_string())),
+            };
 
             // SSE 每个事件由若干行组成；eventsource-stream 已处理行分割和事件边界，
             // 我们只拿到完整的 data 字段。Anthropic 每个事件只发一条 `data:` 行。
             let ev: serde_json::Value = match serde_json::from_str(&event.data) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(AgentError::InvalidResponse(format!(
+                    return self.classify_error(AgentError::InvalidResponse(format!(
                         "SSE JSON parse error: {} (raw: {})",
                         e, event.data
                     )));
@@ -256,7 +303,7 @@ impl Client {
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("stream error");
-                    return Err(AgentError::Stream(msg.to_string()));
+                    return self.classify_error(AgentError::Stream(msg.to_string()));
                 }
                 _ => {}
             }
@@ -268,6 +315,73 @@ impl Client {
             content.len()
         );
 
-        Ok(MessagesResponse { content, stop_reason })
+        CallResult::Success(MessagesResponse { content, stop_reason })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_result_into_response_success() {
+        let r = MessagesResponse {
+            content: vec![],
+            stop_reason: "end_turn".into(),
+        };
+        assert!(CallResult::Success(r).into_response().is_ok());
+    }
+
+    #[test]
+    fn call_result_into_response_prompt_too_long() {
+        let e = AgentError::Api {
+            status: 400,
+            body: "prompt_too_long".into(),
+        };
+        assert!(CallResult::PromptTooLong(e).into_response().is_err());
+    }
+
+    #[test]
+    fn call_result_into_response_failure() {
+        let e = AgentError::Other("network down".into());
+        assert!(CallResult::Failure(e).into_response().is_err());
+    }
+
+    #[test]
+    fn call_result_is_prompt_too_long() {
+        let e = AgentError::Api {
+            status: 400,
+            body: "prompt_too_long".into(),
+        };
+        assert!(CallResult::PromptTooLong(e).is_prompt_too_long());
+
+        let r = MessagesResponse {
+            content: vec![],
+            stop_reason: "end_turn".into(),
+        };
+        assert!(!CallResult::Success(r).is_prompt_too_long());
+
+        let e = AgentError::Other("something".into());
+        assert!(!CallResult::Failure(e).is_prompt_too_long());
+    }
+
+    #[test]
+    fn classify_error_prompt_too_long() {
+        let client = Client::new("key".into(), "https://api.example.com".into(), "model".into());
+        let err = AgentError::Api {
+            status: 400,
+            body: "error: prompt_too_long".into(),
+        };
+        assert!(matches!(
+            client.classify_error(err),
+            CallResult::PromptTooLong(_)
+        ));
+    }
+
+    #[test]
+    fn classify_error_other() {
+        let client = Client::new("key".into(), "https://api.example.com".into(), "model".into());
+        let err = AgentError::Other("random failure".into());
+        assert!(matches!(client.classify_error(err), CallResult::Failure(_)));
     }
 }

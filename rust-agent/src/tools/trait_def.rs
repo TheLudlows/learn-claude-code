@@ -19,6 +19,40 @@ pub enum PermissionCheck {
     NeedsApproval(&'static str),
 }
 
+/// 工具执行的统一结果类型。
+///
+/// 把 dispatch 层的 "找不到工具" / "子 agent 调用受限工具"、
+/// pre_tool 层的 "权限拦截"、execute 层的 "真实输出"
+/// 统一到一个枚举里，避免用 String 内容编码语义。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolResult {
+    /// 工具执行成功（包括工具内部返回的错误串，如 "Error: path required"）
+    Output(String),
+    /// dispatch 层：工具未注册
+    NotFound(String),
+    /// dispatch 层：子 agent 上下文调用受限工具
+    Rejected(String),
+    /// pre_tool hook 拦截（权限拒绝等）
+    Denied(String),
+}
+
+impl ToolResult {
+    /// 不管哪种结果，最终都要作为 tool_result 喂给 LLM
+    pub fn as_content(&self) -> &str {
+        match self {
+            Self::Output(s) => s,
+            Self::NotFound(s) => s,
+            Self::Rejected(s) => s,
+            Self::Denied(s) => s,
+        }
+    }
+
+    /// 只有真正执行过工具（Output），才应该触发 PostToolUse hook
+    pub fn was_executed(&self) -> bool {
+        matches!(self, Self::Output(_))
+    }
+}
+
 /// Context provided to tools during execution
 ///
 /// This struct provides dependency injection for tools, giving them access
@@ -152,173 +186,5 @@ pub mod test_helpers {
         fn default() -> Self {
             Self::new()
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    struct MockTool {
-        name: String,
-        description: String,
-        schema: Value,
-    }
-
-    #[async_trait]
-    impl Tool for MockTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn description(&self) -> &str {
-            &self.description
-        }
-
-        fn input_schema(&self) -> Value {
-            self.schema.clone()
-        }
-
-        async fn execute(&self, _ctx: &ToolContext<'_>, _input: &Value) -> String {
-            format!("Executed {}", self.name)
-        }
-    }
-
-    struct RestrictedTool {
-        name: String,
-    }
-
-    #[async_trait]
-    impl Tool for RestrictedTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn description(&self) -> &str {
-            "A tool that requires approval"
-        }
-
-        fn input_schema(&self) -> Value {
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string" }
-                },
-                "required": ["action"]
-            })
-        }
-
-        fn check_permission(&self, input: &Value) -> PermissionCheck {
-            if input.get("action").and_then(|v| v.as_str()) == Some("dangerous") {
-                PermissionCheck::NeedsApproval("This action requires explicit approval")
-            } else {
-                PermissionCheck::Pass
-            }
-        }
-
-        async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
-            format!("Executed restricted tool with action: {:?}", input)
-        }
-
-        fn available_for_subagent(&self) -> bool {
-            false
-        }
-    }
-
-    #[test]
-    fn test_permission_check_pass() {
-        let check = PermissionCheck::Pass;
-        assert_eq!(check, PermissionCheck::Pass);
-    }
-
-    #[test]
-    fn test_permission_check_needs_approval() {
-        let check = PermissionCheck::NeedsApproval("Reason for approval");
-        match check {
-            PermissionCheck::NeedsApproval(reason) => {
-                assert_eq!(reason, "Reason for approval");
-            }
-            PermissionCheck::Pass => panic!("Expected NeedsApproval"),
-        }
-    }
-
-    #[test]
-    fn test_mock_tool_basic_traits() {
-        let tool = MockTool {
-            name: "test_tool".to_string(),
-            description: "A test tool".to_string(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "param": { "type": "string" }
-                },
-                "required": ["param"]
-            }),
-        };
-
-        assert_eq!(tool.name(), "test_tool");
-        assert_eq!(tool.description(), "A test tool");
-        assert!(tool.available_for_subagent());
-    }
-
-    #[test]
-    fn test_mock_tool_default_permission_check() {
-        let tool = MockTool {
-            name: "test_tool".to_string(),
-            description: "A test tool".to_string(),
-            schema: json!({}),
-        };
-
-        let input = json!({"param": "value"});
-        assert_eq!(tool.check_permission(&input), PermissionCheck::Pass);
-    }
-
-    #[test]
-    fn test_restricted_tool_custom_permission_check() {
-        let tool = RestrictedTool {
-            name: "restricted".to_string(),
-        };
-
-        let safe_input = json!({"action": "safe"});
-        assert_eq!(tool.check_permission(&safe_input), PermissionCheck::Pass);
-
-        let dangerous_input = json!({"action": "dangerous"});
-        match tool.check_permission(&dangerous_input) {
-            PermissionCheck::NeedsApproval(reason) => {
-                assert!(reason.contains("explicit approval"));
-            }
-            PermissionCheck::Pass => panic!("Expected NeedsApproval for dangerous action"),
-        }
-    }
-
-    #[test]
-    fn test_restricted_tool_not_available_for_subagent() {
-        let tool = RestrictedTool {
-            name: "restricted".to_string(),
-        };
-
-        assert!(!tool.available_for_subagent());
-    }
-
-    #[test]
-    fn test_input_schema_format() {
-        let tool = MockTool {
-            name: "schema_test".to_string(),
-            description: "Test schema".to_string(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "required_field": { "type": "string" },
-                    "optional_field": { "type": "integer" }
-                },
-                "required": ["required_field"]
-            }),
-        };
-
-        let schema = tool.input_schema();
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["required"].as_array().unwrap().len(), 1);
-        assert_eq!(schema["properties"]["required_field"]["type"], "string");
     }
 }

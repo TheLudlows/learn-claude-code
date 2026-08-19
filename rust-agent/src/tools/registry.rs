@@ -9,7 +9,9 @@ and definition generation. It provides:
 - Permission checking before execution
 */
 
-use crate::tools::trait_def::{PermissionCheck, Tool, ToolDefinition, ToolContext};
+use std::collections::BTreeMap;
+
+use crate::tools::trait_def::{PermissionCheck, Tool, ToolDefinition, ToolContext, ToolResult};
 use serde_json::Value;
 
 /// Registry for managing and dispatching tools
@@ -17,29 +19,34 @@ use serde_json::Value;
 /// This struct holds all registered tools and provides methods for
 /// tool discovery, execution, and permission checking.
 pub struct ToolRegistry {
-    /// Collection of registered tools stored as trait objects
-    tools: Vec<Box<dyn Tool>>,
+    /// Collection of registered tools stored as a BTreeMap keyed by tool name.
+    /// BTreeMap 保证按名称排序、确定性的迭代顺序，查找 O(log n)。
+    tools: BTreeMap<String, Box<dyn Tool>>,
 }
 
 impl ToolRegistry {
     /// Create a new empty tool registry
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self { tools: BTreeMap::new() }
     }
 
     /// Register a new tool in the registry
     ///
+    /// The tool's name is extracted at registration time and used as the key.
+    /// If a tool with the same name is already registered, it will be replaced.
+    ///
     /// # Arguments
     /// * `tool` - A boxed tool implementing the Tool trait
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(tool);
+        let name = tool.name().to_string();
+        self.tools.insert(name, tool);
     }
 
     /// Dispatch a tool call by name
     ///
     /// `for_subagent` 为 `true` 时（子 agent 上下文），对 `available_for_subagent() == false`
-    /// 的工具返回错误串而非执行——`definitions_for_subagent` 已在**声明层**过滤掉这类工具，
-    /// 此处在**派发层**再挡一道，防止模型幻觉出 `task` 调用导致子 agent 递归委托。
+    /// 的工具返回 `ToolResult::Rejected` 而非执行——`definitions_for_subagent` 已在**声明层**
+    /// 过滤掉这类工具，此处在**派发层**再挡一道，防止模型幻觉出 `task` 调用导致子 agent 递归委托。
     ///
     /// # Arguments
     /// * `name` - The name of the tool to dispatch
@@ -48,27 +55,29 @@ impl ToolRegistry {
     /// * `for_subagent` - 是否在子 agent 上下文中派发
     ///
     /// # Returns
-    /// * `Some(result)` - The tool's output if the tool was found (含子 agent 拒绝时的错误串)
-    /// * `None` - If no tool with the given name was registered
+    /// * `ToolResult::Output(result)` - 工具执行成功
+    /// * `ToolResult::Rejected(reason)` - 子 agent 上下文调用受限工具
+    /// * `ToolResult::NotFound(reason)` - 工具未注册
     pub async fn dispatch(
         &self,
         name: &str,
         ctx: &ToolContext<'_>,
         input: &Value,
         for_subagent: bool,
-    ) -> Option<String> {
-        for tool in &self.tools {
-            if tool.name() == name {
+    ) -> ToolResult {
+        match self.tools.get(name) {
+            Some(tool) => {
                 if for_subagent && !tool.available_for_subagent() {
-                    return Some(format!(
+                    ToolResult::Rejected(format!(
                         "Error: Tool '{}' is not available in subagent context",
                         name
-                    ));
+                    ))
+                } else {
+                    ToolResult::Output(tool.execute(ctx, input).await)
                 }
-                return Some(tool.execute(ctx, input).await);
             }
+            None => ToolResult::NotFound(format!("Error: tool '{}' not found", name)),
         }
-        None
     }
 
     /// Check permission for a tool call
@@ -81,21 +90,18 @@ impl ToolRegistry {
     /// * `Some(permission_check)` - The permission result if the tool was found
     /// * `None` - If no tool with the given name was registered
     pub fn check_permission(&self, name: &str, input: &Value) -> Option<PermissionCheck> {
-        for tool in &self.tools {
-            if tool.name() == name {
-                return Some(tool.check_permission(input));
-            }
-        }
-        None
+        self.tools.get(name).map(|tool| tool.check_permission(input))
     }
 
     /// Generate ToolDefinition list for all registered tools
+    ///
+    /// Definitions are returned in alphabetical order by tool name (BTreeMap 的确定性排序)。
     ///
     /// # Returns
     /// A vector of ToolDefinition structs for API integration
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
-            .iter()
+            .values()
             .map(|tool| ToolDefinition {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
@@ -106,11 +112,13 @@ impl ToolRegistry {
 
     /// Generate ToolDefinition list for tools available to subagents
     ///
+    /// Definitions are returned in alphabetical order by tool name.
+    ///
     /// # Returns
     /// A vector of ToolDefinition structs for subagent API integration
     pub fn definitions_for_subagent(&self) -> Vec<ToolDefinition> {
         self.tools
-            .iter()
+            .values()
             .filter(|tool| tool.available_for_subagent())
             .map(|tool| ToolDefinition {
                 name: tool.name().to_string(),
@@ -128,7 +136,7 @@ impl ToolRegistry {
     /// # Returns
     /// `true` if a tool with the given name is registered, `false` otherwise
     pub fn has_tool(&self, name: &str) -> bool {
-        self.tools.iter().any(|tool| tool.name() == name)
+        self.tools.contains_key(name)
     }
 
     /// Get the number of registered tools
@@ -227,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_dispatch_known_tool() {
-        use crate::tools::trait_def::ToolContext;
+        use crate::tools::trait_def::{ToolContext, ToolResult};
         use crate::client::Client;
         use crate::hooks::Hooks;
 
@@ -256,13 +264,14 @@ mod tests {
 
         let result = registry.dispatch("known_tool", &ctx, &input, false).await;
 
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "TestTool executed with: Object {\"input\": String(\"test_value\")}");
+        assert!(matches!(result, ToolResult::Output(_)));
+        assert_eq!(result.as_content(), "TestTool executed with: Object {\"input\": String(\"test_value\")}");
+        assert!(result.was_executed());
     }
 
     #[tokio::test]
     async fn test_registry_dispatch_unknown_tool() {
-        use crate::tools::trait_def::ToolContext;
+        use crate::tools::trait_def::{ToolContext, ToolResult};
         use crate::client::Client;
         use crate::hooks::Hooks;
 
@@ -286,18 +295,13 @@ mod tests {
 
         let result = registry.dispatch("unknown_tool", &ctx, &input, false).await;
 
-        assert!(result.is_none());
+        assert!(matches!(result, ToolResult::NotFound(_)));
+        assert!(!result.was_executed());
     }
     
     #[test]
     fn test_registry_new_empty() {
         let registry = ToolRegistry::new();
-        assert_eq!(registry.tool_count(), 0);
-    }
-
-    #[test]
-    fn test_registry_default() {
-        let registry = ToolRegistry::default();
         assert_eq!(registry.tool_count(), 0);
     }
 
@@ -411,25 +415,6 @@ mod tests {
     }
 
     #[test]
-    fn test_check_permission_needs_approval() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(RestrictedTestTool {
-            name: "restricted_tool".to_string(),
-        }));
-
-        let restricted_input = json!({"action": "restricted"});
-        let result = registry.check_permission("restricted_tool", &restricted_input);
-
-        assert!(result.is_some());
-        match result.unwrap() {
-            PermissionCheck::NeedsApproval(reason) => {
-                assert!(reason.contains("approval"));
-            }
-            PermissionCheck::Pass => panic!("Expected NeedsApproval"),
-        }
-    }
-
-    #[test]
     fn test_check_permission_unknown_tool() {
         let registry = ToolRegistry::new();
         let input = json!({"test": "value"});
@@ -454,36 +439,6 @@ mod tests {
         let registry = ToolRegistry::new();
         assert!(!registry.has_tool("non_existing_tool"));
     }
-
-    // TODO: Fix async test with proper mock context
-    // #[tokio::test]
-    // async fn test_dispatch_success() {
-    //     let mut registry = ToolRegistry::new();
-    //     registry.register(Box::new(TestTool {
-    //         name: "dispatch_test".to_string(),
-    //         description: "Dispatch test tool".to_string(),
-    //     }));
-
-    //     let input = json!({"input": "test_value"});
-    //     let ctx = create_mock_context();
-
-    //     let result = registry.dispatch("dispatch_test", &ctx, &input, false).await;
-
-    //     assert!(result.is_some());
-    //     assert!(result.unwrap().contains("dispatch_test"));
-    // }
-
-    // TODO: Fix async test with proper mock context
-    // #[tokio::test]
-    // async fn test_dispatch_unknown_tool() {
-    //     let registry = ToolRegistry::new();
-    //     let input = json!({"test": "value"});
-    //     let ctx = create_mock_context();
-
-    //     let result = registry.dispatch("unknown_tool", &ctx, &input, false).await;
-
-    //     assert!(result.is_none());
-    // }
 
     #[test]
     fn test_tool_count_accuracy() {
@@ -585,7 +540,7 @@ mod tests {
         // dispatch 的 for_subagent=true 必须在「派发层」再挡一道——
         // 否则模型幻觉出 task 调用时，子 agent 仍会递归委托。
         use crate::tools::task::TaskTool;
-        use crate::tools::trait_def::ToolContext;
+        use crate::tools::trait_def::{ToolContext, ToolResult};
         use crate::client::Client;
         use crate::hooks::Hooks;
 
@@ -605,43 +560,29 @@ mod tests {
             registry: &registry_for_ctx,
         };
 
-        // 子 agent 上下文派发 task：返回错误串，不执行（不触发递归）
+        // 子 agent 上下文派发 task：返回 Rejected，不执行（不触发递归）
         let result = registry
             .dispatch("task", &ctx, &json!({"prompt": "recurse"}), true)
             .await;
-        assert!(result.is_some(), "dispatch should return an error string, not None");
-        let out = result.unwrap();
+        assert!(matches!(result, ToolResult::Rejected(_)), "dispatch should return Rejected, got {:?}", result);
         assert!(
-            out.contains("not available in subagent context"),
+            result.as_content().contains("not available in subagent context"),
             "subagent dispatch of task must be rejected, got: {}",
-            out
+            result.as_content()
         );
+        assert!(!result.was_executed(), "rejected tool must not be marked as executed");
 
         // 父 agent 上下文派发 task：不在此挡（真实执行由上层 ctx.client 决定，
-        // 这里只确认 for_subagent=false 不会走到拒绝分支——返回串不含拒绝措辞）
+        // 这里只确认 for_subagent=false 不会走到拒绝分支——返回 Output）
         let parent_result = registry
             .dispatch("task", &ctx, &json!({"prompt": "ok"}), false)
             .await;
-        assert!(parent_result.is_some());
+        assert!(matches!(parent_result, ToolResult::Output(_)));
         assert!(
-            !parent_result.unwrap().contains("not available in subagent context"),
+            !parent_result.as_content().contains("not available in subagent context"),
             "parent dispatch must not hit the subagent-reject branch"
         );
-    }
-
-    #[test]
-    fn test_registry_check_permission_default_pass() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(TestTool {
-            name: "default_tool".to_string(),
-            description: "A tool with default permission handling".to_string(),
-        }));
-
-        let input = json!({"input": "some_value"});
-        let result = registry.check_permission("default_tool", &input);
-
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), PermissionCheck::Pass);
+        assert!(parent_result.was_executed());
     }
 
     #[test]

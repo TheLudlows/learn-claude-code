@@ -71,7 +71,8 @@ pub async fn run_subagent_loop(
                 &registry.definitions_for_subagent(),
                 8000,
             )
-            .await?;
+            .await
+            .into_response()?;
 
         // 添加助手响应
         messages.push(Message {
@@ -112,25 +113,20 @@ pub async fn run_subagent_loop(
 
                 // 使用 registry.dispatch（for_subagent=true：派发层再挡 task 等不可用工具，
                 // 防止模型幻觉出 task 调用导致子 agent 递归委托）
-                match registry.dispatch(name, &ctx, input, true).await {
-                    Some(output) => {
-                        // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
-                        if let Some(msg) = hooks.trigger_post_tool(name, input, &output) {
-                            reminders.push(msg);
-                        }
+                let result = registry.dispatch(name, &ctx, input, true).await;
 
-                        tool_results.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: output,
-                        });
-                    },
-                    None => {
-                        tool_results.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: format!("Error: Tool '{}' not found", name),
-                        });
+                // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
+                // 只有工具真正执行过才触发 hook（Denied/NotFound/Rejected 不触发）
+                if result.was_executed() {
+                    if let Some(msg) = hooks.trigger_post_tool(name, input, result.as_content()) {
+                        reminders.push(msg);
                     }
                 }
+
+                tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: result.as_content().to_string(),
+                });
             }
         }
 

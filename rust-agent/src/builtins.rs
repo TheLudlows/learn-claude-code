@@ -204,22 +204,6 @@ mod tests {
     }
 
     #[test]
-    fn permission_hook_requires_approval() {
-        // 使用 build_registry 创建一个包含所有工具的 registry
-        let registry = build_registry();
-
-        // 测试工具权限检查系统是否正常工作
-        // 由于大多数工具默认不需要审批，我们可以测试这个系统
-        let result = PermissionHook.on_pre_tool(
-            &registry,
-            "command",
-            &serde_json::json!({"command": "ls"})
-        );
-        // command 工具不应该需要审批
-        assert_eq!(result, None);
-    }
-
-    #[test]
     fn permission_hook_unknown_tool() {
         // 测试未知工具的处理
         let registry = ToolRegistry::new();

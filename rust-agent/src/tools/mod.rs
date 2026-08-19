@@ -31,7 +31,7 @@ pub mod task;
 
 // Re-exports for convenient access
 pub use self::registry::ToolRegistry;
-pub use self::trait_def::{PermissionCheck, Tool, ToolContext};
+pub use self::trait_def::{PermissionCheck, Tool, ToolContext, ToolResult};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub use self::trait_def::test_helpers::TestToolContext;

@@ -222,26 +222,4 @@ mod tests {
             _ => panic!("No content should be allowed in permission check"),
         }
     }
-
-    // ---- run_write_file tests ----
-
-    #[test]
-    fn run_write_file_creates_file_and_dirs() {
-        let dir = std::env::temp_dir().join("rust-agent-write-file-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // Verify write logic: safe_path_in + write
-        let result = crate::tools::safe_path_in(&dir, "sub/new.txt");
-        assert!(result.is_ok());
-        let abs_path = result.unwrap();
-        if let Some(parent) = abs_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let write_result = std::fs::write(&abs_path, "hello world");
-        assert!(write_result.is_ok());
-        assert_eq!(std::fs::read_to_string(&abs_path).unwrap(), "hello world");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

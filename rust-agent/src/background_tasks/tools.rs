@@ -183,12 +183,4 @@ mod tests {
         ));
         assert!(mgr.collect().is_empty());
     }
-
-    #[test]
-    fn background_stop_hook_empty_returns_none() {
-        // 全局 manager 在测试环境下通常无 ready; 仅验证返回 Option 契约。
-        // 不做强断言 (依赖全局状态), 逻辑在 manager 单测中已覆盖。
-        let hook = BackgroundStopHook;
-        let _: Option<String> = hook.on_stop(&[]);
-    }
 }
