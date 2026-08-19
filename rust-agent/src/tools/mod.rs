@@ -154,6 +154,13 @@ pub fn build_registry() -> ToolRegistry {
     registry.register(Box::new(todo_write::TodoWriteTool));
     registry.register(Box::new(task::TaskTool));
 
+    // s10 任务系统工具
+    registry.register(Box::new(crate::task_system::CreateTaskTool));
+    registry.register(Box::new(crate::task_system::ListTasksTool));
+    registry.register(Box::new(crate::task_system::GetTaskTool));
+    registry.register(Box::new(crate::task_system::ClaimTaskTool));
+    registry.register(Box::new(crate::task_system::CompleteTaskTool));
+
     registry
 }
 
