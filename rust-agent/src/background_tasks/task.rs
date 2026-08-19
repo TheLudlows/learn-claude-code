@@ -78,5 +78,22 @@ mod tests {
         assert_eq!(back.id, "bg_a1b2c3d4");
         assert_eq!(back.status, TaskStatus::Completed);
         assert_eq!(back.exit_code, Some(0));
+
+        // exit_code: None 分支 (Running 态, 序列化为 null)
+        let running = BackgroundTask {
+            id: "bg_00000000".to_string(),
+            command: "sleep 1".to_string(),
+            status: TaskStatus::Running,
+            tool_use_id: "toolu_02".to_string(),
+            started_at: 1700000001,
+            output_file: PathBuf::from(".task_outputs/background/bg_00000000.log"),
+            exit_code: None,
+        };
+        let json_none = serde_json::to_string(&running).unwrap();
+        assert!(json_none.contains("\"exit_code\":null"));
+        assert!(json_none.contains("\"status\":\"running\""));
+        let back_none: BackgroundTask = serde_json::from_str(&json_none).unwrap();
+        assert_eq!(back_none.exit_code, None);
+        assert_eq!(back_none.status, TaskStatus::Running);
     }
 }
