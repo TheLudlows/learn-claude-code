@@ -117,6 +117,77 @@ impl CronManager {
     pub fn workdir(&self) -> &PathBuf {
         &self.workdir
     }
+
+    /// 调度一个 cron 任务
+    pub fn schedule(&self, cron: &str, prompt: &str, recurring: bool, durable: bool) -> Result<CronJob, String> {
+        validate_cron(cron)?;
+        if prompt.trim().is_empty() {
+            return Err("Prompt cannot be empty".to_string());
+        }
+
+        let id = self.generate_id();
+        if id.is_empty() {
+            return Err("Failed to allocate task id".to_string());
+        }
+
+        let job = CronJob {
+            id: id.clone(),
+            cron: cron.to_string(),
+            prompt: prompt.to_string(),
+            recurring,
+            durable,
+            pending_delivery: false,
+            last_fired: None,
+        };
+
+        {
+            let mut state = self.state.lock().expect("state mutex poisoned");
+            state.jobs.insert(id.clone(), job.clone());
+        }
+
+        if durable {
+            self.save_durable()?;
+        }
+
+        Ok(job)
+    }
+
+    /// 取消一个 cron 任务
+    pub fn cancel(&self, job_id: &str) -> Result<String, String> {
+        let (removed_job, was_durable) = {
+            let mut state = self.state.lock().expect("state mutex poisoned");
+            let job = state.jobs.get(job_id).ok_or_else(|| format!("Job {} not found", job_id))?;
+            let was_durable = job.durable;
+
+            // 从队列中移除
+            state.delivery_queue.retain(|j| j.id != job_id);
+
+            let removed_job = state.jobs.remove(job_id).unwrap();
+            (removed_job, was_durable)
+        };
+
+        if was_durable {
+            if let Err(e) = self.save_durable() {
+                // 恢复
+                let mut state = self.state.lock().expect("state mutex poisoned");
+                state.jobs.insert(job_id.to_string(), removed_job);
+                return Err(format!("Failed to save after cancel: {}", e));
+            }
+        }
+
+        Ok(format!("Cancelled {}", job_id))
+    }
+
+    /// 列出所有 cron 任务
+    pub fn list(&self) -> Vec<CronJob> {
+        let state = self.state.lock().expect("state mutex poisoned");
+        state.jobs.values().cloned().collect()
+    }
+
+    // Stub for save_durable - will be implemented in Task 6
+    fn save_durable(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// 验证完整的 cron 表达式
