@@ -163,6 +163,10 @@ pub fn build_registry() -> ToolRegistry {
     registry.register(Box::new(crate::background_tasks::TaskOutputTool));
     registry.register(Box::new(crate::background_tasks::TaskStopTool));
 
+    registry.register(Box::new(crate::cron_scheduler::ScheduleCronTool));
+    registry.register(Box::new(crate::cron_scheduler::ListCronsTool));
+    registry.register(Box::new(crate::cron_scheduler::CancelCronTool));
+
     registry
 }
 
