@@ -132,6 +132,26 @@ impl BackgroundManager {
         }
         out
     }
+
+    /// 取消后台任务: 触发 cancel Notify -> worker 走取消分支 -> kill 进程树 -> Cancelled -> 入 ready。
+    /// 已完成/不存在的任务返回提示, no-op。
+    pub fn stop(&self, task_id: &str) -> String {
+        let cancel_opt = {
+            let state = self.state.lock().expect("state mutex poisoned");
+            match state.tasks.get(task_id).map(|t| t.status) {
+                None => return format!("Error: task {} not found", task_id),
+                Some(TaskStatus::Running) => state.cancels.get(task_id).cloned(),
+                Some(other) => return format!("Task {} already {}", task_id, status_word(other)),
+            }
+        };
+        match cancel_opt {
+            Some(cancel) => {
+                cancel.notify_one();
+                format!("Stopped {}", task_id)
+            }
+            None => format!("Error: task {} not found", task_id),
+        }
+    }
 }
 
 /// 在已持锁的 state 上生成不碰撞的 bg_id (重试 100 次)。
@@ -149,16 +169,19 @@ fn generate_id_locked(state: &State) -> String {
 
 /// worker: 执行命令, 落盘输出, finalize。
 ///
-/// tokio::time::timeout 包裹 child.wait() (借用 &mut child, 非 move): 超时 → kill_tree 杀进程树
-/// + Failed/None + 写 "Error: Timeout (Ns)"。wait_with_output 会 move child, 无法在超时分支
-/// 复用 child 调 kill_tree, 故改用 wait() + 独立 drain_pipe 读管道。(取消臂在 Task 5 加。)
-#[allow(unused_variables)]
+/// tokio::select! 三臂 biased 竞速: cancel.notified() / sleep(timeout) / child.wait()+drain。
+/// - cancel 臂: stop() 触发 Notify → kill_tree 杀进程树 + reap + Cancelled/None + "Cancelled by TaskStop"。
+/// - timeout 臂: sleep 到期 → kill_tree + reap + Failed/None + "Error: Timeout (Ns)"。
+/// - wait 臂: child.wait() (借 &mut child, 非 move) 与 drain_pipe 并发 (tokio::join!); 完成 →
+///   Completed/Failed + 输出正文。wait_with_output 会 move child, 无法在其他臂复用 child 调
+///   kill_tree, 故用 wait() + 独立 drain_pipe。wait 臂的 join! 包在 async {} 块里, &mut child
+/// 借用封闭在该 future 内; 另一臂胜出时该 future 被 drop, 借用释放, 胜出臂可再拿 &mut child。
 async fn run_worker(
     mgr: BackgroundManager,
     id: String,
     command: String,
     output_file: PathBuf,
-    _cancel: Arc<Notify>,
+    cancel: Arc<Notify>,
 ) {
     let mut cmd = build_command(&command);
     cmd.stdout(std::process::Stdio::piped())
@@ -176,51 +199,51 @@ async fn run_worker(
     let timeout_secs = mgr.timeout_secs;
     // 先 take 管道: drain future 拥有所有权, 不与 child.wait() 的 &mut child 借用冲突。
     // 用 tokio::join! 让管道与 wait 并发推进, 避免子进程输出超过管道缓冲 (Windows 低至 4KB)
-    // 时阻塞在 write()、wait 永不返回的死锁。timeout 的 inner future 借 &mut child;
-    // Elapsed 时被 drop, 借用释放, Err 分支可再拿 &mut child 调 kill_tree。
+    // 时阻塞在 write()、wait 永不返回的死锁。wait 臂的 join! 包在 async {} 块里, &mut child
+    // 借用封闭在该 future 内; cancel/timeout 臂胜出时该 future 被 drop, 借用释放, 胜出臂
+    // 可再拿 &mut child 调 kill_tree。stdout_pipe/stderr_pipe 被 move 进 wait 臂的 async 块,
+    // 其他臂胜出时随该 future 一起 drop (反正子进程已被 kill, 管道无需再读)。
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let (status, exit_code, text) = match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        async {
-            let (exit_status, stdout, stderr) = tokio::join!(
+    let (status, exit_code, text) = tokio::select! {
+        biased;
+        _ = cancel.notified() => {
+            kill_tree(&mut child).await;
+            let _ = child.wait().await;
+            (TaskStatus::Cancelled, None, "Cancelled by TaskStop".to_string())
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+            kill_tree(&mut child).await;
+            let _ = child.wait().await;
+            (TaskStatus::Failed, None, format!("Error: Timeout ({}s)", timeout_secs))
+        }
+        (exit_status, stdout, stderr) = async {
+            tokio::join!(
                 child.wait(),
                 drain_pipe(stdout_pipe),
                 drain_pipe(stderr_pipe),
-            );
-            (exit_status, stdout, stderr)
-        },
-    )
-    .await
-    {
-        Ok((Ok(exit_status), stdout, stderr)) => {
-            let code = exit_status.code();
-            let status = if code == Some(0) {
-                TaskStatus::Completed
-            } else {
-                TaskStatus::Failed
-            };
-            let body = format!("{}\n{}", stdout, stderr).trim().to_string();
-            let body = if body.is_empty() {
-                "(no output)".to_string()
-            } else {
-                truncate_chars(&body, MAX_OUTPUT_BYTES)
-            };
-            (status, code, body)
-        }
-        Ok((Err(e), _, _)) => (
-            TaskStatus::Failed,
-            None,
-            format!("Error: wait failed: {}", e),
-        ),
-        Err(_elapsed) => {
-            kill_tree(&mut child).await;
-            let _ = child.wait().await;
-            (
+            )
+        } => match exit_status {
+            Ok(es) => {
+                let code = es.code();
+                let status = if code == Some(0) {
+                    TaskStatus::Completed
+                } else {
+                    TaskStatus::Failed
+                };
+                let body = format!("{}\n{}", stdout, stderr).trim().to_string();
+                let body = if body.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    truncate_chars(&body, MAX_OUTPUT_BYTES)
+                };
+                (status, code, body)
+            }
+            Err(e) => (
                 TaskStatus::Failed,
                 None,
-                format!("Error: Timeout ({}s)", timeout_secs),
-            )
+                format!("Error: wait failed: {}", e),
+            ),
         }
     };
     let _ = std::fs::write(&output_file, &text);
@@ -470,5 +493,35 @@ mod tests {
         let log = std::fs::read_to_string(dir.path().join(format!("{}.log", id)))
             .unwrap_or_default();
         assert!(log.contains("Timeout"), "log must say Timeout: {}", log);
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_running_task() {
+        let dir = tempdir().unwrap();
+        let mgr = create_test_manager_with_timeout(dir.path(), 60);
+        let cmd = if cfg!(windows) { "ping -n 60 127.0.0.1" } else { "sleep 60" };
+        let id = mgr.start(cmd, "toolu_4").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let msg = mgr.stop(&id);
+        assert!(msg.contains("Stopped"), "stop msg: {}", msg);
+
+        let mut got = Vec::new();
+        for _ in 0..200 {
+            got = mgr.collect();
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("cancelled"), "status must be cancelled: {}", got[0]);
+    }
+
+    #[test]
+    fn stop_unknown_task_is_noop_error() {
+        let dir = tempdir().unwrap();
+        let mgr = create_test_manager(dir.path());
+        let msg = mgr.stop("bg_deadbeef");
+        assert!(msg.contains("not found"), "unknown stop: {}", msg);
     }
 }
