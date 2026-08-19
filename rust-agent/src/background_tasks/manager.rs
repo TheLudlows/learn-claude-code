@@ -147,7 +147,7 @@ impl BackgroundManager {
         match cancel_opt {
             Some(cancel) => {
                 cancel.notify_one();
-                format!("Stopped {}", task_id)
+                format!("[Stopped {}]", task_id)
             }
             None => format!("Error: task {} not found", task_id),
         }
@@ -503,7 +503,7 @@ mod tests {
         let id = mgr.start(cmd, "toolu_4").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let msg = mgr.stop(&id);
-        assert!(msg.contains("Stopped"), "stop msg: {}", msg);
+        assert!(msg.contains(&format!("[Stopped {}]", id)), "stop msg: {}", msg);
 
         let mut got = Vec::new();
         for _ in 0..200 {
@@ -515,6 +515,40 @@ mod tests {
         }
         assert_eq!(got.len(), 1);
         assert!(got[0].contains("cancelled"), "status must be cancelled: {}", got[0]);
+    }
+
+    #[tokio::test]
+    async fn stop_on_finalized_task_returns_already() {
+        // stop 一次 → Cancelled (finalize 把状态置 Cancelled, 但 task 仍在 tasks 里直到 collect)。
+        // 紧接着再 stop 一次, 命中 "already {status}" 分支 (非 Running)。
+        let dir = tempdir().unwrap();
+        let mgr = create_test_manager_with_timeout(dir.path(), 60);
+        let cmd = if cfg!(windows) { "ping -n 60 127.0.0.1" } else { "sleep 60" };
+        let id = mgr.start(cmd, "toolu_5").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let first = mgr.stop(&id);
+        assert!(first.contains("[Stopped"));
+
+        // 等 worker 走完取消臂 + finalize (状态置 Cancelled, 但未 collect 所以仍在 tasks)。
+        // 轮询第二次 stop 直到命中 "already" 分支 (finalize 完成, 状态非 Running)。
+        // 用轮询而非固定 sleep: 并行测试时 CPU 争用会让 finalize 慢于固定 sleep, 造成 flake。
+        // 重复 stop 对 Running 任务只是再 fire notify_one (worker 已离开 select cancel 臂), 无副作用。
+        let mut second = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            second = mgr.stop(&id);
+            if second.contains("already") || std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        assert!(
+            second.contains("already"),
+            "second stop on finalized task should say 'already', got: {}",
+            second
+        );
+        // 清理: collect 掉这个 cancelled task, 不影响其它测试
+        let _ = mgr.collect();
     }
 
     #[test]
