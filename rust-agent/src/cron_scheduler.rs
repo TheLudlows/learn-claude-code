@@ -250,6 +250,103 @@ impl CronManager {
 
         Ok(loaded)
     }
+
+    /// 检查到期任务并入队
+    pub fn poll_due_jobs(&self, moment: &chrono::DateTime<chrono::Local>) {
+        let minute_marker = moment.format("%Y-%m-%d %H:%M").to_string();
+
+        let mut state = self.state.lock().expect("state mutex poisoned");
+        let job_ids: Vec<String> = state.jobs.keys().cloned().collect();
+
+        for id in job_ids {
+            let job_clone = {
+                if let Some(job) = state.jobs.get_mut(&id) {
+                    if job.pending_delivery {
+                        continue;
+                    }
+                    if job.last_fired.as_ref() == Some(&minute_marker) {
+                        continue;
+                    }
+                    if cron_matches(&job.cron, moment) {
+                        job.pending_delivery = true;
+                        job.last_fired = Some(minute_marker.clone());
+                        let job_clone = job.clone();
+                        job_clone
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            };
+
+            state.delivery_queue.push_back(job_clone.clone());
+
+            if job_clone.durable {
+                drop(state);
+                let _ = self.save_durable();
+                state = self.state.lock().expect("state mutex poisoned");
+            }
+
+            println!("  [cron] due {}: {}", job_clone.id, &job_clone.prompt[..job_clone.prompt.len().min(60)]);
+        }
+    }
+
+    /// 消费待交付队列
+    pub fn consume_queue(&self) -> Vec<CronJob> {
+        let mut state = self.state.lock().expect("state mutex poisoned");
+        state.delivery_queue.drain(..).collect()
+    }
+
+    /// 确认任务已交付
+    pub fn acknowledge_jobs(&self, jobs: &[CronJob]) -> Result<(), String> {
+        let mut state = self.state.lock().expect("state mutex poisoned");
+
+        for delivered in jobs {
+            if let Some(current) = state.jobs.get_mut(&delivered.id) {
+                if current.recurring {
+                    current.pending_delivery = false;
+                } else {
+                    state.jobs.remove(&delivered.id);
+                }
+            }
+        }
+
+        if jobs.iter().any(|j| j.durable) {
+            drop(state);
+            self.save_durable()?;
+        }
+
+        Ok(())
+    }
+
+    /// 恢复未交付的任务到队列
+    pub fn restore_jobs(&self, jobs: &[CronJob]) {
+        let mut state = self.state.lock().expect("state mutex poisoned");
+        let queued_ids: std::collections::HashSet<String> =
+            state.delivery_queue.iter().map(|j| j.id.clone()).collect();
+
+        for delivered in jobs {
+            let current_clone = {
+                if let Some(current) = state.jobs.get_mut(&delivered.id) {
+                    current.pending_delivery = true;
+                    current.clone()
+                } else {
+                    continue;
+                }
+            };
+
+            if !queued_ids.contains(&delivered.id) {
+                state.delivery_queue.push_back(current_clone);
+            }
+        }
+    }
+
+    /// 检查是否有待交付任务
+    pub fn has_queue(&self) -> bool {
+        let state = self.state.lock().expect("state mutex poisoned");
+        !state.delivery_queue.is_empty()
+    }
 }
 
 /// 验证完整的 cron 表达式
