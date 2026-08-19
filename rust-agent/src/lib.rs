@@ -8,6 +8,7 @@ pub mod output;
 pub mod skills;
 pub mod subagent;
 pub mod task_system;
+pub mod background_tasks;
 pub mod todo;
 pub mod tools;
 
