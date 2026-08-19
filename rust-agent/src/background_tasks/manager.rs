@@ -54,6 +54,7 @@ impl State {
 pub struct BackgroundManager {
     output_dir: PathBuf,
     state: Arc<Mutex<State>>,
+    timeout_secs: u64,
 }
 
 impl BackgroundManager {
@@ -65,6 +66,7 @@ impl BackgroundManager {
         Self {
             output_dir,
             state: Arc::new(Mutex::new(State::new())),
+            timeout_secs: BG_TIMEOUT_SECS,
         }
     }
 
@@ -171,27 +173,33 @@ async fn run_worker(
             return;
         }
     };
-    let timeout_secs = std::env::var("TEST_BG_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(BG_TIMEOUT_SECS);
-    // child.wait() 借用 &mut child; 超时后 inner future 被 drop, 借用释放, Err 分支可再拿
-    // &mut child 调 kill_tree。
+    let timeout_secs = mgr.timeout_secs;
+    // 先 take 管道: drain future 拥有所有权, 不与 child.wait() 的 &mut child 借用冲突。
+    // 用 tokio::join! 让管道与 wait 并发推进, 避免子进程输出超过管道缓冲 (Windows 低至 4KB)
+    // 时阻塞在 write()、wait 永不返回的死锁。timeout 的 inner future 借 &mut child;
+    // Elapsed 时被 drop, 借用释放, Err 分支可再拿 &mut child 调 kill_tree。
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
     let (status, exit_code, text) = match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        child.wait(),
+        async {
+            let (exit_status, stdout, stderr) = tokio::join!(
+                child.wait(),
+                drain_pipe(stdout_pipe),
+                drain_pipe(stderr_pipe),
+            );
+            (exit_status, stdout, stderr)
+        },
     )
     .await
     {
-        Ok(Ok(exit_status)) => {
+        Ok((Ok(exit_status), stdout, stderr)) => {
             let code = exit_status.code();
             let status = if code == Some(0) {
                 TaskStatus::Completed
             } else {
                 TaskStatus::Failed
             };
-            let stdout = drain_pipe(child.stdout.take()).await;
-            let stderr = drain_pipe(child.stderr.take()).await;
             let body = format!("{}\n{}", stdout, stderr).trim().to_string();
             let body = if body.is_empty() {
                 "(no output)".to_string()
@@ -200,7 +208,7 @@ async fn run_worker(
             };
             (status, code, body)
         }
-        Ok(Err(e)) => (
+        Ok((Err(e), _, _)) => (
             TaskStatus::Failed,
             None,
             format!("Error: wait failed: {}", e),
@@ -344,8 +352,11 @@ pub(crate) fn create_test_manager_with_timeout(
     output_dir: &std::path::Path,
     timeout_secs: u64,
 ) -> BackgroundManager {
-    std::env::set_var("TEST_BG_TIMEOUT_SECS", timeout_secs.to_string());
-    create_test_manager(output_dir)
+    BackgroundManager {
+        output_dir: output_dir.to_path_buf(),
+        state: Arc::new(Mutex::new(State::new())),
+        timeout_secs,
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +470,5 @@ mod tests {
         let log = std::fs::read_to_string(dir.path().join(format!("{}.log", id)))
             .unwrap_or_default();
         assert!(log.contains("Timeout"), "log must say Timeout: {}", log);
-        std::env::remove_var("TEST_BG_TIMEOUT_SECS");
     }
 }
