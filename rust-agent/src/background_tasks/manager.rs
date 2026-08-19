@@ -145,10 +145,11 @@ fn generate_id_locked(state: &State) -> String {
     String::new() // 极低概率; 调用方按错误处理
 }
 
-/// worker: 执行命令, 落盘输出, finalize (更新状态 + 入 ready)。
+/// worker: 执行命令, 落盘输出, finalize。
 ///
-/// 此版本: 直接 await child.output(), 仅区分 completed/failed。
-/// 超时/取消/panic 守卫在后续任务 (Task 4-6) 加。`_cancel` 本任务未用 (Task 5 接线)。
+/// tokio::time::timeout 包裹 child.wait() (借用 &mut child, 非 move): 超时 → kill_tree 杀进程树
+/// + Failed/None + 写 "Error: Timeout (Ns)"。wait_with_output 会 move child, 无法在超时分支
+/// 复用 child 调 kill_tree, 故改用 wait() + 独立 drain_pipe 读管道。(取消臂在 Task 5 加。)
 #[allow(unused_variables)]
 async fn run_worker(
     mgr: BackgroundManager,
@@ -159,33 +160,77 @@ async fn run_worker(
 ) {
     let mut cmd = build_command(&command);
     cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let (status, exit_code, text) = match cmd.output().await {
-        Ok(output) => {
-            let stdout = crate::tools::command::decode_console(&output.stdout);
-            let stderr = crate::tools::command::decode_console(&output.stderr);
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let text = format!("Error: spawn failed: {}", e);
+            let _ = std::fs::write(&output_file, &text);
+            finalize(&mgr, &id, TaskStatus::Failed, None);
+            return;
+        }
+    };
+    let timeout_secs = std::env::var("TEST_BG_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(BG_TIMEOUT_SECS);
+    // child.wait() 借用 &mut child; 超时后 inner future 被 drop, 借用释放, Err 分支可再拿
+    // &mut child 调 kill_tree。
+    let (status, exit_code, text) = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(exit_status)) => {
+            let code = exit_status.code();
+            let status = if code == Some(0) {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Failed
+            };
+            let stdout = drain_pipe(child.stdout.take()).await;
+            let stderr = drain_pipe(child.stderr.take()).await;
             let body = format!("{}\n{}", stdout, stderr).trim().to_string();
             let body = if body.is_empty() {
                 "(no output)".to_string()
             } else {
                 truncate_chars(&body, MAX_OUTPUT_BYTES)
             };
-            let code = output.status.code();
-            let status = if code == Some(0) {
-                TaskStatus::Completed
-            } else {
-                TaskStatus::Failed
-            };
             (status, code, body)
         }
-        Err(e) => (
+        Ok(Err(e)) => (
             TaskStatus::Failed,
             None,
-            format!("Error: spawn failed: {}", e),
+            format!("Error: wait failed: {}", e),
         ),
+        Err(_elapsed) => {
+            kill_tree(&mut child).await;
+            let _ = child.wait().await;
+            (
+                TaskStatus::Failed,
+                None,
+                format!("Error: Timeout ({}s)", timeout_secs),
+            )
+        }
     };
     let _ = std::fs::write(&output_file, &text);
     finalize(&mgr, &id, status, exit_code);
+}
+
+/// 读取子进程管道 (stdout/stderr) 全部内容并解码。wait 完成后调用:
+/// 子进程已退出, 管道写端关闭, read_to_end 返回 EOF。
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> String {
+    use tokio::io::AsyncReadExt;
+    match pipe {
+        Some(mut p) => {
+            let mut buf = Vec::new();
+            let _ = p.read_to_end(&mut buf).await;
+            crate::tools::command::decode_console(&buf)
+        }
+        None => String::new(),
+    }
 }
 
 /// 落库: 更新 task 字段并入 ready 队列; 移除 cancel 信号。
@@ -199,20 +244,54 @@ fn finalize(mgr: &BackgroundManager, id: &str, status: TaskStatus, exit_code: Op
     state.cancels.remove(id);
 }
 
-/// 构造跨平台命令 (复用 command.rs 的 cmd.exe/bash 分流)。
-/// 进程组/creation_flags 在 Task 4 加 (供 kill_tree)。
+/// 构造跨平台命令。设置新进程组/CREATE_NEW_PROCESS_GROUP, 供 kill_tree 杀整棵进程树。
 fn build_command(command: &str) -> tokio::process::Command {
-    if cfg!(windows) {
+    let mut c = if cfg!(windows) {
         let mut c = tokio::process::Command::new("cmd.exe");
         c.args(["/C", command]);
-        c.current_dir(crate::tools::workdir());
         c
     } else {
         let mut c = tokio::process::Command::new("bash");
         c.arg("-c").arg(command);
-        c.current_dir(crate::tools::workdir());
         c
+    };
+    c.current_dir(crate::tools::workdir());
+
+    // 新进程组: Unix process_group(0) 让 PGID = child PID; Windows CREATE_NEW_PROCESS_GROUP。
+    // kill_tree 据此杀整组/整棵树。tokio::process::Command 自带这两个 inherent 方法。
+    #[cfg(unix)]
+    {
+        c.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        // CREATE_NEW_PROCESS_GROUP = 0x00000200
+        c.creation_flags(0x00000200);
+    }
+    c
+}
+
+/// 杀整棵进程树 (零依赖, shell-out)。
+///
+/// - Unix: `kill -KILL -{pgid}` (负 PID = 进程组; child 经 process_group(0) 自成一组)。
+/// - Windows: `taskkill /T /F /PID {pid}` (`/T` 终止整棵子树)。
+/// 最后兜底 child.kill() (直接子进程)。
+async fn kill_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let mut kill_cmd = if cfg!(windows) {
+            let mut c = tokio::process::Command::new("taskkill");
+            c.args(["/T", "/F", "/PID", &pid.to_string()]);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("kill");
+            c.args(["-KILL", &format!("-{}", pid)]);
+            c
+        };
+        kill_cmd.stdout(std::process::Stdio::null());
+        kill_cmd.stderr(std::process::Stdio::null());
+        let _ = kill_cmd.output().await;
+    }
+    let _ = child.kill().await;
 }
 
 /// 按字节上限截断, 落在 UTF-8 字符边界上 (与 command.rs 同逻辑)。
@@ -258,6 +337,15 @@ fn status_word(status: TaskStatus) -> String {
 #[cfg(test)]
 pub(crate) fn create_test_manager(output_dir: &std::path::Path) -> BackgroundManager {
     BackgroundManager::new(output_dir.to_path_buf())
+}
+
+#[cfg(test)]
+pub(crate) fn create_test_manager_with_timeout(
+    output_dir: &std::path::Path,
+    timeout_secs: u64,
+) -> BackgroundManager {
+    std::env::set_var("TEST_BG_TIMEOUT_SECS", timeout_secs.to_string());
+    create_test_manager(output_dir)
 }
 
 #[cfg(test)]
@@ -347,5 +435,30 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(got[0].contains("failed"), "got: {}", got[0]);
         assert!(got[0].contains("7"), "exit code in notification: {}", got[0]);
+    }
+
+    #[tokio::test]
+    async fn timeout_yields_failed_with_consistent_text() {
+        // 回归 s11 bug: 超时 exit_code=None, 状态必须 Failed 且文本写明 Timeout。
+        let dir = tempdir().unwrap();
+        let mgr = create_test_manager_with_timeout(dir.path(), 1);
+        let cmd = if cfg!(windows) { "ping -n 120 127.0.0.1" } else { "sleep 120" };
+        let id = mgr.start(cmd, "toolu_3").unwrap();
+        let mut got = Vec::new();
+        for _ in 0..400 {
+            got = mgr.collect();
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(got.len(), 1, "should have completed via timeout");
+        let n = &got[0];
+        assert!(n.contains("failed"), "status must be failed: {}", n);
+        assert!(n.contains("none"), "exit_code must be none: {}", n);
+        let log = std::fs::read_to_string(dir.path().join(format!("{}.log", id)))
+            .unwrap_or_default();
+        assert!(log.contains("Timeout"), "log must say Timeout: {}", log);
+        std::env::remove_var("TEST_BG_TIMEOUT_SECS");
     }
 }
