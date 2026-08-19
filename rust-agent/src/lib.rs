@@ -2,6 +2,7 @@ pub mod background_tasks;
 pub mod builtins;
 pub mod client;
 pub mod compact;
+pub mod cron_scheduler;
 pub mod error;
 pub mod hooks;
 pub mod memory;
