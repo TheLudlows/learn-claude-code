@@ -184,9 +184,71 @@ impl CronManager {
         state.jobs.values().cloned().collect()
     }
 
-    // Stub for save_durable - will be implemented in Task 6
+    /// 保存 durable 任务到磁盘
     fn save_durable(&self) -> Result<(), String> {
+        let state = self.state.lock().expect("state mutex poisoned");
+        let payload: Vec<CronJob> = state.jobs.values()
+            .filter(|j| j.durable)
+            .cloned()
+            .collect();
+        drop(state);
+
+        let json = serde_json::to_string_pretty(&payload)
+            .map_err(|e| format!("Failed to serialize: {}", e))?;
+
+        let file_path = self.workdir.join(Self::DURABLE_FILE);
+        let temp_path = file_path.with_extension(format!("tmp.{}", std::process::id()));
+
+        std::fs::write(&temp_path, json)
+            .map_err(|e| format!("Failed to write temp file: {}", e))?;
+
+        std::fs::rename(&temp_path, &file_path)
+            .map_err(|e| format!("Failed to rename temp file: {}", e))?;
+
         Ok(())
+    }
+
+    /// 从磁盘加载 durable 任务
+    pub fn load_durable(&self) -> Result<usize, String> {
+        let file_path = self.workdir.join(Self::DURABLE_FILE);
+        if !file_path.exists() {
+            return Ok(0);
+        }
+
+        let content = std::fs::read_to_string(&file_path)
+            .map_err(|e| format!("Failed to read: {}", e))?;
+
+        let payload: Vec<CronJob> = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse: {}", e))?;
+
+        let mut loaded = 0;
+        let mut state = self.state.lock().expect("state mutex poisoned");
+        for job in payload {
+            if let Err(e) = validate_cron(&job.cron) {
+                eprintln!("  [cron] skipped invalid saved job: {}", e);
+                continue;
+            }
+            if !job.id.starts_with("cron_") {
+                eprintln!("  [cron] skipped invalid job ID: {}", job.id);
+                continue;
+            }
+            if job.prompt.trim().is_empty() {
+                eprintln!("  [cron] skipped job with empty prompt: {}", job.id);
+                continue;
+            }
+
+            state.jobs.insert(job.id.clone(), job.clone());
+            if job.pending_delivery {
+                state.delivery_queue.push_back(job);
+            }
+            loaded += 1;
+        }
+
+        if loaded > 0 {
+            println!("  [cron] loaded {} durable job(s)", loaded);
+        }
+
+        Ok(loaded)
     }
 }
 
