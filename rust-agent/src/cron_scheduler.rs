@@ -5,13 +5,12 @@ cron_scheduler.rs - Cron Scheduler (s12)
 */
 
 use crate::client::{ContentBlock, Message};
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Notify;
 
 /// Cron 任务
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -683,5 +682,254 @@ impl Tool for CancelCronTool {
 
     fn available_for_subagent(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use chrono::TimeZone;
+
+    #[test]
+    fn validate_cron_all_wildcards() {
+        assert!(validate_cron("* * * * *").is_ok());
+    }
+
+    #[test]
+    fn validate_cron_specific_time() {
+        assert!(validate_cron("0 9 * * *").is_ok());
+    }
+
+    #[test]
+    fn validate_cron_step() {
+        assert!(validate_cron("*/5 * * * *").is_ok());
+    }
+
+    #[test]
+    fn validate_cron_range() {
+        assert!(validate_cron("0 9-17 * * 1-5").is_ok());
+    }
+
+    #[test]
+    fn validate_cron_list() {
+        assert!(validate_cron("0,15,30,45 * * * *").is_ok());
+    }
+
+    #[test]
+    fn validate_cron_invalid_field_count() {
+        assert!(validate_cron("* * * *").is_err());
+    }
+
+    #[test]
+    fn validate_cron_invalid_range() {
+        assert!(validate_cron("60 * * * *").is_err()); // minute max is 59
+    }
+
+    #[test]
+    fn validate_cron_invalid_step() {
+        assert!(validate_cron("*/0 * * * *").is_err()); // step must be > 0
+    }
+
+    #[test]
+    fn cron_field_matches_wildcard() {
+        assert!(cron_field_matches("*", 30));
+    }
+
+    #[test]
+    fn cron_field_matches_exact() {
+        assert!(cron_field_matches("30", 30));
+        assert!(!cron_field_matches("30", 31));
+    }
+
+    #[test]
+    fn cron_field_matches_step() {
+        assert!(cron_field_matches("*/5", 30)); // 30 % 5 == 0
+        assert!(!cron_field_matches("*/5", 31));
+    }
+
+    #[test]
+    fn cron_field_matches_range() {
+        assert!(cron_field_matches("9-17", 12));
+        assert!(!cron_field_matches("9-17", 8));
+        assert!(!cron_field_matches("9-17", 18));
+    }
+
+    #[test]
+    fn cron_field_matches_list() {
+        assert!(cron_field_matches("0,15,30,45", 30));
+        assert!(!cron_field_matches("0,15,30,45", 10));
+    }
+
+    #[test]
+    fn cron_matches_daily() {
+        let time = Local.with_ymd_and_hms(2026, 8, 19, 9, 0, 0).unwrap();
+        assert!(cron_matches("0 9 * * *", &time));
+        assert!(!cron_matches("0 10 * * *", &time));
+    }
+
+    #[test]
+    fn cron_matches_weekday() {
+        // Monday
+        let time = Local.with_ymd_and_hms(2026, 8, 17, 9, 0, 0).unwrap();
+        assert!(cron_matches("0 9 * * 1", &time)); // 1=Monday in cron
+        assert!(!cron_matches("0 9 * * 6", &time)); // 6=Saturday in cron
+    }
+
+    #[test]
+    fn cron_matches_day_or_weekday() {
+        // 2026-08-17 is a Monday
+        let time = Local.with_ymd_and_hms(2026, 8, 17, 9, 0, 0).unwrap();
+
+        // Day match only
+        assert!(cron_matches("0 9 17 * *", &time));
+
+        // Weekday match only
+        assert!(cron_matches("0 9 * * 1", &time));
+
+        // Neither match
+        assert!(!cron_matches("0 9 18 * *", &time));
+        assert!(!cron_matches("0 9 * * 2", &time));
+    }
+
+    #[test]
+    fn schedule_and_list() {
+        let dir = tempdir().unwrap();
+        let manager = CronManager::new(dir.path().to_path_buf());
+
+        let job = manager.schedule("0 9 * * *", "run tests", true, false).unwrap();
+        assert!(job.id.starts_with("cron_"));
+        assert_eq!(job.cron, "0 9 * * *");
+        assert_eq!(job.prompt, "run tests");
+
+        let jobs = manager.list();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job.id);
+    }
+
+    #[test]
+    fn schedule_invalid_cron() {
+        let dir = tempdir().unwrap();
+        let manager = CronManager::new(dir.path().to_path_buf());
+
+        assert!(manager.schedule("* * *", "test", true, false).is_err());
+    }
+
+    #[test]
+    fn schedule_empty_prompt() {
+        let dir = tempdir().unwrap();
+        let manager = CronManager::new(dir.path().to_path_buf());
+
+        assert!(manager.schedule("0 9 * * *", "", true, false).is_err());
+    }
+
+    #[test]
+    fn cancel_existing_job() {
+        let dir = tempdir().unwrap();
+        let manager = CronManager::new(dir.path().to_path_buf());
+
+        let job = manager.schedule("0 9 * * *", "run tests", true, false).unwrap();
+        let result = manager.cancel(&job.id);
+        assert!(result.is_ok());
+
+        let jobs = manager.list();
+        assert_eq!(jobs.len(), 0);
+    }
+
+    #[test]
+    fn cancel_nonexistent_job() {
+        let dir = tempdir().unwrap();
+        let manager = CronManager::new(dir.path().to_path_buf());
+
+        let result = manager.cancel("cron_deadbeef");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn save_and_load_durable() {
+        let dir = tempdir().unwrap();
+        let manager1 = CronManager::new(dir.path().to_path_buf());
+
+        let job = manager1.schedule("0 9 * * *", "run tests", true, true).unwrap();
+
+        let jobs = manager1.list();
+        assert_eq!(jobs.len(), 1);
+
+        drop(manager1);
+
+        let manager2 = CronManager::new(dir.path().to_path_buf());
+        let loaded = manager2.load_durable().unwrap();
+        assert_eq!(loaded, 1);
+
+        let jobs = manager2.list();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job.id);
+        assert_eq!(jobs[0].cron, job.cron);
+    }
+
+    #[test]
+    fn consume_queue() {
+        let dir = tempdir().unwrap();
+        let manager = CronManager::new(dir.path().to_path_buf());
+
+        let job = manager.schedule("0 9 * * *", "run tests", true, false).unwrap();
+
+        // 手动入队（测试可访问私有字段）
+        {
+            let mut state = manager.state.lock().expect("state mutex poisoned");
+            state.delivery_queue.push_back(job.clone());
+        }
+
+        let jobs = manager.consume_queue();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job.id);
+
+        // 队列已清空
+        let jobs = manager.consume_queue();
+        assert_eq!(jobs.len(), 0);
+    }
+
+    #[test]
+    fn acknowledge_recurring_job() {
+        let dir = tempdir().unwrap();
+        let manager = CronManager::new(dir.path().to_path_buf());
+
+        let job = manager.schedule("0 9 * * *", "run tests", true, false).unwrap();
+
+        // 标记为待交付（测试可访问私有字段）
+        {
+            let mut state = manager.state.lock().expect("state mutex poisoned");
+            if let Some(j) = state.jobs.get_mut(&job.id) {
+                j.pending_delivery = true;
+            }
+        }
+
+        manager.acknowledge_jobs(&[job]).unwrap();
+
+        let jobs = manager.list();
+        assert_eq!(jobs.len(), 1);
+        assert!(!jobs[0].pending_delivery);
+    }
+
+    #[test]
+    fn acknowledge_oneshot_job() {
+        let dir = tempdir().unwrap();
+        let manager = CronManager::new(dir.path().to_path_buf());
+
+        let job = manager.schedule("0 9 * * *", "run tests", false, false).unwrap();
+
+        // 标记为待交付（测试可访问私有字段）
+        {
+            let mut state = manager.state.lock().expect("state mutex poisoned");
+            if let Some(j) = state.jobs.get_mut(&job.id) {
+                j.pending_delivery = true;
+            }
+        }
+
+        manager.acknowledge_jobs(&[job]).unwrap();
+
+        let jobs = manager.list();
+        assert_eq!(jobs.len(), 0); // one-shot 任务被移除
     }
 }
