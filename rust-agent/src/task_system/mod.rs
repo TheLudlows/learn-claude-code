@@ -16,3 +16,4 @@ pub use store::{TaskStore, TaskStoreError};
 pub use tools::init_task_store;
 pub use tools::CreateTaskTool;
 pub use tools::ListTasksTool;
+pub use tools::GetTaskTool;

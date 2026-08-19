@@ -181,6 +181,50 @@ impl Tool for ListTasksTool {
     }
 }
 
+pub struct GetTaskTool;
+
+#[async_trait]
+impl Tool for GetTaskTool {
+    fn name(&self) -> &str {
+        "get_task"
+    }
+
+    fn description(&self) -> &str {
+        "Get a task by ID, returning full task details"
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The task ID to retrieve"
+                }
+            },
+            "required": ["task_id"]
+        })
+    }
+
+    fn check_permission(&self, _input: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+
+    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+        let task_id = input
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let store = get_store();
+        match store.load(task_id) {
+            Ok(task) => serde_json::to_string_pretty(&task)
+                .unwrap_or_else(|_| "Error: serialization failed".to_string()),
+            Err(e) => error_to_output(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tool_tests {
     use super::*;
@@ -228,5 +272,15 @@ mod tool_tests {
         let tool = ListTasksTool;
         let check = tool.check_permission(&json!({}));
         assert!(matches!(check, PermissionCheck::Pass));
+    }
+
+    #[test]
+    fn test_get_tool_name_and_schema() {
+        let tool = GetTaskTool;
+        assert_eq!(tool.name(), "get_task");
+        assert_eq!(
+            tool.input_schema()["required"].as_array().unwrap()[0],
+            "task_id"
+        );
     }
 }
