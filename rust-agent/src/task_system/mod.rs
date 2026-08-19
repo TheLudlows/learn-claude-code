@@ -17,3 +17,5 @@ pub use tools::init_task_store;
 pub use tools::CreateTaskTool;
 pub use tools::ListTasksTool;
 pub use tools::GetTaskTool;
+pub use tools::ClaimTaskTool;
+pub use tools::claim_task;

@@ -44,6 +44,15 @@ fn error_to_output(e: TaskStoreError) -> String {
     format!("Error: {}", e)
 }
 
+/// 把状态序列化成裸单词（`in_progress`），剥除 JSON 的引号，
+/// 便于拼进面向用户的消息（如 `Task x is in_progress, cannot claim`）。
+fn status_word(status: TaskStatus) -> String {
+    serde_json::to_string(&status)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
 /// 返回任务尚未满足的依赖列表。
 ///
 /// 依赖任务不存在或状态非 `Completed` 都算未完成。
@@ -64,6 +73,41 @@ fn incomplete_dependencies(store: &TaskStore, task: &Task) -> Vec<String> {
         }
     }
     incomplete
+}
+
+/// 认领任务：把 Pending 任务置为 InProgress 并登记 owner。
+///
+/// 非 Pending 或依赖未完成时返回拒绝信息，不修改存储。
+pub fn claim_task(store: &TaskStore, task_id: &str, owner: &str) -> String {
+    match store.load(task_id) {
+        Ok(mut task) => {
+            // 检查状态
+            if task.status != TaskStatus::Pending {
+                return format!(
+                    "Task {} is {}, cannot claim",
+                    task_id,
+                    status_word(task.status)
+                );
+            }
+
+            // 检查依赖
+            let incomplete = incomplete_dependencies(store, &task);
+            if !incomplete.is_empty() {
+                return format!("Blocked by: {:?}", incomplete);
+            }
+
+            // 认领任务
+            task.status = TaskStatus::InProgress;
+            task.owner = Some(owner.to_string());
+
+            if let Err(e) = store.save(&task) {
+                return error_to_output(e);
+            }
+
+            format!("Claimed {} ({})", task.id, task.subject)
+        }
+        Err(e) => error_to_output(e),
+    }
 }
 
 pub struct CreateTaskTool;
@@ -247,6 +291,46 @@ impl Tool for GetTaskTool {
     }
 }
 
+pub struct ClaimTaskTool;
+
+#[async_trait]
+impl Tool for ClaimTaskTool {
+    fn name(&self) -> &str {
+        "claim_task"
+    }
+
+    fn description(&self) -> &str {
+        "Claim a pending task whose dependencies are complete. Sets owner and status to in_progress"
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The task ID to claim"
+                }
+            },
+            "required": ["task_id"]
+        })
+    }
+
+    fn check_permission(&self, _input: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+
+    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+        let task_id = input
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let store = get_store();
+        claim_task(&store, task_id, "agent")
+    }
+}
+
 #[cfg(test)]
 mod tool_tests {
     use super::*;
@@ -390,5 +474,44 @@ mod tool_tests {
         let incomplete = incomplete_dependencies(&store, &task);
         assert_eq!(incomplete.len(), 1);
         assert_eq!(incomplete[0], "task_missing");
+    }
+
+    #[test]
+    fn test_claim_tool_name_and_schema() {
+        let tool = ClaimTaskTool;
+        assert_eq!(tool.name(), "claim_task");
+        assert_eq!(
+            tool.input_schema()["required"].as_array().unwrap()[0],
+            "task_id"
+        );
+    }
+
+    #[test]
+    fn test_claim_blocks_in_progress() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+        let mut task = store
+            .create("Test".to_string(), "".to_string(), vec![])
+            .unwrap();
+        task.status = TaskStatus::InProgress;
+        store.save(&task).unwrap();
+
+        let result = claim_task(&store, &task.id, "agent");
+        assert!(result.contains("is in_progress"));
+    }
+
+    #[test]
+    fn test_claim_blocks_on_dependencies() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+        let dep = store
+            .create("Dependency".to_string(), "".to_string(), vec![])
+            .unwrap();
+        let task = store
+            .create("Test".to_string(), "".to_string(), vec![dep.id])
+            .unwrap();
+
+        let result = claim_task(&store, &task.id, "agent");
+        assert!(result.contains("Blocked by"));
     }
 }
