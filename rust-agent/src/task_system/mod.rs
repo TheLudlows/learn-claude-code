@@ -21,3 +21,6 @@ pub use tools::ClaimTaskTool;
 pub use tools::CompleteTaskTool;
 pub use tools::claim_task;
 pub use tools::complete_task;
+
+#[cfg(feature = "testing")]
+pub use tools::{clear_store_for_test, set_store_for_test};

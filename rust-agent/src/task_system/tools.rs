@@ -16,6 +16,15 @@ use std::sync::Arc;
 /// 全局任务存储（Arc 共享，OnceLock 保证只初始化一次）
 static TASK_STORE: std::sync::OnceLock<Arc<TaskStore>> = std::sync::OnceLock::new();
 
+/// 测试专用全局存储覆盖（feature `testing`）。
+///
+/// `get_store` 优先返回此项；为 `None` 时回退到 `OnceLock` 中的生产存储。
+/// 这样集成测试可为每个用例注入独立的临时存储，避免 `OnceLock` 的
+/// “首次调用即固化”导致的跨用例污染，也无需改动 `current_dir`。
+#[cfg(feature = "testing")]
+static TEST_STORE: std::sync::Mutex<Option<Arc<TaskStore>>> =
+    std::sync::Mutex::new(None);
+
 /// 初始化全局任务存储。
 ///
 /// 在工作目录下建立 `.tasks/` 目录。使用 OnceLock，因此多次调用幂等：
@@ -32,11 +41,28 @@ pub fn init_task_store() -> Result<(), TaskStoreError> {
 /// 获取全局任务存储的句柄。
 ///
 /// 调用前必须先调用 `init_task_store`，否则 panic。
+/// 启用 `testing` feature 时，优先返回 `TEST_STORE` 覆盖项。
 fn get_store() -> Arc<TaskStore> {
+    #[cfg(feature = "testing")]
+    if let Some(s) = TEST_STORE.lock().unwrap().clone() {
+        return s;
+    }
     TASK_STORE
         .get()
         .expect("TaskStore not initialized. Call init_task_store() first.")
         .clone()
+}
+
+/// 测试专用：注入全局存储覆盖项（feature `testing`）。
+#[cfg(feature = "testing")]
+pub fn set_store_for_test(store: TaskStore) {
+    *TEST_STORE.lock().unwrap() = Some(Arc::new(store));
+}
+
+/// 测试专用：清除全局存储覆盖项（feature `testing`）。
+#[cfg(feature = "testing")]
+pub fn clear_store_for_test() {
+    *TEST_STORE.lock().unwrap() = None;
 }
 
 /// 把 TaskStoreError 转成工具输出字符串。
