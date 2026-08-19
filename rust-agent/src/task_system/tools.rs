@@ -7,6 +7,7 @@ shared state, initialized once at startup via init_task_store().
 */
 
 use crate::task_system::store::{TaskStore, TaskStoreError};
+use crate::task_system::task::{Task, TaskStatus};
 use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -115,6 +116,71 @@ impl Tool for CreateTaskTool {
     }
 }
 
+pub struct ListTasksTool;
+
+#[async_trait]
+impl Tool for ListTasksTool {
+    fn name(&self) -> &str {
+        "list_tasks"
+    }
+
+    fn description(&self) -> &str {
+        "List all tasks with their status, owner, and dependencies"
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    fn check_permission(&self, _input: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+
+    async fn execute(&self, _ctx: &ToolContext<'_>, _input: &Value) -> String {
+        let store = get_store();
+        match store.list() {
+            Ok(tasks) => {
+                if tasks.is_empty() {
+                    return "No tasks. Use create_task to add some.".to_string();
+                }
+
+                let mut lines = Vec::new();
+                for task in tasks {
+                    let marker = match task.status {
+                        TaskStatus::Pending => "[ ]",
+                        TaskStatus::InProgress => "[>]",
+                        TaskStatus::Completed => "[x]",
+                    };
+                    let deps_str = if task.blocked_by.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (blockedBy: {})", task.blocked_by.join(", "))
+                    };
+                    let owner_str = task
+                        .owner
+                        .as_ref()
+                        .map_or(String::new(), |o| format!(" [{}]", o));
+
+                    lines.push(format!(
+                        "{} {}: {} [{}]{}{}",
+                        marker,
+                        task.id,
+                        task.subject,
+                        serde_json::to_string(&task.status).unwrap(),
+                        owner_str,
+                        deps_str
+                    ));
+                }
+                lines.join("\n")
+            }
+            Err(e) => error_to_output(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tool_tests {
     use super::*;
@@ -147,6 +213,20 @@ mod tool_tests {
         let tool = CreateTaskTool;
         let input = json!({"subject": "test"});
         let check = tool.check_permission(&input);
+        assert!(matches!(check, PermissionCheck::Pass));
+    }
+
+    #[test]
+    fn test_list_tool_name_and_schema() {
+        let tool = ListTasksTool;
+        assert_eq!(tool.name(), "list_tasks");
+        assert_eq!(tool.input_schema()["type"], "object");
+    }
+
+    #[test]
+    fn test_list_tool_passes_permission() {
+        let tool = ListTasksTool;
+        let check = tool.check_permission(&json!({}));
         assert!(matches!(check, PermissionCheck::Pass));
     }
 }
