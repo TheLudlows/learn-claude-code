@@ -46,6 +46,7 @@ use rust_agent::memory::{build_system, MemoryStore};
 use rust_agent::builtins::{ContextInjectHook, LargeOutputHook, PermissionHook, SummaryHook, TodoReminderHook};
 use rust_agent::hooks::{assemble_post_tool_messages, Hooks};
 use rust_agent::tools::{workdir, ToolContext, ToolRegistry, ToolResult};
+use rust_agent::cron_scheduler::{init_manager, start_runtime, get_manager, acknowledge_jobs, restore_jobs};
 use dotenv::dotenv;
 use std::env;
 use std::io;
@@ -118,6 +119,24 @@ async fn agent_loop(
         // s11: 循环顶部收集已完成后台任务通知 (被动兜底)
         let _ = rust_agent::background_tasks::collect_and_inject(messages);
 
+        // s12: 循环顶部收集待交付的定时任务
+        let scheduled_start = messages.len();
+        let scheduled_jobs = get_manager().map(|mgr| mgr.consume_queue());
+        let mut waiting_for_ack: Vec<rust_agent::cron_scheduler::CronJob> = Vec::new();
+
+        if let Some(jobs) = scheduled_jobs {
+            for job in &jobs {
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: format!("[Scheduled] {}", job.prompt),
+                    }],
+                });
+                println!("  [cron] delivered {}: {}", job.id, &job.prompt[..job.prompt.len().min(60)]);
+            }
+            waiting_for_ack = jobs;
+        }
+
         // s08: 每次调用模型前运行压缩管线
         compactor
             .prepare(client, messages, active_request)
@@ -142,6 +161,12 @@ async fn agent_loop(
             }
             // prompt_too_long 耗尽重试 或 其他错误：直接返回
             CallResult::PromptTooLong(e) | CallResult::Failure(e) => {
+                // s12: 模型调用失败时恢复定时任务
+                if !waiting_for_ack.is_empty() {
+                    // 移除已注入的消息
+                    messages.truncate(scheduled_start);
+                    restore_jobs(&waiting_for_ack);
+                }
                 return Err(e);
             }
         };
@@ -157,6 +182,14 @@ async fn agent_loop(
             role: "assistant".to_string(),
             content: response.content.clone(),
         });
+
+        // s12: 模型调用成功后确认定时任务
+        if !waiting_for_ack.is_empty() {
+            if let Err(e) = acknowledge_jobs(&waiting_for_ack) {
+                println!("  [cron] acknowledgement failed: {}", e);
+            }
+            waiting_for_ack.clear();
+        }
 
         // 检查是否需要调用工具
         if response.stop_reason != "tool_use" {
@@ -282,6 +315,11 @@ async fn main() -> Result<(), AgentError> {
     // 初始化 TodoManager 并设置全局实例
     let todo_manager = rust_agent::todo::TodoManager::new();
     rust_agent::todo::set_instance(todo_manager);
+
+    // s12: 初始化 CronManager 并启动运行时
+    let cron_manager = init_manager(PathBuf::from(&cwd));
+    start_runtime().await;
+    let _ = cron_manager; // 抑制 unused 警告
 
     loop {
         rust_agent::output::prompt();
