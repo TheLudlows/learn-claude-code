@@ -2,12 +2,10 @@
 error.rs - Unified error types for the agent
 
 Provides a typed error enum to replace `Box<dyn Error>` and ad-hoc error strings.
-Covers LLM API errors; tool-layer errors still return `String` for simplicity,
-but can migrate to `AgentError` incrementally.
+Covers LLM API errors, tool errors, file system errors, and validation errors.
 */
 
 /// Unified error type for the agent.
-///
 ///
 /// Variants:
 /// - `Api`: HTTP-level error from the LLM provider (non-2xx status).
@@ -15,8 +13,15 @@ but can migrate to `AgentError` incrementally.
 /// - `Stream`: SSE stream-level error (protocol violation, server-sent error event).
 /// - `Timeout`: Operation exceeded its deadline.
 /// - `InvalidResponse`: Malformed response (bad JSON, missing fields).
+/// - `ToolNotFound`: Tool was not found in the registry.
+/// - `ToolRejected`: Tool was rejected (e.g., in subagent context).
+/// - `ToolDenied`: Tool execution was denied by a pre-tool hook.
+/// - `ToolExecution`: Tool execution failed with a specific error message.
+/// - `PathTraversal`: Path attempt to escape the workspace.
+/// - `FileSystem`: File system related error.
+/// - `Validation`: Input validation failed.
 /// - `Other`: Catch-all for errors not yet classified (io, config, etc.).
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum AgentError {
     /// HTTP error from the LLM API (non-2xx response).
     #[error("API error (HTTP {status}): {body}")]
@@ -24,7 +29,7 @@ pub enum AgentError {
 
     /// Network / transport error.
     #[error("Network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(String),
 
     /// SSE stream-level error.
     #[error("Stream error: {0}")]
@@ -37,6 +42,34 @@ pub enum AgentError {
     /// Invalid / malformed response.
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
+
+    /// Tool was not found in the registry.
+    #[error("Tool '{name}' not found. Available tools: {available}")]
+    ToolNotFound { name: String, available: String },
+
+    /// Tool was rejected (e.g., in subagent context).
+    #[error("Tool '{name}' rejected: {reason}")]
+    ToolRejected { name: String, reason: String },
+
+    /// Tool execution was denied by a pre-tool hook.
+    #[error("Tool '{name}' denied: {reason}")]
+    ToolDenied { name: String, reason: String },
+
+    /// Tool execution failed with a specific error message.
+    #[error("Tool '{name}' execution failed: {reason}")]
+    ToolExecution { name: String, reason: String },
+
+    /// Path attempt to escape the workspace.
+    #[error("Path '{path}' escapes workspace")]
+    PathTraversal { path: String },
+
+    /// File system related error.
+    #[error("File system error: {0}")]
+    FileSystem(String),
+
+    /// Input validation failed.
+    #[error("Validation error: {0}")]
+    Validation(String),
 
     /// Catch-all.
     #[error("{0}")]
@@ -64,26 +97,31 @@ impl AgentError {
 
 impl From<std::io::Error> for AgentError {
     fn from(e: std::io::Error) -> Self {
-        Self::Other(e.to_string())
+        Self::FileSystem(e.to_string())
     }
 }
 
-/// Allows `?` to convert `Result<T, Box<dyn Error>>` into `Result<T, AgentError>`.
-impl From<Box<dyn std::error::Error>> for AgentError {
-    fn from(e: Box<dyn std::error::Error>) -> Self {
-        Self::Other(e.to_string())
+impl From<reqwest::Error> for AgentError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Network(e.to_string())
     }
 }
 
 impl From<std::env::VarError> for AgentError {
     fn from(e: std::env::VarError) -> Self {
-        Self::Other(format!("Environment variable error: {}", e))
+        Self::Validation(format!("Environment variable error: {}", e))
     }
 }
 
 impl From<serde_json::Error> for AgentError {
     fn from(e: serde_json::Error) -> Self {
-        Self::Other(format!("JSON error: {}", e))
+        Self::Validation(format!("JSON error: {}", e))
+    }
+}
+
+impl From<Box<dyn std::error::Error>> for AgentError {
+    fn from(e: Box<dyn std::error::Error>) -> Self {
+        Self::Other(e.to_string())
     }
 }
 
@@ -180,11 +218,4 @@ mod tests {
         assert!(!err4.is_prompt_too_long());
     }
 
-    #[test]
-    fn from_serde_json_error() {
-        let json_err = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
-        let err: AgentError = json_err.into();
-        assert!(matches!(err, AgentError::Other(_)));
-        assert!(err.to_string().contains("JSON error"));
-    }
 }

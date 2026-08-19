@@ -56,8 +56,8 @@ impl ToolRegistry {
     ///
     /// # Returns
     /// * `ToolResult::Output(result)` - 工具执行成功
-    /// * `ToolResult::Rejected(reason)` - 子 agent 上下文调用受限工具
-    /// * `ToolResult::NotFound(reason)` - 工具未注册
+    /// * `ToolResult::Rejected` - 子 agent 上下文调用受限工具
+    /// * `ToolResult::NotFound` - 工具未注册
     pub async fn dispatch(
         &self,
         name: &str,
@@ -68,15 +68,21 @@ impl ToolRegistry {
         match self.tools.get(name) {
             Some(tool) => {
                 if for_subagent && !tool.available_for_subagent() {
-                    ToolResult::Rejected(format!(
-                        "Error: Tool '{}' is not available in subagent context",
-                        name
-                    ))
+                    ToolResult::Rejected {
+                        name: name.to_string(),
+                        reason: "Tool is not available in subagent context".to_string(),
+                    }
                 } else {
                     ToolResult::Output(tool.execute(ctx, input).await)
                 }
             }
-            None => ToolResult::NotFound(format!("Error: tool '{}' not found", name)),
+            None => {
+                let available: Vec<String> = self.tools.keys().cloned().collect();
+                ToolResult::NotFound {
+                    name: name.to_string(),
+                    available,
+                }
+            }
         }
     }
 
@@ -295,7 +301,7 @@ mod tests {
 
         let result = registry.dispatch("unknown_tool", &ctx, &input, false).await;
 
-        assert!(matches!(result, ToolResult::NotFound(_)));
+        assert!(matches!(&result, ToolResult::NotFound { name: _, available: _ }));
         assert!(!result.was_executed());
     }
     
@@ -564,7 +570,7 @@ mod tests {
         let result = registry
             .dispatch("task", &ctx, &json!({"prompt": "recurse"}), true)
             .await;
-        assert!(matches!(result, ToolResult::Rejected(_)), "dispatch should return Rejected, got {:?}", result);
+        assert!(matches!(&result, ToolResult::Rejected { name: _, reason: _ }), "dispatch should return Rejected, got {:?}", result);
         assert!(
             result.as_content().contains("not available in subagent context"),
             "subagent dispatch of task must be rejected, got: {}",

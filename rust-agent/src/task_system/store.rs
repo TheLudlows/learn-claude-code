@@ -6,12 +6,12 @@ Manages .tasks/ directory, file I/O, and task persistence.
 
 use thiserror::Error;
 use regex::Regex;
-use std::path::PathBuf;
-#[cfg(test)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::env;
 use std::fs::create_dir_all;
 use fastrand;
+use path_clean::PathClean;
+use dunce;
 
 use crate::task_system::task::{Task, TaskStatus};
 
@@ -49,25 +49,56 @@ impl TaskStore {
     const MAX_ID_RETRIES: usize = 100;
 
     /// Creates a new TaskStore instance
+    ///
+    /// Security measures:
+    /// - Uses dunce to normalize paths (removes Windows \\?\ prefix)
+    /// - Uses path-clean for lexical normalization (no filesystem access)
+    /// - Checks for directory traversal before creating directories
+    /// - Verifies .tasks directory is not a symlink (Unix only)
     pub fn new(directory: PathBuf) -> Result<Self, TaskStoreError> {
         tracing::info!("Creating new task store path: {}", directory.display());
-        let mut directory = directory.canonicalize()
-            .map_err(|_| TaskStoreError::EscapesWorkspace)?;
-        directory = directory.join(".tasks");
-        // create_dir 在目录已存在时会报错（如上次运行残留 .tasks/），导致 new 失败。
-        // create_dir_all 幂等：目录已存在不视为错误，父目录缺失也会一并创建。
-        create_dir_all(&directory)?;
-        let workdir = env::current_dir()
-            .map_err(|_| TaskStoreError::EscapesWorkspace)?
-            .canonicalize()
+
+        let workdir = dunce::canonicalize(env::current_dir()?)
             .map_err(|_| TaskStoreError::EscapesWorkspace)?;
 
-        if !directory.starts_with(&workdir) {
+        // Normalize input path with dunce (removes \\?\ prefix on Windows)
+        // If path doesn't exist, use lexical normalization
+        let directory = if directory.exists() {
+            dunce::canonicalize(&directory)
+                .map_err(|_| TaskStoreError::EscapesWorkspace)?
+        } else {
+            directory.clean()
+        };
+
+        // For relative paths, join with workdir; for absolute paths, use directly
+        let normalized = if directory.is_absolute() {
+            directory
+        } else {
+            workdir.join(&directory).clean()
+        };
+
+        // Check for path traversal before creating anything
+        if !normalized.starts_with(&workdir) {
             return Err(TaskStoreError::EscapesWorkspace);
         }
 
+        // Create .tasks directory
+        let tasks_dir = normalized.join(".tasks");
+        create_dir_all(&tasks_dir)?;
+
+        // Ensure .tasks directory is not a symlink (Unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if let Ok(meta) = std::fs::symlink_metadata(&tasks_dir) {
+                if meta.file_type().is_symlink() {
+                    return Err(TaskStoreError::EscapesWorkspace);
+                }
+            }
+        }
+
         Ok(Self {
-            directory,
+            directory: tasks_dir,
             id_pattern: Regex::new(r"^task_[0-9a-f]{8}$")
                 .map_err(|_| TaskStoreError::InvalidId("regex".into()))?,
         })
@@ -79,14 +110,7 @@ impl TaskStore {
             return Err(TaskStoreError::InvalidId(task_id.to_string()));
         }
 
-        let path = self.directory.join(format!("{}.json", task_id));
-
-        // Security check: ensure the path is within our directory
-        if path != self.directory.join(format!("{}.json", task_id)) {
-            return Err(TaskStoreError::InvalidId(task_id.to_string()));
-        }
-
-        Ok(path)
+        Ok(self.directory.join(format!("{}.json", task_id)))
     }
 
     /// Checks if a task exists
@@ -184,6 +208,17 @@ impl TaskStore {
     }
 
     pub fn list(&self) -> Result<Vec<Task>, TaskStoreError> {
+        // Ensure directory still exists and is not a symlink (Unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if let Ok(meta) = std::fs::symlink_metadata(&self.directory) {
+                if meta.file_type().is_symlink() {
+                    return Err(TaskStoreError::EscapesWorkspace);
+                }
+            }
+        }
+
         if !self.directory.exists() {
             return Ok(Vec::new());
         }

@@ -71,7 +71,10 @@ async fn execute_tool(
 ) -> ToolResult {
     // PreToolUse 拦截
     if let Some(reason) = hooks.trigger_pre_tool(registry, name, input) {
-        return ToolResult::Denied(reason);
+        return ToolResult::Denied {
+            name: name.to_string(),
+            reason,
+        };
     }
 
     // Create ToolContext for tool execution
@@ -180,18 +183,18 @@ async fn agent_loop(
                 // 打印工具执行结果（此前只喂回 LLM，用户看不到工具返回了什么）
                 {
                     let mut out = io::stdout().lock();
-                    rust_agent::output::render_tool_result(name, tool_result.as_content(), &mut out);
+                    rust_agent::output::render_tool_result(name, &tool_result.as_content(), &mut out);
                 }
                 // PostToolUse: 提醒作为独立 user 消息注入，不进 tool_result
-                // 只有工具真正执行过才触发 hook（Denied/NotFound 不触发）
+                // 只有工具真正执行过才触发 hook（Denied/NotFound/Rejected 不触发）
                 if tool_result.was_executed() {
-                    if let Some(msg) = hooks.trigger_post_tool(name, input, tool_result.as_content()) {
+                    if let Some(msg) = hooks.trigger_post_tool(name, input, &tool_result.as_content()) {
                         reminders.push(msg);
                     }
                 }
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: tool_result.as_content().to_string(),
+                    content: tool_result.as_content(),
                 });
             }
         }

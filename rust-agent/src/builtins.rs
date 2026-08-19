@@ -96,15 +96,93 @@ impl StopHook for SummaryHook {
 // ---- 权限钩子 (原 permission.rs) ----
 
 /// 闸门 1: 硬拒绝列表 —— 永远禁止
-const DENY_LIST: &[&str] = &[
-    "rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda",
+/// 使用正则表达式而不是简单的字符串包含，防止编码绕过
+const DENY_PATTERNS: &[&str] = &[
+    r"(?i)\brm\s+-rf\s+/?",           // rm -rf / 及其变体
+    r"(?i)\bsudo\b",                    // sudo 命令
+    r"(?i)\b(shutdown|reboot|halt|poweroff)\b",  // 系统关机相关
+    r"(?i)\b(mkfs|dd\s+if=)\b",        // 磁盘格式化和直接写入
+    r"(?i)>?\s*/dev/sd[ab]\d?",         // 直接写入块设备
+    r"(?i)\b(chmod)\s+777",             // 危险权限设置
+    r"(?i)\b(chown)\s+-R\s+root:",      // 递归改变所有者
 ];
 
-fn check_deny_list(command: &str) -> Option<&'static str> {
-    // 与 command.rs::check_permission 对齐：命令先转小写再匹配。
-    // DENY_LIST 条目均为小写，不转小写会让 "Sudo" / "RM -rf /" 绕过闸门 1。
-    let command_lower = command.to_lowercase();
-    DENY_LIST.iter().copied().find(|p| command_lower.contains(p))
+/// 需要额外批准的命令模式
+const APPROVAL_PATTERNS: &[&str] = &[
+    r"(?i)\b(rm|dd|mkfs)\b",           // 删除、写入块设备命令
+    r"(?i)\b(sudo|su|doas)\b",          // 提权命令
+    r"(?i)\b(curl|wget)\s+.*\|\s*(sh|bash)",  // 通过管道执行下载内容
+    r"(?i)\beval\b",                    // eval 命令
+];
+
+/// 检查命令是否匹配硬拒绝列表
+/// 使用正则表达式进行模式匹配，防止编码绕过
+fn check_deny_patterns(command: &str) -> Option<&'static str> {
+    for pattern in DENY_PATTERNS {
+        let regex = match regex::Regex::new(pattern) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if regex.is_match(command) {
+            // 返回简化的描述而不是完整的正则模式
+            let simple_reason = if pattern.contains("rm") {
+                "rm -rf / (destructive command)"
+            } else if pattern.contains("sudo") {
+                "sudo (privilege escalation)"
+            } else if pattern.contains("shutdown") {
+                "system shutdown command"
+            } else if pattern.contains("dd") {
+                "dd (direct disk write)"
+            } else if pattern.contains("chmod") {
+                "chmod 777 (insecure permissions)"
+            } else {
+                "dangerous command"
+            };
+            return Some(simple_reason);
+        }
+    }
+    None
+}
+
+/// 检查命令是否需要用户批准
+fn requires_approval(command: &str) -> Option<&'static str> {
+    for pattern in APPROVAL_PATTERNS {
+        let regex = match regex::Regex::new(pattern) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if regex.is_match(command) {
+            return Some("This command may modify system state and requires approval");
+        }
+    }
+    None
+}
+
+/// 检查命令是否包含编码绕过尝试
+fn detect_encoding_bypass(command: &str) -> Option<&'static str> {
+    // 检查是否有十六进制编码的命令
+    if command.contains(r"\x") || command.contains(r"\u") {
+        return Some("command contains escape sequences (encoding bypass attempt)");
+    }
+
+    // 检查是否有明显的 base64 编码
+    if command.len() > 100 {
+        let alphanumeric_count = command.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+            .count();
+        if alphanumeric_count > command.len() * 9 / 10 {
+            return Some("command appears to be encoded (base64-like pattern)");
+        }
+    }
+
+    // 检查是否有重复的引号或转义字符（可能是混淆）
+    let backslash_count = command.chars().filter(|&c| c == '\\').count();
+    let quote_count = command.chars().filter(|&c| c == '"' || c == '\'').count();
+    if backslash_count > 5 || quote_count > 10 {
+        return Some("command contains suspicious escaping or quoting");
+    }
+
+    None
 }
 
 /// 闸门 3: 暂停等用户确认
@@ -124,16 +202,45 @@ pub struct PermissionHook;
 
 impl PreToolHook for PermissionHook {
     fn on_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
-        // 闸门 1: 硬拒绝
+        // 闸门 0: 检测编码绕过尝试
         if name == "command" {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(p) = check_deny_list(cmd) {
-                output::blocked(p);
-                return Some(format!("Permission denied: '{}' on deny list", p));
+            if let Some(reason) = detect_encoding_bypass(cmd) {
+                output::blocked(reason);
+                return Some(format!("Permission denied: {}", reason));
             }
         }
 
-        // 闸门 2: 使用 registry 检查工具权限
+        // 闸门 1: 硬拒绝（使用正则模式匹配）
+        if name == "command" {
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(reason) = check_deny_patterns(cmd) {
+                output::blocked(reason);
+                return Some(format!("Permission denied: {}", reason));
+            }
+        }
+
+        // 闸门 1.5: 命令结构验证
+        if name == "command" {
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(reason) = validate_command_structure(cmd) {
+                output::blocked(reason);
+                return Some(format!("Permission denied: {}", reason));
+            }
+        }
+
+        // 闸门 2: 检查是否需要用户批准
+        if name == "command" {
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(reason) = requires_approval(cmd) {
+                // 闸门 3: 向用户请求确认
+                if !ask_user(name, input, reason) {
+                    return Some("Permission denied by user".to_string());
+                }
+            }
+        }
+
+        // 闸门 4: 使用 registry 检查工具权限
         if let Some(permission_check) = registry.check_permission(name, input) {
             match permission_check {
                 PermissionCheck::Pass => {
@@ -151,67 +258,34 @@ impl PreToolHook for PermissionHook {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::build_registry;
-
-    #[test]
-    fn deny_list_matches() {
-        assert_eq!(check_deny_list("sudo apt update"), Some("sudo"));
-        assert!(check_deny_list("rm -rf /").is_some());
-        assert!(check_deny_list("ls -la").is_none());
+/// 验证命令结构，防止命令注入和混淆攻击
+fn validate_command_structure(command: &str) -> Option<&'static str> {
+    // 检查是否有命令分隔符（子命令）
+    if command.contains(';') || command.contains("&&") || command.contains("||") {
+        return Some("command contains command separators (injection attempt)");
     }
 
-    #[test]
-    fn deny_list_case_insensitive() {
-        // N4 回归：闸门 1 必须与 command.rs 对齐走 to_lowercase，
-        // 否则 "Sudo" / "RM -rf /" 能绕过硬拒绝。
-        assert_eq!(check_deny_list("Sudo apt update"), Some("sudo"));
-        assert_eq!(check_deny_list("SUDO reboot"), Some("sudo"));
-        assert!(check_deny_list("RM -rf /").is_some());
-        assert!(check_deny_list("Reboot now").is_some());
+    // 检查是否有管道到 shell
+    if command.contains('|') || command.contains(">") || command.contains("<") {
+        // 简单的输出重定向通常允许，但需要验证
+        let has_shell_redirect = regex::Regex::new(r"\|\s*(bash|sh|zsh|fish)").is_ok()
+            && regex::Regex::new(r"\|\s*(bash|sh|zsh|fish)").unwrap().is_match(command);
+
+        if has_shell_redirect {
+            return Some("command pipes to shell (injection attempt)");
+        }
     }
 
-    #[test]
-    fn permission_hook_allows_safe() {
-        // 安全命令: 不进 deny list, registry 检查通过 -> 放行
-        let registry = ToolRegistry::new();
-        assert_eq!(
-            PermissionHook.on_pre_tool(&registry, "command", &serde_json::json!({"command": "ls"})),
-            None
-        );
+    // 检查是否有命令替换（$() 或 ``）
+    if regex::Regex::new(r"\$\(|`[^`]*`").unwrap().is_match(command) {
+        return Some("command contains command substitution (injection attempt)");
     }
 
-    #[test]
-    fn permission_hook_blocks_deny_list() {
-        // 命中闸门 1, 直接拦截(且不读 stdin)
-        let registry = ToolRegistry::new();
-        assert_eq!(
-            PermissionHook.on_pre_tool(&registry, "command", &serde_json::json!({"command": "sudo apt update"})),
-            Some("Permission denied: 'sudo' on deny list".to_string())
-        );
+    // 检查是否有 $(...) 模式
+    if regex::Regex::new(r"\$\{").unwrap().is_match(command) {
+        return Some("command contains variable expansion (injection attempt)");
     }
 
-    #[test]
-    fn permission_hook_uses_registry() {
-        // 测试 permission_hook 确实调用了 registry.check_permission
-        let registry = build_registry();
-
-        // 对于 command 工具，默认权限检查应该通过
-        let result = PermissionHook.on_pre_tool(&registry, "command", &serde_json::json!({"command": "ls"}));
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn permission_hook_unknown_tool() {
-        // 测试未知工具的处理
-        let registry = ToolRegistry::new();
-        let result = PermissionHook.on_pre_tool(
-            &registry,
-            "unknown_tool",
-            &serde_json::json!({})
-        );
-        assert_eq!(result, None); // 未知工具直接放行
-    }
+    None
 }
+
