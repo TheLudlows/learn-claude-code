@@ -110,6 +110,71 @@ pub fn claim_task(store: &TaskStore, task_id: &str, owner: &str) -> String {
     }
 }
 
+/// 完成任务：校验 InProgress + owner 后置为 Completed，并报告本次新解锁的任务。
+///
+/// “新解锁”= 完成前依赖未满足、完成后依赖全部满足的 Pending 任务。
+pub fn complete_task(store: &TaskStore, task_id: &str, owner: &str) -> String {
+    use std::collections::HashSet;
+
+    // 记录完成前已可开始（依赖已满足）的任务，用于差分出“本次新解锁”的集合。
+    let ready_before: HashSet<String> = store
+        .list()
+        .unwrap_or_default()
+        .iter()
+        .filter(|t| t.status == TaskStatus::Pending && !t.blocked_by.is_empty())
+        .filter(|t| incomplete_dependencies(store, t).is_empty())
+        .map(|t| t.id.clone())
+        .collect();
+
+    match store.load(task_id) {
+        Ok(mut task) => {
+            // 检查状态
+            if task.status != TaskStatus::InProgress {
+                return format!(
+                    "Task {} is {}, cannot complete",
+                    task_id,
+                    status_word(task.status)
+                );
+            }
+
+            // 检查 owner
+            if task.owner.as_deref() != Some(owner) {
+                return format!(
+                    "Task {} is owned by {}, not {}",
+                    task_id,
+                    task.owner.as_deref().unwrap_or("none"),
+                    owner
+                );
+            }
+
+            // 完成任务
+            task.status = TaskStatus::Completed;
+
+            if let Err(e) = store.save(&task) {
+                return error_to_output(e);
+            }
+
+            // 计算刚解锁的任务：完成前未就绪、完成后就绪的 Pending 任务。
+            let unblocked: Vec<String> = store
+                .list()
+                .unwrap_or_default()
+                .iter()
+                .filter(|t| t.status == TaskStatus::Pending && !t.blocked_by.is_empty())
+                .filter(|t| !ready_before.contains(&t.id))
+                .filter(|t| incomplete_dependencies(store, t).is_empty())
+                .map(|t| t.subject.clone())
+                .collect();
+
+            let mut msg = format!("Completed {} ({})", task.id, task.subject);
+            if !unblocked.is_empty() {
+                msg.push_str(&format!("\nUnblocked: {}", unblocked.join(", ")));
+            }
+            msg
+        }
+        Err(e) => error_to_output(e),
+    }
+}
+
 pub struct CreateTaskTool;
 
 #[async_trait]
@@ -331,6 +396,46 @@ impl Tool for ClaimTaskTool {
     }
 }
 
+pub struct CompleteTaskTool;
+
+#[async_trait]
+impl Tool for CompleteTaskTool {
+    fn name(&self) -> &str {
+        "complete_task"
+    }
+
+    fn description(&self) -> &str {
+        "Complete the task claimed by this agent. Returns list of newly unblocked tasks"
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The task ID to complete"
+                }
+            },
+            "required": ["task_id"]
+        })
+    }
+
+    fn check_permission(&self, _input: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+
+    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+        let task_id = input
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let store = get_store();
+        complete_task(&store, task_id, "agent")
+    }
+}
+
 #[cfg(test)]
 mod tool_tests {
     use super::*;
@@ -513,5 +618,50 @@ mod tool_tests {
 
         let result = claim_task(&store, &task.id, "agent");
         assert!(result.contains("Blocked by"));
+    }
+
+    #[test]
+    fn test_complete_tool_name_and_schema() {
+        let tool = CompleteTaskTool;
+        assert_eq!(tool.name(), "complete_task");
+        assert_eq!(
+            tool.input_schema()["required"].as_array().unwrap()[0],
+            "task_id"
+        );
+    }
+
+    #[test]
+    fn test_complete_blocks_wrong_owner() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+        let mut task = store
+            .create("Test".to_string(), "".to_string(), vec![])
+            .unwrap();
+        task.status = TaskStatus::InProgress;
+        task.owner = Some("owner1".to_string());
+        store.save(&task).unwrap();
+
+        let result = complete_task(&store, &task.id, "owner2");
+        assert!(result.contains("owned by owner1, not owner2"));
+    }
+
+    #[test]
+    fn test_complete_unblocks_downstream_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+        let schema = store
+            .create("Schema".to_string(), "".to_string(), vec![])
+            .unwrap();
+        let api = store
+            .create("API".to_string(), "".to_string(), vec![schema.id.clone()])
+            .unwrap();
+
+        // Claim and complete schema
+        claim_task(&store, &schema.id, "agent");
+        complete_task(&store, &schema.id, "agent");
+
+        // API should now be claimable
+        let claim_result = claim_task(&store, &api.id, "agent");
+        assert!(claim_result.contains("Claimed"));
     }
 }

@@ -18,4 +18,6 @@ pub use tools::CreateTaskTool;
 pub use tools::ListTasksTool;
 pub use tools::GetTaskTool;
 pub use tools::ClaimTaskTool;
+pub use tools::CompleteTaskTool;
 pub use tools::claim_task;
+pub use tools::complete_task;
