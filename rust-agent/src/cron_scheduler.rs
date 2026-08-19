@@ -4,11 +4,13 @@ cron_scheduler.rs - Cron Scheduler (s12)
 定时任务调度器：使用 cron 表达式在指定时间将 prompt 注入到 agent 循环。
 */
 
+use crate::client::{ContentBlock, Message};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
 /// Cron 任务
@@ -429,5 +431,104 @@ pub fn cron_matches(cron_expr: &str, moment: &chrono::DateTime<chrono::Local>) -
         ("*", _) => weekday_matches,
         (_, "*") => day_matches,
         _ => day_matches || weekday_matches,
+    }
+}
+
+/// 全局运行时停止标志
+static RUNTIME_STOP: AtomicBool = AtomicBool::new(false);
+static RUNTIME_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RUNTIME_HANDLE: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> = std::sync::Mutex::new(None);
+
+/// 全局 CronManager 实例
+static CRON_MANAGER: std::sync::OnceLock<std::sync::Arc<CronManager>> = std::sync::OnceLock::new();
+
+/// 初始化全局 CronManager
+pub fn init_manager(workdir: PathBuf) -> std::sync::Arc<CronManager> {
+    let manager = std::sync::Arc::new(CronManager::new(workdir));
+    let _ = CRON_MANAGER.set(manager.clone());
+
+    // 加载持久化任务
+    let _ = manager.load_durable();
+
+    manager
+}
+
+/// 获取全局 CronManager
+pub fn get_manager() -> Option<std::sync::Arc<CronManager>> {
+    CRON_MANAGER.get().cloned()
+}
+
+/// 启动运行时
+pub async fn start_runtime() {
+    if RUNTIME_STARTED.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let manager = get_manager().expect("CronManager not initialized");
+    RUNTIME_STOP.store(false, Ordering::SeqCst);
+
+    let handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if RUNTIME_STOP.load(Ordering::SeqCst) {
+                break;
+            }
+            manager.poll_due_jobs(&chrono::Local::now());
+        }
+    });
+
+    let mut guard = RUNTIME_HANDLE.lock().expect("handle mutex poisoned");
+    *guard = Some(handle);
+    RUNTIME_STARTED.store(true, Ordering::SeqCst);
+}
+
+/// 停止运行时
+pub async fn stop_runtime() {
+    RUNTIME_STOP.store(true, Ordering::SeqCst);
+
+    if let Some(handle) = RUNTIME_HANDLE.lock().expect("handle mutex poisoned").take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+    }
+
+    RUNTIME_STARTED.store(false, Ordering::SeqCst);
+}
+
+/// 收集并注入待交付任务到消息列表
+pub fn collect_and_inject(messages: &mut Vec<Message>) -> Option<usize> {
+    let manager = get_manager()?;
+    if !manager.has_queue() {
+        return None;
+    }
+
+    let jobs = manager.consume_queue();
+    if jobs.is_empty() {
+        return None;
+    }
+
+    let count = jobs.len();
+    for job in &jobs {
+        messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: format!("[Scheduled] {}", job.prompt),
+            }],
+        });
+        println!("  [cron] delivered {}: {}", job.id, &job.prompt[..job.prompt.len().min(60)]);
+    }
+
+    Some(count)
+}
+
+/// 确认任务已交付
+pub fn acknowledge_jobs(jobs: &[CronJob]) -> Result<(), String> {
+    let manager = get_manager().ok_or_else(|| "CronManager not initialized".to_string())?;
+    manager.acknowledge_jobs(jobs)
+}
+
+/// 恢复未交付的任务
+pub fn restore_jobs(jobs: &[CronJob]) {
+    if let Some(manager) = get_manager() {
+        manager.restore_jobs(jobs);
     }
 }
