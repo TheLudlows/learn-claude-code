@@ -201,22 +201,25 @@ impl TaskStore {
     }
 }
 
+/// 测试专用：在给定目录下构造一个绕过工作区校验的 TaskStore。
+///
+/// `TaskStore::new` 会把 directory canonicalize 后与 `current_dir` 比较以阻止越界，
+/// 但单元测试的临时目录不在工作区内，因此提供此构造器直接装配私有字段。
+/// `tools` 模块的测试也复用此助手，保证两处行为一致。
+#[cfg(test)]
+pub(crate) fn create_test_store(dir: &Path) -> TaskStore {
+    let store_dir = dir.join("tasks");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    TaskStore {
+        directory: store_dir,
+        id_pattern: regex::Regex::new(r"^task_[0-9a-f]{8}$").unwrap(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    fn create_test_store(dir: &Path) -> TaskStore {
-        // Create a subdirectory within the test dir
-        let store_dir = dir.join("tasks");
-        std::fs::create_dir_all(&store_dir).unwrap();
-
-        // Use a simpler approach for tests that bypasses workspace validation
-        TaskStore {
-            directory: store_dir,
-            id_pattern: regex::Regex::new(r"^task_[0-9a-f]{8}$").unwrap(),
-        }
-    }
 
     #[test]
     fn test_new_validates_workspace() {

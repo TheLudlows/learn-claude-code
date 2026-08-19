@@ -44,6 +44,28 @@ fn error_to_output(e: TaskStoreError) -> String {
     format!("Error: {}", e)
 }
 
+/// 返回任务尚未满足的依赖列表。
+///
+/// 依赖任务不存在或状态非 `Completed` 都算未完成。
+/// 用于 `claim_task` 判定是否可认领、`complete_task` 计算解锁项。
+fn incomplete_dependencies(store: &TaskStore, task: &Task) -> Vec<String> {
+    let mut incomplete = Vec::new();
+    for dep_id in &task.blocked_by {
+        match store.load(dep_id) {
+            Ok(dep_task) => {
+                if dep_task.status != TaskStatus::Completed {
+                    incomplete.push(dep_id.clone());
+                }
+            }
+            Err(_) => {
+                // 依赖任务不存在也算未完成
+                incomplete.push(dep_id.clone());
+            }
+        }
+    }
+    incomplete
+}
+
 pub struct CreateTaskTool;
 
 #[async_trait]
@@ -228,7 +250,9 @@ impl Tool for GetTaskTool {
 #[cfg(test)]
 mod tool_tests {
     use super::*;
+    use crate::task_system::store::create_test_store;
     use serde_json::json;
+    use tempfile::TempDir;
 
     #[test]
     fn test_create_tool_name_and_description() {
@@ -282,5 +306,89 @@ mod tool_tests {
             tool.input_schema()["required"].as_array().unwrap()[0],
             "task_id"
         );
+    }
+
+    #[test]
+    fn test_incomplete_dependencies_with_no_deps() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+        let task = Task {
+            id: "task_12345678".to_string(),
+            subject: "Test".to_string(),
+            description: "".to_string(),
+            status: TaskStatus::Pending,
+            owner: None,
+            blocked_by: vec![],
+        };
+
+        let incomplete = incomplete_dependencies(&store, &task);
+        assert!(incomplete.is_empty());
+    }
+
+    #[test]
+    fn test_incomplete_dependencies_with_completed_deps() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+        let dep = store
+            .create("Dependency".to_string(), "".to_string(), vec![])
+            .unwrap();
+
+        // Complete the dependency
+        let mut dep_completed = dep.clone();
+        dep_completed.status = TaskStatus::Completed;
+        store.save(&dep_completed).unwrap();
+
+        let task = Task {
+            id: "task_12345678".to_string(),
+            subject: "Test".to_string(),
+            description: "".to_string(),
+            status: TaskStatus::Pending,
+            owner: None,
+            blocked_by: vec![dep.id.clone()],
+        };
+
+        let incomplete = incomplete_dependencies(&store, &task);
+        assert!(incomplete.is_empty());
+    }
+
+    #[test]
+    fn test_incomplete_dependencies_with_pending_deps() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+        let dep = store
+            .create("Dependency".to_string(), "".to_string(), vec![])
+            .unwrap();
+
+        let task = Task {
+            id: "task_12345678".to_string(),
+            subject: "Test".to_string(),
+            description: "".to_string(),
+            status: TaskStatus::Pending,
+            owner: None,
+            blocked_by: vec![dep.id.clone()],
+        };
+
+        let incomplete = incomplete_dependencies(&store, &task);
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(incomplete[0], dep.id);
+    }
+
+    #[test]
+    fn test_incomplete_dependencies_with_missing_deps() {
+        let tmp = TempDir::new().unwrap();
+        let store = create_test_store(tmp.path());
+
+        let task = Task {
+            id: "task_12345678".to_string(),
+            subject: "Test".to_string(),
+            description: "".to_string(),
+            status: TaskStatus::Pending,
+            owner: None,
+            blocked_by: vec!["task_missing".to_string()],
+        };
+
+        let incomplete = incomplete_dependencies(&store, &task);
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(incomplete[0], "task_missing");
     }
 }
