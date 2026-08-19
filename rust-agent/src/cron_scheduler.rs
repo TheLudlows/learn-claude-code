@@ -80,6 +80,45 @@ fn validate_cron_field(field: &str, min: i32, max: i32) -> Result<(), String> {
     }
 }
 
+use fastrand;
+
+/// Cron 任务管理器
+#[derive(Clone)]
+pub struct CronManager {
+    state: Arc<Mutex<CronState>>,
+    workdir: PathBuf,
+}
+
+impl CronManager {
+    const MAX_ID_RETRIES: usize = 100;
+    const DURABLE_FILE: &str = ".scheduled_tasks.json";
+
+    /// 创建管理器
+    pub fn new(workdir: PathBuf) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(CronState::default())),
+            workdir,
+        }
+    }
+
+    /// 生成唯一的任务 ID
+    fn generate_id(&self) -> String {
+        let state = self.state.lock().expect("state mutex poisoned");
+        for _ in 0..Self::MAX_ID_RETRIES {
+            let id = format!("cron_{:08x}", fastrand::u32(..));
+            if !state.jobs.contains_key(&id) {
+                return id;
+            }
+        }
+        String::new() // 极低概率
+    }
+
+    /// 获取工作目录
+    pub fn workdir(&self) -> &PathBuf {
+        &self.workdir
+    }
+}
+
 /// 验证完整的 cron 表达式
 pub fn validate_cron(cron_expr: &str) -> Result<(), String> {
     let fields: Vec<&str> = cron_expr.trim().split_whitespace().collect();
