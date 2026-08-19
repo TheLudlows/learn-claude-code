@@ -1,13 +1,16 @@
 /*
 mod.rs - Task System module
 
-Exports Task, TaskStatus, and TaskStore for use by other modules.
+Exports Task, TaskStatus, TaskStore, and TaskStoreError for use by other modules.
+Tool structs are re-exported from `tools` as they are implemented.
 */
 
 pub mod task;
 pub mod store;
+pub mod tools;
 #[cfg(test)]
 mod store_tests;
 
 pub use task::{Task, TaskStatus};
-pub use store::TaskStoreError;
+pub use store::{TaskStore, TaskStoreError};
+pub use tools::init_task_store;
