@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::path::Path;
 use std::env;
-use std::fs::create_dir;
+use std::fs::create_dir_all;
 use fastrand;
 
 use crate::task_system::task::{Task, TaskStatus};
@@ -38,6 +38,8 @@ pub enum TaskStoreError {
 }
 
 /// TaskStore manages task persistence in the file system
+///
+#[derive(Debug)]
 pub struct TaskStore {
     directory: PathBuf,
     id_pattern: Regex,
@@ -52,7 +54,9 @@ impl TaskStore {
         let mut directory = directory.canonicalize()
             .map_err(|_| TaskStoreError::EscapesWorkspace)?;
         directory = directory.join(".tasks");
-        create_dir(&directory)?;
+        // create_dir 在目录已存在时会报错（如上次运行残留 .tasks/），导致 new 失败。
+        // create_dir_all 幂等：目录已存在不视为错误，父目录缺失也会一并创建。
+        create_dir_all(&directory)?;
         let workdir = env::current_dir()
             .map_err(|_| TaskStoreError::EscapesWorkspace)?
             .canonicalize()

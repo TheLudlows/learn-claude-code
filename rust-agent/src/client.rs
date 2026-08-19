@@ -91,6 +91,14 @@ impl Client {
             tools: tools.to_vec(),
         };
 
+        tracing::info!(
+            "[req] model={}, messages={}, tools={}, max_tokens={}",
+            self.model,
+            messages.len(),
+            tools.len(),
+            max_tokens
+        );
+
         let response = self
             .http
             .post(&url)
@@ -253,6 +261,12 @@ impl Client {
                 _ => {}
             }
         }
+
+        tracing::info!(
+            "[resp] stop_reason={}, blocks={}",
+            stop_reason,
+            content.len()
+        );
 
         Ok(MessagesResponse { content, stop_reason })
     }

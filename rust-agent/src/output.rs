@@ -11,7 +11,8 @@
 //! 断言；`NO_COLOR` 置位时公共入口 `render` / `render_tool_result` 自动关色。
 
 use crate::client::{ContentBlock, MessagesResponse};
-use owo_colors::OwoColorize;
+use colored::control;
+use colored::Colorize;
 use std::io::{self, Write};
 
 /// 超过此字符数的结果折叠成单行并截断。
@@ -63,6 +64,11 @@ pub fn render<W: Write>(response: &MessagesResponse, out: &mut W) {
 
 /// 同 `render`，但颜色由参数控制（测试传 `false` 走无转义码路径）。
 pub fn render_with<W: Write>(response: &MessagesResponse, out: &mut W, color: bool) {
+    // colored 默认按 TTY 探测决定是否输出 ANSI：写到 Vec<u8> 等非 TTY 时会丢色，
+    // 使 `color=true` 在测试里不再产生转义码。这里以 `color` 参数 override 全局
+    // 开关，行为对齐旧 owo-colors（它总是按调用输出转义码）。render_with /
+    // render_tool_result_with 是所有着色渲染的唯一入口，在此统一 set 即覆盖全路径。
+    control::set_override(color);
     let mut first = true;
     for block in &response.content {
         match block {
@@ -118,6 +124,7 @@ pub fn render_tool_result_with<W: Write>(
     out: &mut W,
     color: bool,
 ) {
+    control::set_override(color);
     let size = human_size(result.len());
     // 换行折叠成空格、去首尾空白；按字符截断，避免截断多字节 UTF-8。
     let collapsed: String = result
@@ -135,7 +142,6 @@ pub fn render_tool_result_with<W: Write>(
     };
 
     let prefix = format!("↳ {name} 结果 ({size}): ");
-    let _ = writeln!(out); // 与上方内容空一行
     let _ = write!(
         out,
         "{}",

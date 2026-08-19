@@ -24,7 +24,7 @@
 
 **文件：** `rust-agent/Cargo.toml`、`rust-agent/src/output.rs`
 
-- `Cargo.toml`：删 `owo-colors = "4"`，加 `colored = "2"`。
+- `Cargo.toml`：删 `owo-colors = "4"`，加 `colored = "3"`。
 - `output.rs`：`use owo_colors::OwoColorize;` → `use colored::Colorize;`。
   两个 trait 的方法名一致（`cyan` / `bold` / `dimmed` / `yellow` / `red`），
   所有 `format!("{}", x.cyan().bold())` 调用点无需改动。
