@@ -532,3 +532,156 @@ pub fn restore_jobs(jobs: &[CronJob]) {
         manager.restore_jobs(jobs);
     }
 }
+
+use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
+use async_trait::async_trait;
+use serde_json::Value;
+
+/// ScheduleCron 工具
+pub struct ScheduleCronTool;
+
+#[async_trait]
+impl Tool for ScheduleCronTool {
+    fn name(&self) -> &str {
+        "schedule_cron"
+    }
+
+    fn description(&self) -> &str {
+        "Schedule a prompt with a 5-field cron expression."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cron": {"type": "string"},
+                "prompt": {"type": "string"},
+                "recurring": {"type": "boolean", "default": true},
+                "durable": {"type": "boolean", "default": true}
+            },
+            "required": ["cron", "prompt"]
+        })
+    }
+
+    fn check_permission(&self, _input: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+
+    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+        let manager = get_manager();
+        let Some(manager) = manager else {
+            return "Error: CronManager not initialized".to_string();
+        };
+
+        let cron = input.get("cron").and_then(|v| v.as_str()).unwrap_or("");
+        let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let recurring = input.get("recurring").and_then(|v| v.as_bool()).unwrap_or(true);
+        let durable = input.get("durable").and_then(|v| v.as_bool()).unwrap_or(true);
+
+        match manager.schedule(cron, prompt, recurring, durable) {
+            Ok(job) => format!("Scheduled {}: {} -> {}", job.id, job.cron, job.prompt),
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    fn available_for_subagent(&self) -> bool {
+        true
+    }
+}
+
+/// ListCrons 工具
+pub struct ListCronsTool;
+
+#[async_trait]
+impl Tool for ListCronsTool {
+    fn name(&self) -> &str {
+        "list_crons"
+    }
+
+    fn description(&self) -> &str {
+        "List scheduled cron jobs."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    fn check_permission(&self, _input: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+
+    async fn execute(&self, _ctx: &ToolContext<'_>, _input: &Value) -> String {
+        let manager = get_manager();
+        let Some(manager) = manager else {
+            return "Error: CronManager not initialized".to_string();
+        };
+
+        let jobs = manager.list();
+        if jobs.is_empty() {
+            return "No cron jobs.".to_string();
+        }
+
+        jobs.iter()
+            .map(|job| {
+                let frequency = if job.recurring { "recurring" } else { "one-shot" };
+                let storage = if job.durable { "durable" } else { "session" };
+                format!("{}: {} -> {} [{}, {}]", job.id, job.cron,
+                    &job.prompt[..job.prompt.len().min(60)], frequency, storage)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn available_for_subagent(&self) -> bool {
+        true
+    }
+}
+
+/// CancelCron 工具
+pub struct CancelCronTool;
+
+#[async_trait]
+impl Tool for CancelCronTool {
+    fn name(&self) -> &str {
+        "cancel_cron"
+    }
+
+    fn description(&self) -> &str {
+        "Cancel a cron job by ID."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"}
+            },
+            "required": ["job_id"]
+        })
+    }
+
+    fn check_permission(&self, _input: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+
+    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+        let manager = get_manager();
+        let Some(manager) = manager else {
+            return "Error: CronManager not initialized".to_string();
+        };
+
+        let job_id = input.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+        match manager.cancel(job_id) {
+            Ok(msg) => msg,
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    fn available_for_subagent(&self) -> bool {
+        true
+    }
+}
