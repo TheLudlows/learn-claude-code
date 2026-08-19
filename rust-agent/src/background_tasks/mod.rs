@@ -5,6 +5,8 @@ background_tasks/mod.rs - 后台任务模块 (s11)
 循环继续; 命令完成后在后续轮次以 <task_notification> 注入会话。
 */
 
+pub mod manager;
 pub mod task;
 
+pub use manager::BackgroundManager;
 pub use task::{BackgroundTask, TaskStatus};
