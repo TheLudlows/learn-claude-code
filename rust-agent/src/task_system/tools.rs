@@ -7,6 +7,9 @@ shared state, initialized once at startup via init_task_store().
 */
 
 use crate::task_system::store::{TaskStore, TaskStoreError};
+use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
+use async_trait::async_trait;
+use serde_json::Value;
 use std::sync::Arc;
 
 /// 全局任务存储（Arc 共享，OnceLock 保证只初始化一次）
@@ -38,4 +41,112 @@ fn get_store() -> Arc<TaskStore> {
 /// 把 TaskStoreError 转成工具输出字符串。
 fn error_to_output(e: TaskStoreError) -> String {
     format!("Error: {}", e)
+}
+
+pub struct CreateTaskTool;
+
+#[async_trait]
+impl Tool for CreateTaskTool {
+    fn name(&self) -> &str {
+        "create_task"
+    }
+
+    fn description(&self) -> &str {
+        "Create a task with optional dependencies. The task is stored in .tasks/{id}.json"
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subject": {
+                    "type": "string",
+                    "description": "Brief title for the task"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Detailed description of the task"
+                },
+                "blockedBy": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of task IDs this task depends on"
+                }
+            },
+            "required": ["subject"]
+        })
+    }
+
+    fn check_permission(&self, _input: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+
+    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+        let subject = input
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let description = input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let blocked_by = input
+            .get("blockedBy")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let store = get_store();
+        match store.create(subject.to_string(), description.to_string(), blocked_by) {
+            Ok(task) => {
+                let deps_str = if task.blocked_by.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (blockedBy: {})", task.blocked_by.join(", "))
+                };
+                format!("Created {}: {}{}", task.id, task.subject, deps_str)
+            }
+            Err(e) => error_to_output(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_create_tool_name_and_description() {
+        let tool = CreateTaskTool;
+        assert_eq!(tool.name(), "create_task");
+        assert!(tool.description().contains("Create a task"));
+    }
+
+    #[test]
+    fn test_create_tool_schema() {
+        let tool = CreateTaskTool;
+        let schema = tool.input_schema();
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["subject"]["type"], "string");
+        assert_eq!(schema["properties"]["description"]["type"], "string");
+        assert_eq!(schema["properties"]["blockedBy"]["type"], "array");
+
+        let required = schema["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "subject");
+    }
+
+    #[test]
+    fn test_create_tool_passes_permission() {
+        let tool = CreateTaskTool;
+        let input = json!({"subject": "test"});
+        let check = tool.check_permission(&input);
+        assert!(matches!(check, PermissionCheck::Pass));
+    }
 }

@@ -14,3 +14,4 @@ mod store_tests;
 pub use task::{Task, TaskStatus};
 pub use store::{TaskStore, TaskStoreError};
 pub use tools::init_task_store;
+pub use tools::CreateTaskTool;
