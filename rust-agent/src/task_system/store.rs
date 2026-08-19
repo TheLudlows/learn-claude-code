@@ -6,7 +6,9 @@ Manages .tasks/ directory, file I/O, and task persistence.
 
 use thiserror::Error;
 use regex::Regex;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(test)]
+use std::path::Path;
 use std::env;
 use fastrand;
 
@@ -94,8 +96,6 @@ impl TaskStore {
         description: String,
         blocked_by: Vec<String>,
     ) -> Result<Task, TaskStoreError> {
-        use crate::task_system::task::{Task, TaskStatus};
-
         let subject = subject.trim().to_string();
         if subject.is_empty() {
             return Err(TaskStoreError::InvalidId("empty subject".into()));
