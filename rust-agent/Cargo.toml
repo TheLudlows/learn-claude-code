@@ -27,6 +27,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fastrand = "2.1"
 regex = "1"
+croner = "3"
+tokio-cron-scheduler = "0.15"
 
 
 [dev-dependencies]

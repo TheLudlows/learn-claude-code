@@ -185,7 +185,7 @@ async fn agent_loop(
 
         // s12: 模型调用成功后确认定时任务
         if !waiting_for_ack.is_empty() {
-            if let Err(e) = acknowledge_jobs(&waiting_for_ack) {
+            if let Err(e) = acknowledge_jobs(&waiting_for_ack).await {
                 println!("  [cron] acknowledgement failed: {}", e);
             }
             waiting_for_ack.clear();
@@ -317,7 +317,7 @@ async fn main() -> Result<(), AgentError> {
     rust_agent::todo::set_instance(todo_manager);
 
     // s12: 初始化 CronManager 并启动运行时
-    let cron_manager = init_manager(PathBuf::from(&cwd));
+    let cron_manager = init_manager(PathBuf::from(&cwd)).await;
     start_runtime().await;
     let _ = cron_manager; // 抑制 unused 警告
 
