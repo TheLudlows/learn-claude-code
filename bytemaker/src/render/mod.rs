@@ -5,7 +5,8 @@
 //! 半行未换行，`emit` 前若半行先补换行。真终端用 `CrosstermBackend`，
 //! 测试用 `VirtualTerm`（实现 Backend，可 dump 屏缓冲断言）。
 
-use std::io;
+use std::io::{self, Write};
+use crossterm::terminal as ct;
 
 /// 输出栏状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,38 @@ impl Backend for VirtualTerm {
     fn size(&self) -> (usize, usize) { (self.rows, self.cols) }
 }
 
+/// 真终端后端。
+pub struct CrosstermBackend;
+impl Backend for CrosstermBackend {
+    fn write_str(&mut self, s: &str) -> io::Result<()> {
+        io::Write::write_all(&mut io::stdout().lock(), s.as_bytes())
+    }
+    fn flush(&mut self) -> io::Result<()> { io::stdout().lock().flush() }
+    fn size(&self) -> (usize, usize) {
+        let (r, c) = ct::size().unwrap_or((24, 80));
+        (r as usize, c as usize)
+    }
+}
+
+/// raw 模式 RAII 守卫：构造开启、Drop 恢复，保证 panic/早退也复位终端。
+pub struct RawModeGuard { enabled: bool }
+impl RawModeGuard {
+    /// `interactive=true` 才真正进 raw 模式（非 TTY 传 false）。
+    pub fn new(interactive: bool) -> Self {
+        if interactive {
+            let _ = ct::enable_raw_mode();
+        }
+        Self { enabled: interactive }
+    }
+}
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = ct::disable_raw_mode();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +127,12 @@ mod tests {
         c.emit("b").unwrap();
         let s = c.into_backend().screendump();
         assert!(s.contains("a") && s.contains("b"), "got: {:?}", s);
+    }
+
+    #[test]
+    fn raw_mode_guard_is_drop_safe_when_not_a_tty() {
+        // 非 TTY（CI）下不应 panic，构造/析构皆 Ok。
+        let g = RawModeGuard::new(false);
+        drop(g); // 不 panic 即过
     }
 }
