@@ -8,6 +8,7 @@ pub mod error;
 pub mod hooks;
 pub mod memory;
 pub mod output;
+pub mod render;
 pub mod skills;
 pub mod task_system;
 pub mod team;
