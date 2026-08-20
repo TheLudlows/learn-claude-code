@@ -42,6 +42,14 @@ pub fn workdir() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| ".".into())
 }
 
+/// Resolve the caller's working directory from a ToolContext (s13).
+///
+/// Lead/subagent -> repo workdir; teammate with an active assignment -> the
+/// task's cwd; teammate with no assignment -> Err("Claim a Task...").
+pub fn ctx_cwd(ctx: &ToolContext<'_>) -> Result<PathBuf, String> {
+    ctx.cwd()
+}
+
 /// 路径安全校验 - 确保路径在工作目录内
 ///
 /// 用 `path-clean` 做**词法归一化**（消解 `..`/`.`，不访问文件系统），

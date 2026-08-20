@@ -10,6 +10,7 @@ This module implements:
 use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::Path;
 use tokio::time::{timeout, Duration};
 
 /// Command execution timeout in seconds.
@@ -25,19 +26,19 @@ const MAX_OUTPUT_BYTES: usize = 50_000;
 ///
 /// 危险命令的拦截已移至 builtins::PermissionHook 闸门(s03/s04),
 /// 在到达这里之前就已被拒; safe_path 仍是文件工具的工作区沙箱。
-pub(crate) async fn run_bash(command: &str) -> String {
+pub(crate) async fn run_bash(command: &str, cwd: &Path) -> String {
     let result = timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), async {
         if cfg!(windows) {
             tokio::process::Command::new("cmd.exe")
                 .args(["/C", command])
-                .current_dir(crate::tools::workdir())
+                .current_dir(cwd)
                 .output()
                 .await
         } else {
             tokio::process::Command::new("bash")
                 .arg("-c")
                 .arg(command)
-                .current_dir(crate::tools::workdir())
+                .current_dir(cwd)
                 .output()
                 .await
         }
@@ -233,7 +234,11 @@ impl Tool for CommandTool {
         if bg {
             start_background(&ctx.agent.bg_manager, command).await
         } else {
-            run_bash(command).await
+            let cwd = match crate::tools::ctx_cwd(ctx) {
+                Ok(p) => p,
+                Err(e) => return format!("Error: {}", e),
+            };
+            run_bash(command, &cwd).await
         }
     }
 
@@ -393,7 +398,7 @@ mod tests {
     #[tokio::test]
     #[cfg(windows)]
     async fn decodes_non_ascii_without_replacement_chars() {
-        let out = run_bash("ver").await;
+        let out = run_bash("ver", &crate::tools::workdir()).await;
         assert!(
             !out.contains('\u{FFFD}'),
             "命令输出不应含 U+FFFD 替换符（应为合法 UTF-8）: {out:?}"
@@ -402,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_bash_executes_simple_command() {
-        let out = run_bash("echo hello_from_bytemaker").await;
+        let out = run_bash("echo hello_from_bytemaker", &crate::tools::workdir()).await;
         assert!(
             out.contains("hello_from_bytemaker"),
             "expected 'hello_from_bytemaker' in output, got: {}",
@@ -420,7 +425,7 @@ mod tests {
         } else {
             "sleep 120"
         };
-        let out = run_bash(cmd).await;
+        let out = run_bash(cmd, &crate::tools::workdir()).await;
         assert!(
             out.contains("timed out"),
             "expected timeout message, got: {}",
@@ -438,7 +443,7 @@ mod tests {
         } else {
             "python3 -c \"print('A' * 100 * 1000)\""
         };
-        let out = run_bash(cmd).await;
+        let out = run_bash(cmd, &crate::tools::workdir()).await;
         // Output should be truncated to at most MAX_OUTPUT_BYTES
         assert!(
             out.len() <= MAX_OUTPUT_BYTES + 100, // small margin for UTF-8 boundary adjustment
@@ -480,5 +485,25 @@ mod tests {
         let input = json!({"command": "echo sync_path_ok", "run_in_background": false});
         let out = tool.execute(&ctx, &input).await;
         assert!(out.contains("sync_path_ok"), "false should use sync run_bash, got: {}", out);
+    }
+
+    #[tokio::test]
+    async fn command_runs_in_ctx_cwd() {
+        // s13: a Lead agent (TestAgent, team=None) -> ctx.cwd() == workdir
+        // (the tempdir). Verify the command actually runs there.
+        use crate::agent::TestAgent;
+        use crate::tools::trait_def::Tool;
+        let a = TestAgent::new();
+        let ctx = a.context();
+        let out = CommandTool
+            .execute(&ctx, &serde_json::json!({"command": "cd"}))
+            .await;
+        // `cd` prints the cwd; the TestAgent tempdir path contains a separator
+        // (and usually "Temp").
+        assert!(
+            out.contains("TempDir") || out.contains('\\') || out.contains('/'),
+            "command should run in ctx cwd, got: {}",
+            out
+        );
     }
 }

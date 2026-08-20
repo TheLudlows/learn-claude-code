@@ -5,8 +5,12 @@ use serde_json::Value;
 use std::fs;
 
 /// 读取文件
-pub(crate) fn run_read_file(path: &str, limit: Option<u32>) -> String {
-    match fs::read_to_string(path) {
+pub(crate) fn run_read_file(path: &str, limit: Option<u32>, base: &std::path::Path) -> String {
+    let abs = match crate::tools::safe_path_in(base, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match fs::read_to_string(&abs) {
         Ok(content) => {
             let lines: Vec<&str> = content.lines().collect();
             if let Some(limit) = limit {
@@ -75,7 +79,7 @@ impl Tool for ReadFileTool {
         PermissionCheck::Pass
     }
 
-    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+    async fn execute(&self, ctx: &ToolContext<'_>, input: &Value) -> String {
         let path = match input.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: No file path provided".to_string(),
@@ -83,7 +87,11 @@ impl Tool for ReadFileTool {
 
         let limit = input.get("limit").and_then(|v| v.as_u64()).map(|l| l as u32);
 
-        run_read_file(path, limit)
+        let cwd = match crate::tools::ctx_cwd(ctx) {
+            Ok(p) => p,
+            Err(e) => return format!("Error: {}", e),
+        };
+        run_read_file(path, limit, &cwd)
     }
 
 }

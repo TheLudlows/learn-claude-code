@@ -12,8 +12,8 @@ use serde_json::Value;
 use std::fs;
 
 /// 写入文件
-pub(crate) fn run_write_file(path: &str, content: &str) -> String {
-    match crate::tools::safe_path(path) {
+pub(crate) fn run_write_file(path: &str, content: &str, base: &std::path::Path) -> String {
+    match crate::tools::safe_path_in(base, path) {
         Ok(abs_path) => {
             if let Some(parent) = abs_path.parent() {
                 fs::create_dir_all(parent).ok();
@@ -72,7 +72,7 @@ impl Tool for WriteFileTool {
         PermissionCheck::Pass
     }
 
-    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+    async fn execute(&self, ctx: &ToolContext<'_>, input: &Value) -> String {
         let path = match input.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: No file path provided".to_string(),
@@ -83,7 +83,11 @@ impl Tool for WriteFileTool {
             None => return "Error: No content provided".to_string(),
         };
 
-        run_write_file(path, content)
+        let cwd = match crate::tools::ctx_cwd(ctx) {
+            Ok(p) => p,
+            Err(e) => return format!("Error: {}", e),
+        };
+        run_write_file(path, content, &cwd)
     }
 
 }

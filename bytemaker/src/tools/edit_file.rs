@@ -12,8 +12,8 @@ use serde_json::Value;
 use std::fs;
 
 /// 编辑文件（替换文本）
-pub(crate) fn run_edit_file(path: &str, old_text: &str, new_text: &str) -> String {
-    match crate::tools::safe_path(path) {
+pub(crate) fn run_edit_file(path: &str, old_text: &str, new_text: &str, base: &std::path::Path) -> String {
+    match crate::tools::safe_path_in(base, path) {
         Ok(abs_path) => match fs::read_to_string(&abs_path) {
             Ok(content) => {
                 if !content.contains(old_text) {
@@ -80,7 +80,7 @@ impl Tool for EditFileTool {
         PermissionCheck::Pass
     }
 
-    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+    async fn execute(&self, ctx: &ToolContext<'_>, input: &Value) -> String {
         let path = match input.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: No file path provided".to_string(),
@@ -96,7 +96,11 @@ impl Tool for EditFileTool {
             None => return "Error: No new text provided".to_string(),
         };
 
-        run_edit_file(path, old_text, new_text)
+        let cwd = match crate::tools::ctx_cwd(ctx) {
+            Ok(p) => p,
+            Err(e) => return format!("Error: {}", e),
+        };
+        run_edit_file(path, old_text, new_text, &cwd)
     }
 
 }

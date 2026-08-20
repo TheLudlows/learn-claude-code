@@ -55,8 +55,8 @@ pub(crate) fn glob_in(pattern: &str, base: &Path) -> Vec<String> {
 }
 
 /// 查找匹配的文件（按 glob 规则匹配，递归整个工作区）
-pub(crate) fn run_glob(pattern: &str) -> String {
-    let results = glob_in(pattern, &crate::tools::workdir());
+pub(crate) fn run_glob(pattern: &str, base: &Path) -> String {
+    let results = glob_in(pattern, base);
     if results.is_empty() {
         "Error: no matches".to_string()
     } else {
@@ -98,7 +98,7 @@ impl Tool for GlobTool {
         PermissionCheck::Pass
     }
 
-    async fn execute(&self, _ctx: &ToolContext<'_>, input: &Value) -> String {
+    async fn execute(&self, ctx: &ToolContext<'_>, input: &Value) -> String {
         let pattern = input["pattern"].as_str().unwrap_or("");
 
         let search_path = input["path"].as_str().map(|s| s.to_string());
@@ -111,7 +111,11 @@ impl Tool for GlobTool {
                 results.join("\n")
             }
         } else {
-            run_glob(pattern)
+            let cwd = match crate::tools::ctx_cwd(ctx) {
+                Ok(p) => p,
+                Err(e) => return format!("Error: {}", e),
+            };
+            run_glob(pattern, &cwd)
         }
     }
 
