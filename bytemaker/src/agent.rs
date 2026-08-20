@@ -74,6 +74,10 @@ pub struct Agent {
     pub(crate) base_system: String,
     pub(crate) max_turns: Option<usize>,
     pub(crate) kind: AgentKind,
+    /// s13: this agent's owner name ("agent" for Lead/subagent; teammate name for teammates).
+    pub(crate) owner: String,
+    /// s13: shared team context (Lead + teammates have Some; s06 subagents have None).
+    pub(crate) team: Option<Arc<crate::team::TeamCtx>>,
     pub(crate) max_tokens: u32,
 }
 
@@ -110,6 +114,10 @@ impl Agent {
         let registry = Arc::new(tools::build_registry());
         let base_system = build_base_system(&skills, &cfg.workdir);
         let hooks = Self::build_hooks(&bg_manager);
+        let team = Arc::new(
+            crate::team::TeamCtx::new(cfg.workdir.clone(), Arc::clone(&task_store))
+                .map_err(|e| AgentError::Other(format!("team init: {e}")))?,
+        );
 
         Ok(Agent {
             client,
@@ -126,6 +134,8 @@ impl Agent {
             base_system,
             max_turns: None,
             kind: AgentKind::Lead,
+            owner: "agent".to_string(),
+            team: Some(team),
             max_tokens: MAX_TOKENS,
         })
     }
@@ -148,6 +158,8 @@ impl Agent {
             base_system: sub_system.to_string(),
             max_turns: Some(max_turns),
             kind: AgentKind::Subagent,
+            owner: "agent".to_string(),
+            team: None,
             max_tokens: self.max_tokens,
         }
     }
@@ -173,6 +185,50 @@ impl Agent {
         h.on_post_tool(builtins::TodoReminderHook::new());
         h.on_stop(BackgroundStopHook::new(Arc::clone(bg)));
         h
+    }
+
+    /// Produce a persistent teammate agent: shares infra, kind=Teammate, team=Some,
+    /// fresh non-interactive hooks. Does NOT reference the Lead agent, so there is
+    /// no TeamCtx → Agent → TeamCtx Arc cycle.
+    pub fn child_teammate(&self, name: &str, system: &str, team: Arc<crate::team::TeamCtx>) -> Agent {
+        Agent {
+            client: Arc::clone(&self.client),
+            registry: Arc::clone(&self.registry),
+            skills: Arc::clone(&self.skills),
+            task_store: Arc::clone(&self.task_store),
+            bg_manager: Arc::clone(&self.bg_manager),
+            todo_manager: Arc::clone(&self.todo_manager),
+            workdir: self.workdir.clone(),
+            cron_manager: None,
+            compactor: None,
+            memory: None,
+            hooks: Self::build_teammate_hooks(),
+            base_system: system.to_string(),
+            max_turns: None,
+            kind: AgentKind::Teammate,
+            owner: name.to_string(),
+            team: Some(team),
+            max_tokens: self.max_tokens,
+        }
+    }
+
+    /// Teammate hook set: non-interactive permission (no stdin) + large-output
+    /// reminder. No TodoReminder/Summary — teammates are non-interactive.
+    fn build_teammate_hooks() -> Hooks {
+        let mut h = Hooks::new();
+        h.on_pre_tool(builtins::TeammatePermissionHook);
+        h.on_post_tool(builtins::LargeOutputHook);
+        h
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+    pub fn team(&self) -> Option<&Arc<crate::team::TeamCtx>> {
+        self.team.as_ref()
+    }
+    pub fn lead_notify(&self) -> Option<&tokio::sync::Notify> {
+        self.team.as_ref().map(|t| t.lead_notify())
     }
 
     /// 用户输入提交后触发 UserPromptSubmit 钩子。
@@ -203,6 +259,23 @@ impl Agent {
                 name: name.to_string(),
                 reason,
             };
+        }
+        // s13 plan gate: teammates cannot run mutating tools until the plan is approved.
+        if self.kind == AgentKind::Teammate
+            && matches!(name, "command" | "write_file" | "edit_file")
+        {
+            if let Some(team) = &self.team {
+                let gate = team.protocols.gate(&self.owner);
+                if gate.blocks_mutating_tools() {
+                    return ToolResult::Denied {
+                        name: name.to_string(),
+                        reason: format!(
+                            "Blocked: plan status is {:?}. Submit or revise the plan and wait for approval.",
+                            gate
+                        ),
+                    };
+                }
+            }
         }
         let ctx = ToolContext { agent: self };
         self.registry.dispatch(name, &ctx, input, self.kind).await
@@ -276,6 +349,16 @@ impl Agent {
                     println!("  [cron] delivered {}: {}", job.id, preview);
                 }
                 waiting_for_ack = jobs;
+            }
+
+            // s13: teammates drain their own inbox each turn (Lead's inbox is
+            // drained by main.rs outside run_loop). An accepted shutdown ends the loop.
+            if self.kind == AgentKind::Teammate {
+                if let Some(team) = &self.team {
+                    if crate::team::drain_inbox(team, &self.owner, messages) {
+                        return Ok(LoopOutcome::Completed);
+                    }
+                }
             }
 
             // s08：每次调用模型前运行压缩管线（子 agent compactor=None 跳过）。
@@ -501,6 +584,8 @@ impl TestAgent {
             base_system: "test system".into(),
             max_turns: None,
             kind: AgentKind::Lead,
+            owner: "agent".to_string(),
+            team: None,
             max_tokens: MAX_TOKENS,
         };
         Self { _tmp: tmp, agent }
@@ -586,6 +671,48 @@ mod tests {
         assert!(
             result.is_err(),
             "Agent::new should fail when task store can't be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_plan_gate_blocks_command_for_teammate() {
+        // s13: a teammate with gate=Pending cannot run command; the gate sits
+        // after pre_tool, so a non-destructive command is blocked by the gate.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::task_system::store::create_test_store(tmp.path()));
+        let team = Arc::new(crate::team::TeamCtx::new(tmp.path().to_path_buf(), store).unwrap());
+        team.protocols
+            .set_gate("alice", crate::team::protocols::GateStatus::Pending);
+        let a = TestAgent::new();
+        let child = a.agent().child_teammate("alice", "sub", Arc::clone(&team));
+        let r = child
+            .execute_tool("command", &serde_json::json!({"command": "ls"}))
+            .await;
+        assert!(
+            matches!(r, ToolResult::Denied { .. }),
+            "teammate command must be gated, got {:?}",
+            r
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_allows_command_when_approved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::task_system::store::create_test_store(tmp.path()));
+        let team = Arc::new(crate::team::TeamCtx::new(tmp.path().to_path_buf(), store).unwrap());
+        team.protocols
+            .set_gate("alice", crate::team::protocols::GateStatus::Approved);
+        let a = TestAgent::new();
+        let child = a.agent().child_teammate("alice", "sub", Arc::clone(&team));
+        // child has no assignment -> ctx.cwd() would error for a teammate, but
+        // the gate passes; command runs (via workdir()) and is not Denied.
+        let r = child
+            .execute_tool("command", &serde_json::json!({"command": "echo hi"}))
+            .await;
+        assert!(
+            !matches!(r, ToolResult::Denied { .. }) || r.as_content().contains("Claim a Task"),
+            "should not be gated when approved, got {:?}",
+            r
         );
     }
 }

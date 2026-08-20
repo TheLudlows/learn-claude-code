@@ -258,6 +258,44 @@ impl PreToolHook for PermissionHook {
     }
 }
 
+/// PreToolUse hook for teammates: non-interactive version of PermissionHook.
+///
+/// 同样的 deny/approval 闸门，但**不读 stdin**：任何需要用户批准的命令/路径
+/// 在 teammate 上下文里直接拒绝（teammate 是后台非交互的）。返回 Some(reason)
+/// 表示拦截，None 表示放行。
+pub struct TeammatePermissionHook;
+
+impl PreToolHook for TeammatePermissionHook {
+    fn on_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
+        if name == "command" {
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(reason) = detect_encoding_bypass(cmd) {
+                return Some(format!("Permission denied: {}", reason));
+            }
+            if let Some(reason) = check_deny_patterns(cmd) {
+                return Some(format!("Permission denied: {}", reason));
+            }
+            if let Some(reason) = validate_command_structure(cmd) {
+                return Some(format!("Permission denied: {}", reason));
+            }
+            if requires_approval(cmd).is_some() {
+                return Some("Permission denied: teammate context cannot prompt for approval".to_string());
+            }
+        }
+        // File tools' check_permission returns NeedsApproval for paths escaping
+        // the workspace — teammates can't prompt, so deny those too.
+        if let Some(permission_check) = registry.check_permission(name, input) {
+            match permission_check {
+                PermissionCheck::Pass => {}
+                PermissionCheck::NeedsApproval(reason) => {
+                    return Some(format!("Permission denied (teammate, non-interactive): {}", reason));
+                }
+            }
+        }
+        None
+    }
+}
+
 /// 验证命令结构，防止命令注入和混淆攻击
 fn validate_command_structure(command: &str) -> Option<&'static str> {
     // 检查是否有命令分隔符（子命令）

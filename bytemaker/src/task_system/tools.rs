@@ -368,8 +368,12 @@ impl Tool for ClaimTaskTool {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let store = ctx.agent.task_store.clone();
-        claim_task(&store, task_id, "agent")
+        let owner = ctx.agent.owner.as_str();
+        if let Some(team) = &ctx.agent.team {
+            crate::team::claim_task(team, task_id, owner)
+        } else {
+            claim_task(&ctx.agent.task_store, task_id, owner)
+        }
     }
 }
 
@@ -408,8 +412,12 @@ impl Tool for CompleteTaskTool {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let store = ctx.agent.task_store.clone();
-        complete_task(&store, task_id, "agent")
+        let owner = ctx.agent.owner.as_str();
+        if let Some(team) = &ctx.agent.team {
+            crate::team::complete_task(team, task_id, owner)
+        } else {
+            complete_task(&ctx.agent.task_store, task_id, owner)
+        }
     }
 }
 

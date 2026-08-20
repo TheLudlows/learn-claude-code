@@ -95,6 +95,41 @@ pub struct ToolContext<'a> {
     pub agent: &'a crate::agent::Agent,
 }
 
+impl<'a> ToolContext<'a> {
+    /// The owning agent's name (Lead/subagent use "agent"; teammates use their name).
+    pub fn owner(&self) -> &str {
+        &self.agent.owner
+    }
+
+    /// Resolve the caller's working directory.
+    ///
+    /// - No team context (s06 subagents): the repo workdir.
+    /// - Lead (team=Some, no assignment): the repo workdir.
+    /// - Teammate with an active assignment: the assignment's cwd (task worktree
+    ///   in Phase 2, repo dir in Phase 1); fail-closed if the binding is broken.
+    /// - Teammate with no assignment: Err("Claim a Task...") — teammates must
+    ///   claim before touching the workspace.
+    pub fn cwd(&self) -> Result<std::path::PathBuf, String> {
+        match &self.agent.team {
+            None => Ok(self.agent.workdir.clone()),
+            Some(team) => {
+                if team.assignments.get(&self.agent.owner).is_some() {
+                    crate::team::assignment::assignment_cwd(
+                        &team.workdir,
+                        &team.task_store,
+                        &team.assignments,
+                        &self.agent.owner,
+                    )
+                } else if self.agent.kind == AgentKind::Teammate {
+                    Err("Claim a Task before using workspace tools.".into())
+                } else {
+                    Ok(self.agent.workdir.clone())
+                }
+            }
+        }
+    }
+}
+
 /// Tool definition structure for API integration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolDefinition {

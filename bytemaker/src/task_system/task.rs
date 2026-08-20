@@ -41,3 +41,14 @@ impl Task {
             && self.owner.as_deref() == Some(owner)
     }
 }
+
+impl TaskStatus {
+    /// 裸单词形式（`in_progress`），便于拼进面向用户的消息。
+    pub fn as_word(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+        }
+    }
+}

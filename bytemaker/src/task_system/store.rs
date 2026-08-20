@@ -113,6 +113,11 @@ impl TaskStore {
         Ok(self.directory.join(format!("{}.json", task_id)))
     }
 
+    /// The on-disk `.tasks` directory this store manages (s13: for TaskStoreLock).
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
     /// Checks if a task exists
     pub fn exists(&self, task_id: &str) -> bool {
         self.task_path(task_id)
