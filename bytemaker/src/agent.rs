@@ -384,7 +384,7 @@ impl Agent {
             let defs = self.registry.definitions_for(self.kind);
             let response = match self
                 .client
-                .stream_messages(&system, messages, &defs, self.max_tokens)
+                .stream_messages(&system, messages, &defs, self.max_tokens, None, tokio_util::sync::CancellationToken::new())
                 .await
             {
                 CallResult::Success(r) => {
@@ -409,6 +409,15 @@ impl Agent {
                         }
                     }
                     return Err(e);
+                }
+                CallResult::Cancelled => {
+                    if !waiting_for_ack.is_empty() {
+                        messages.truncate(scheduled_start);
+                        if let Some(cron) = &self.cron_manager {
+                            cron.restore_jobs(&waiting_for_ack);
+                        }
+                    }
+                    return Err(AgentError::Other("Cancelled".to_string()));
                 }
             };
 

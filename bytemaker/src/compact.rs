@@ -366,7 +366,7 @@ impl ContextCompactor {
         let body = self.summary_input(messages);
         let req = vec![Message::user_text(body)];
         let response: MessagesResponse = client
-            .stream_messages(SUMMARY_SYSTEM, &req, &[], 2000)
+            .stream_messages(SUMMARY_SYSTEM, &req, &[], 2000, None, tokio_util::sync::CancellationToken::new())
             .await
             .into_response()?;
         let summary: String = response
