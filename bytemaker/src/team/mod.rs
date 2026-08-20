@@ -395,6 +395,47 @@ fn apply_plan_response(team: &TeamCtx, owner: &str, msg: &MessageRecord) -> Stri
     )
 }
 
+// ---- s13 Lead inbox delivery (Task 13) ----
+
+/// Consume the Lead inbox, advancing protocol state for typed responses
+/// (shutdown_response / plan_approval_response). Returns the drained messages
+/// for the REPL to surface to the Lead as a new turn.
+pub fn consume_lead_inbox(team: &TeamCtx) -> Vec<MessageRecord> {
+    let msgs = team.bus.read_inbox("lead");
+    for msg in &msgs {
+        if msg.msg_type.ends_with("_response") {
+            let request_id = msg
+                .metadata
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let approve = msg.metadata.get("approve").and_then(|v| v.as_bool()).unwrap_or(false);
+            team.protocols
+                .match_response(&msg.msg_type, request_id, approve, &msg.from, &msg.to);
+        }
+    }
+    msgs
+}
+
+/// Render drained Lead-inbox events as a single user message body.
+pub fn format_team_events(msgs: &[MessageRecord]) -> String {
+    let mut lines = Vec::new();
+    for msg in msgs {
+        let rid = msg
+            .metadata
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let suffix = if rid.is_empty() {
+            String::new()
+        } else {
+            format!(" request_id={}", rid)
+        };
+        lines.push(format!("[{}{}] {}: {}", msg.msg_type, suffix, msg.from, msg.content));
+    }
+    format!("[Team events]\n{}", lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +507,59 @@ mod tests {
         let results: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let winners = results.iter().filter(|r| r.starts_with("Claimed")).count();
         assert_eq!(winners, 1, "exactly one concurrent claim must win, got {:?}", results);
+    }
+
+    #[test]
+    fn consume_lead_inbox_matches_response() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(create_test_store(tmp.path()));
+        let team = TeamCtx::new(tmp.path().to_path_buf(), store).unwrap();
+        // seed a pending shutdown request
+        use crate::team::protocols::{ProtocolState, ProtocolStatus, ProtocolType};
+        team.protocols.pending.lock().unwrap().insert(
+            "req_000001".into(),
+            ProtocolState {
+                request_id: "req_000001".into(),
+                ptype: ProtocolType::Shutdown,
+                sender: "lead".into(),
+                target: "alice".into(),
+                status: ProtocolStatus::Pending,
+                payload: String::new(),
+                work_version: None,
+                task_id: None,
+            },
+        );
+        // teammate replies shutdown_response into lead inbox
+        team.bus.send(
+            "alice",
+            "lead",
+            "ack",
+            "shutdown_response",
+            Some(serde_json::json!({"request_id": "req_000001", "approve": true})),
+        );
+        let inbox = consume_lead_inbox(&team);
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(
+            team.protocols
+                .pending
+                .lock()
+                .unwrap()
+                .get("req_000001")
+                .unwrap()
+                .status,
+            ProtocolStatus::Approved
+        );
+    }
+
+    #[test]
+    fn format_team_events_shape() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(create_test_store(tmp.path()));
+        let team = TeamCtx::new(tmp.path().to_path_buf(), store).unwrap();
+        team.bus.send("alice", "lead", "done", "result", None);
+        let inbox = team.bus.read_inbox("lead");
+        let s = format_team_events(&inbox);
+        assert!(s.starts_with("[Team events]"));
+        assert!(s.contains("[result] alice: done"));
     }
 }

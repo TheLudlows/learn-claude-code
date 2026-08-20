@@ -12,8 +12,8 @@ use bytemaker::error::AgentError;
 use bytemaker::output;
 use dotenv::dotenv;
 use std::env;
-use std::io;
 use std::path::PathBuf;
+use tokio::io::AsyncBufReadExt;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -61,36 +61,54 @@ async fn main() -> Result<(), AgentError> {
     ));
 
     let mut messages: Vec<Message> = Vec::new();
+    let mut reader = tokio::io::BufReader::new(tokio::io::stdin()).lines();
 
     loop {
-        output::prompt();
-
-        let mut query = String::new();
-        io::stdin().read_line(&mut query)?;
-        let query = query.trim().to_string();
-
-        if query.is_empty() {
-            continue;
+        // s13: wake the Lead when a teammate delivers an event (result/idle/plan).
+        let notify = agent.lead_notify().expect("team initialized");
+        tokio::select! {
+            biased;
+            // stdin line → a user turn.
+            line = reader.next_line() => {
+                let line = match line {
+                    Ok(Some(s)) => s,
+                    _ => break,
+                };
+                let query = line.trim().to_string();
+                if query.is_empty() {
+                    continue;
+                }
+                if query.eq_ignore_ascii_case("q") || query == "exit" {
+                    break;
+                }
+                // 用户输入后、进入 LLM 前触发 UserPromptSubmit。
+                agent.trigger_prompt(&query);
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text { text: query.clone() }],
+                });
+                if let Err(e) = agent.run_loop(&mut messages, &query).await {
+                    output::error(&format!("Error: {}", e));
+                }
+                output::blank();
+            }
+            // Lead inbox notify → drain typed events into a new turn.
+            _ = notify.notified() => {
+                let inbox = bytemaker::team::consume_lead_inbox(agent.team().unwrap());
+                if inbox.is_empty() {
+                    continue;
+                }
+                let text = bytemaker::team::format_team_events(&inbox);
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text { text }],
+                });
+                println!("[wake: {} team event(s) -> new turn]", inbox.len());
+                if let Err(e) = agent.run_loop(&mut messages, "[team events]").await {
+                    output::error(&format!("Error: {}", e));
+                }
+            }
         }
-        if query.eq_ignore_ascii_case("q") || query == "exit" {
-            break;
-        }
-
-        // 用户输入后、进入 LLM 前触发 UserPromptSubmit。
-        agent.trigger_prompt(&query);
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: query.clone(),
-            }],
-        });
-
-        if let Err(e) = agent.run_loop(&mut messages, &query).await {
-            output::error(&format!("Error: {}", e));
-        }
-
-        output::blank();
     }
 
     Ok(())
