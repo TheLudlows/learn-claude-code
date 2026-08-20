@@ -7,6 +7,7 @@
 
 use std::io::{self, Write};
 use crossterm::terminal as ct;
+use colored::{Colorize, control as colored_control};
 
 /// 输出栏状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +52,125 @@ impl<B: Backend> Coordinator<B> {
         self.backend.flush()?;
         self.mid_line = true;
         Ok(())
+    }
+
+    // ---- UX 输出方法（替代 output.rs 自由函数） ----
+
+    /// 普通横幅行（不着色）。
+    pub fn banner(&mut self, msg: &str) { let _ = self.emit(msg); }
+
+    /// 空行。
+    pub fn blank(&mut self) { let _ = self.emit(""); }
+
+    /// 状态行。
+    pub fn status(&mut self, msg: &str) {
+        if colored_control::SHOULD_COLORIZE.should_colorize() {
+            let _ = self.emit(&format!("{}", msg.yellow()));
+        } else {
+            let _ = self.emit(msg);
+        }
+    }
+
+    /// 错误行。
+    pub fn error(&mut self, msg: &str) {
+        if colored_control::SHOULD_COLORIZE.should_colorize() {
+            let _ = self.emit(&format!("{}", msg.red()));
+        } else {
+            let _ = self.emit(msg);
+        }
+    }
+
+    /// blocked 提示。
+    pub fn blocked(&mut self, pattern: &str) {
+        let _ = self.emit(""); // 前置空行
+        let msg = format!("[blocked] '{}' is on the deny list", pattern);
+        if colored_control::SHOULD_COLORIZE.should_colorize() {
+            let _ = self.emit(&format!("{}", msg.red()));
+        } else {
+            let _ = self.emit(&msg);
+        }
+    }
+
+    /// 提示符 ` >> `（cyan，无换行）。
+    pub fn prompt(&mut self) {
+        let s = if colored_control::SHOULD_COLORIZE.should_colorize() {
+            format!("{}", " >> ".cyan())
+        } else {
+            " >> ".to_string()
+        };
+        let _ = self.backend.write_str(&s);
+        let _ = self.backend.flush();
+    }
+
+    /// 权限确认。
+    pub fn permission(&mut self, reason: &str, name: &str, input: &serde_json::Value) {
+        let _ = self.emit(""); // 前置空行
+        if colored_control::SHOULD_COLORIZE.should_colorize() {
+            let _ = self.emit(&format!("{}", format!("[permission] {reason}").yellow()));
+        } else {
+            let _ = self.emit(&format!("[permission] {reason}"));
+        }
+        let _ = self.emit(&format!("   Tool: {}({})", name, input));
+        let _ = self.backend.write_str("   Allow? [y/N] ");
+        let _ = self.backend.flush();
+    }
+
+    /// 工具执行结果渲染（折叠+截断）。
+    pub fn render_tool_result(&mut self, name: &str, result: &str, color: bool) {
+        if color {
+            colored::control::set_override(true);
+        }
+
+        const TRUNCATE_AT: usize = 200;
+        let size = if result.len() < 1024 {
+            format!("{} B", result.len())
+        } else if result.len() < 1024 * 1024 {
+            format!("{:.1} KB", result.len() as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", result.len() as f64 / (1024.0 * 1024.0))
+        };
+
+        // 换行折叠成空格、去首尾空白
+        let collapsed: String = result
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect::<String>()
+            .trim()
+            .to_string();
+        let total = collapsed.chars().count();
+        let (content, truncated) = if total > TRUNCATE_AT {
+            let s: String = collapsed.chars().take(TRUNCATE_AT).collect();
+            (format!("{s}…"), true)
+        } else {
+            (collapsed, false)
+        };
+
+        let prefix = format!("↳ {name} 结果 ({size}): ");
+        let _ = self.emit(&format!(
+            "{}{}",
+            if color && colored_control::SHOULD_COLORIZE.should_colorize() {
+                format!("{}", prefix.dimmed())
+            } else {
+                prefix
+            },
+            content
+        ));
+
+        if truncated {
+            let trunc_msg = format!("  (已截断，共 {total} 字符)");
+            let _ = self.emit(&format!(
+                "{}",
+                if color && colored_control::SHOULD_COLORIZE.should_colorize() {
+                    format!("{}", trunc_msg.dimmed())
+                } else {
+                    trunc_msg
+                }
+            ));
+        }
+
+        if color {
+            colored_control::set_override(false);
+        }
     }
 }
 
@@ -144,5 +264,25 @@ mod tests {
         // 非 TTY（CI）下不应 panic，构造/析构皆 Ok。
         let g = RawModeGuard::new(false);
         drop(g); // 不 panic 即过
+    }
+
+    #[test]
+    fn render_tool_result_via_coordinator_matches_old_prefix() {
+        let mut c = Coordinator::new(VirtualTerm::new(24, 80));
+        c.render_tool_result("read_file", "hi", false);
+        let s = c.into_backend().screendump();
+        assert!(s.contains("↳"), "prefix kept: {s}");
+        assert!(s.contains("read_file"), "{s}");
+        assert!(s.contains("2 B"), "{s}");
+    }
+
+    #[test]
+    fn render_tool_result_truncates_long_output() {
+        let mut c = Coordinator::new(VirtualTerm::new(24, 80));
+        let long = "a".repeat(300);
+        c.render_tool_result("test", &long, false);
+        let s = c.into_backend().screendump();
+        assert!(s.contains("…"), "should be truncated: {s}");
+        assert!(s.contains("已截断"), "{s}");
     }
 }
