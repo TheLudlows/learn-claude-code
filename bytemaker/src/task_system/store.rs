@@ -169,6 +169,7 @@ impl TaskStore {
                         status: TaskStatus::Pending,
                         owner: None,
                         blocked_by: unique_deps.clone(),
+                        worktree: None,
                     };
 
                     let content = serde_json::to_string_pretty(&task)?;

@@ -485,6 +485,7 @@ mod tool_tests {
             status: TaskStatus::Pending,
             owner: None,
             blocked_by: vec![],
+            worktree: None,
         };
 
         let incomplete = incomplete_dependencies(&store, &task);
@@ -511,6 +512,7 @@ mod tool_tests {
             status: TaskStatus::Pending,
             owner: None,
             blocked_by: vec![dep.id.clone()],
+            worktree: None,
         };
 
         let incomplete = incomplete_dependencies(&store, &task);
@@ -532,6 +534,7 @@ mod tool_tests {
             status: TaskStatus::Pending,
             owner: None,
             blocked_by: vec![dep.id.clone()],
+            worktree: None,
         };
 
         let incomplete = incomplete_dependencies(&store, &task);
@@ -551,6 +554,7 @@ mod tool_tests {
             status: TaskStatus::Pending,
             owner: None,
             blocked_by: vec!["task_missing".to_string()],
+            worktree: None,
         };
 
         let incomplete = incomplete_dependencies(&store, &task);

@@ -29,7 +29,7 @@ fastrand = "2.1"
 regex = "1"
 croner = "3"
 tokio-cron-scheduler = "0.15"
-
+fs4 = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

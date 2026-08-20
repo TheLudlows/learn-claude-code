@@ -24,6 +24,9 @@ pub struct Task {
     pub owner: Option<String>,
     /// 前置任务 ID 列表
     pub blocked_by: Vec<String>,
+    /// Optional task-bound worktree name (s13). Old JSON without it deserializes to None.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 impl Task {

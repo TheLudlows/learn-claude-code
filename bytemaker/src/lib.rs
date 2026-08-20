@@ -10,6 +10,7 @@ pub mod memory;
 pub mod output;
 pub mod skills;
 pub mod task_system;
+pub mod team;
 pub mod todo;
 pub mod tools;
 
