@@ -35,6 +35,10 @@ regex = "1"
 croner = "3"
 tokio-cron-scheduler = "0.15"
 fs4 = "0.9"
+crossterm = "0.29"
+reedline = { version = "0.50", features = ["bashisms"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 tempfile = "3"
+portable-pty = "0.9"
