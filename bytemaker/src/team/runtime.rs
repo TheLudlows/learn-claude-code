@@ -211,7 +211,6 @@ pub fn spawn_teammate_thread(
 mod tests {
     use super::*;
     use crate::agent::TestAgent;
-    use crate::team::bus::is_valid_agent_name;
     use crate::team::is_reserved_teammate_name;
 
     #[test]
