@@ -42,6 +42,16 @@ impl AssignmentRegistry {
         self.assignments.lock().unwrap().remove(owner)
     }
 
+    /// Snapshot all (owner, assignment) pairs (s13 worktree removal: detect leases).
+    pub fn snap(&self) -> Vec<(String, Assignment)> {
+        self.assignments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     pub fn version(&self, owner: &str) -> u32 {
         *self.versions.lock().unwrap().get(owner).unwrap_or(&0)
     }

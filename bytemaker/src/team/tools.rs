@@ -405,6 +405,39 @@ impl Tool for ReviewPlanTool {
     }
 }
 
+/// Lead tool: create + bind a task worktree. Task must be pending and unowned.
+pub struct CreateWorktreeTool;
+
+#[async_trait]
+impl Tool for CreateWorktreeTool {
+    fn name(&self) -> &str {
+        "create_worktree"
+    }
+    fn description(&self) -> &str {
+        "Create and bind a task worktree (Lead only). Task must be pending and unowned."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{
+            "name":{"type":"string","pattern":"^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$","maxLength":64},
+            "task_id":{"type":"string"}
+        },"required":["name","task_id"],"additionalProperties":false})
+    }
+    fn check_permission(&self, _: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+    fn available_for(&self, kind: AgentKind) -> bool {
+        kind == AgentKind::Lead
+    }
+    async fn execute(&self, ctx: &ToolContext<'_>, input: &Value) -> String {
+        let Some(team) = &ctx.agent.team else {
+            return "Error: not in team context".into();
+        };
+        let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let task_id = input.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        crate::team::worktree::create_worktree(team, name, task_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

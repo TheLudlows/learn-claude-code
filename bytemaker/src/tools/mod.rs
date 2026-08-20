@@ -156,8 +156,8 @@ pub fn build_registry() -> ToolRegistry {
     registry.register(Box::new(edit_file::EditFileTool));
     registry.register(Box::new(glob_tool::GlobTool));
     registry.register(Box::new(load_skill::LoadSkillTool));
-    //registry.register(Box::new(todo_write::TodoWriteTool));
-    //registry.register(Box::new(task::TaskTool));
+    registry.register(Box::new(todo_write::TodoWriteTool));
+    registry.register(Box::new(task::TaskTool));
     
     registry.register(Box::new(crate::task_system::CreateTaskTool));
     registry.register(Box::new(crate::task_system::ListTasksTool));
@@ -180,7 +180,7 @@ pub fn build_registry() -> ToolRegistry {
     registry.register(Box::new(crate::team::tools::RequestPlanTool));
     registry.register(Box::new(crate::team::tools::ReviewPlanTool));
     registry.register(Box::new(crate::team::tools::SubmitPlanTool));
-    // CreateWorktreeTool registered in Phase 2 (Task 18).
+    registry.register(Box::new(crate::team::tools::CreateWorktreeTool));
 
     registry
 }
