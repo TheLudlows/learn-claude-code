@@ -4,7 +4,10 @@
     <content url="file://$MODULE_DIR$">
       <sourceFolder url="file://$MODULE_DIR$/bytemaker/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/bytemaker/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/bytemaker/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/rust-agent/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/bytemaker/target" />
+      <excludeFolder url="file://$MODULE_DIR$/rust-agent/target" />
     </content>
     <orderEntry type="jdk" jdkName="D:\miniconda" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

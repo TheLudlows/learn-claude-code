@@ -1000,8 +1000,8 @@ git commit -m "test(s14): pty end-to-end REPL I/O smoke (ignored)"
 
 ## 决策记录（spike 后填写）
 
-- [ ] spike 结果：PASS / FAIL（附症状）
-- [ ] 若 PASS：主路径 Task 2..11 执行
+- [x] spike 结果：PASS（ANSI 转义码验证通过，reedline 提示符正常显示，终端正常恢复）
+- [x] 若 PASS：主路径 Task 2..11 执行
 - [ ] 若 FAIL：回 spec §9.1，选回退 B（crossterm-only 手写编辑器）或 C（reedline 退半并发），重写 Task 8/9
 
 ---
@@ -1015,3 +1015,24 @@ Plan complete and saved to `docs/superpowers/plans/2026-08-20-console-io-separat
 **2. Inline Execution** - 在本会话用 executing-plans 批量执行，带检查点 review。
 
 哪种？
+
+**执行状态 (2026-08-20):**
+
+✅ 基础架构完成 (Tasks 1-6):
+- Task 1: Spike PASS - reedline + crossterm 滚动区共存验证通过
+- Task 2: Coordinator core + Backend trait + VirtualTerm - 5个测试通过  
+- Task 3: CrosstermBackend + RawModeGuard - 线程安全 Mutex 包裹
+- Task 4: DeltaSink + Cancelled + cancel-aware stream_messages
+- Task 5: agent.rs wiring - coordinator 共享 infra + delta sink + LoopOutcome::Cancelled
+- Task 6: output UX 方法收口为 Coordinator 方法 - 5个测试通过
+
+已提交分支：`worktree-console-io-separation` (6 commits: fa5f39a, 581b3c6, e982738, e716cfe, baf7fb7, b2cd312)
+
+⏳ 剩余集成工作 (Tasks 7-11):
+- Task 7: 异步 PreToolHook + HookContext + 权限经 InputTask oneshot 路由
+- Task 8: InputTask - reedline 壳 + 提交/排队/Ctrl+C/权限模式  
+- Task 9: main.rs 装配 - RawModeGuard + Coordinator + spawn InputTask + select(input_rx, lead_notify, cancel)
+- Task 10: 非 TTY 降级路径
+- Task 11: pty 端到端测试 (ignored,需真实终端 + API key)
+
+建议：使用 `superpowers:subagent-driven-development` 继续执行剩余 Tasks 7-11。
