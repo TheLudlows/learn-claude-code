@@ -67,6 +67,18 @@ impl CronManager {
         Ok(Self { state, workdir })
     }
 
+    /// 空操作实例：不启动后台调度器，consume_queue 返回空，schedule 操作内存态。
+    /// Subagent / Teammate 不需要定时能力，用此占位避免 Option。
+    pub fn noop() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(CronState {
+                jobs: HashMap::new(),
+                delivery_queue: VecDeque::new(),
+            })),
+            workdir: PathBuf::new(),
+        }
+    }
+
     /// 生成唯一的任务 ID
     fn generate_id(&self) -> String {
         let state = self.state.lock().expect("state mutex poisoned");

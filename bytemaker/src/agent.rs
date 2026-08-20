@@ -68,11 +68,11 @@ pub struct Agent {
 
     // ---- per-loop 状态：child 刷新 ----
     pub(crate) cron_manager: Option<Arc<CronManager>>,
-    pub(crate) compactor: Option<ContextCompactor>,
-    pub(crate) memory: Option<MemoryStore>,
+    pub(crate) compactor: ContextCompactor,
+    pub(crate) memory: MemoryStore,
     pub(crate) hooks: Hooks,
     pub(crate) base_system: String,
-    pub(crate) max_turns: Option<usize>,
+    pub(crate) max_turns: usize,
     pub(crate) kind: AgentKind,
     /// s13: this agent's owner name ("agent" for Lead/subagent; teammate name for teammates).
     pub(crate) owner: String,
@@ -105,11 +105,11 @@ impl Agent {
             cm
         });
 
-        let compactor = Some(ContextCompactor::new(
+        let compactor = ContextCompactor::new(
             cfg.workdir.join(".transcripts"),
             cfg.workdir.join(".task_outputs").join("tool-results"),
-        ));
-        let memory = Some(MemoryStore::new(cfg.workdir.join(".memory")));
+        );
+        let memory = MemoryStore::new(cfg.workdir.join(".memory"));
 
         let registry = Arc::new(tools::build_registry());
         let base_system = build_base_system(&skills, &cfg.workdir);
@@ -132,7 +132,7 @@ impl Agent {
             memory,
             hooks,
             base_system,
-            max_turns: None,
+            max_turns: usize::MAX,
             kind: AgentKind::Lead,
             owner: "agent".to_string(),
             team: Some(team),
@@ -141,8 +141,21 @@ impl Agent {
     }
 
     /// 产出嵌套子 agent：Arc-clone 共享 infra，刷新 per-loop 状态。
-    /// cron/compactor/memory 置 None（子 agent 不投递定时任务、不压缩、不读写持久记忆）。
+    /// cron_manager 置 None（子 agent 不投递定时任务）；
+    /// compactor 使用隔离子目录（避免与 Lead 文件竞争）；
+    /// memory 使用 read_only 模式（可召回但不写盘）；
+    /// max_turns 设为有限值以约束循环。
     pub fn child_agent(&self, max_turns: usize, sub_system: &str) -> Agent {
+        let subagent_id = format!("subagent_{}", fastrand::u64(..));
+        let subagent_dir = self.workdir.join(".subagents").join(&subagent_id);
+
+        let compactor = ContextCompactor::new(
+            subagent_dir.join(".transcripts"),
+            subagent_dir.join(".task_outputs").join("tool-results"),
+        );
+
+        let memory = MemoryStore::new_read_only(self.workdir.join(".memory"));
+
         Agent {
             client: Arc::clone(&self.client),
             registry: Arc::clone(&self.registry),
@@ -152,11 +165,11 @@ impl Agent {
             todo_manager: Arc::clone(&self.todo_manager),
             workdir: self.workdir.clone(),
             cron_manager: None,
-            compactor: None,
-            memory: None,
+            compactor,
+            memory,
             hooks: Self::build_hooks(&self.bg_manager, &self.todo_manager),
             base_system: sub_system.to_string(),
-            max_turns: Some(max_turns),
+            max_turns,
             kind: AgentKind::Subagent,
             owner: "agent".to_string(),
             team: None,
@@ -191,7 +204,18 @@ impl Agent {
     /// Produce a persistent teammate agent: shares infra, kind=Teammate, team=Some,
     /// fresh non-interactive hooks. Does NOT reference the Lead agent, so there is
     /// no TeamCtx → Agent → TeamCtx Arc cycle.
+    /// cron_manager 置 None；compactor 使用隔离子目录；memory 使用 read_only；
+    /// max_turns 设为 usize::MAX（Teammate 无轮次限制）。
     pub fn child_teammate(&self, name: &str, system: &str, team: Arc<crate::team::TeamCtx>) -> Agent {
+        let teammate_dir = self.workdir.join(".teammates").join(name);
+
+        let compactor = ContextCompactor::new(
+            teammate_dir.join(".transcripts"),
+            teammate_dir.join(".task_outputs").join("tool-results"),
+        );
+
+        let memory = MemoryStore::new_read_only(self.workdir.join(".memory"));
+
         Agent {
             client: Arc::clone(&self.client),
             registry: Arc::clone(&self.registry),
@@ -201,11 +225,11 @@ impl Agent {
             todo_manager: Arc::clone(&self.todo_manager),
             workdir: self.workdir.clone(),
             cron_manager: None,
-            compactor: None,
-            memory: None,
+            compactor,
+            memory,
             hooks: Self::build_teammate_hooks(),
             base_system: system.to_string(),
-            max_turns: None,
+            max_turns: usize::MAX,
             kind: AgentKind::Teammate,
             owner: name.to_string(),
             team: Some(team),
@@ -310,23 +334,20 @@ impl Agent {
     }
 
     /// 统一循环（原 main.rs::agent_loop + subagent.rs::run_subagent_loop 合并）。
-    /// Option 字段门控子 agent 差异（cron/compactor/memory 仅主 agent 有；max_turns 仅子 agent 有）。
+    /// cron_manager 仍为 Option（仅 Lead 持有）；compactor/memory/max_turns 始终有值。
     pub async fn run_loop(
         &self,
         messages: &mut Vec<Message>,
         active_request: &str,
     ) -> Result<LoopOutcome, AgentError> {
-        // s09：召回相关记忆拼进 system（每请求一次，与压缩正交）。子 agent memory=None 跳过。
-        let system = if let Some(mem) = &self.memory {
-            let recalled = mem.load_memories(&self.client, messages).await;
-            let index = mem.read_memory_index();
-            build_system(&self.base_system, &index, &recalled)
-        } else {
-            self.base_system.clone()
-        };
+        // s09：召回相关记忆拼进 system（每请求一次，与压缩正交）。
+        // read_only 实例也可召回；extract/consolidate 阶段 read_only 自动跳过写盘。
+        let recalled = self.memory.load_memories(&self.client, messages).await;
+        let index = self.memory.read_memory_index();
+        let system = build_system(&self.base_system, &index, &recalled);
 
         let mut reactive_retries = 0u32;
-        let max = self.max_turns.unwrap_or(usize::MAX);
+        let max = self.max_turns;
 
         for _turn in 1..=max {
             // 循环顶部：被动兜底收集已完成后台任务（子 agent 不在顶部拉取，与现状一致）。
@@ -357,10 +378,8 @@ impl Agent {
                 }
             }
 
-            // s08：每次调用模型前运行压缩管线（子 agent compactor=None 跳过）。
-            if let Some(c) = &self.compactor {
-                c.prepare(&self.client, messages, active_request).await?;
-            }
+            // s08：每次调用模型前运行压缩管线。
+            self.compactor.prepare(&self.client, messages, active_request).await?;
 
             let defs = self.registry.definitions_for(self.kind);
             let response = match self
@@ -372,14 +391,10 @@ impl Agent {
                     reactive_retries = 0;
                     r
                 }
-                // prompt_too_long 且有 compactor、还有重试预算：压缩后重试（子 agent 无 compactor → 走失败臂）。
-                CallResult::PromptTooLong(_)
-                    if reactive_retries < MAX_REACTIVE_RETRIES && self.compactor.is_some() =>
-                {
+                // prompt_too_long 且还有重试预算：压缩后重试。
+                CallResult::PromptTooLong(_) if reactive_retries < MAX_REACTIVE_RETRIES => {
                     output::status("[reactive compact]");
                     self.compactor
-                        .as_ref()
-                        .expect("compactor checked above")
                         .reactive_compact(&self.client, messages, active_request)
                         .await?;
                     reactive_retries += 1;
@@ -421,10 +436,9 @@ impl Agent {
                     messages.push(Message::user_text(force));
                     continue;
                 }
-                if let Some(mem) = &self.memory {
-                    if mem.extract_memories(&self.client, messages).await > 0 {
-                        let _ = mem.consolidate_memories(&self.client).await;
-                    }
+                // read_only 实例的 extract/consolidate 内部直接返回 0，无需额外判断。
+                if self.memory.extract_memories(&self.client, messages).await > 0 {
+                    let _ = self.memory.consolidate_memories(&self.client).await;
                 }
                 return Ok(LoopOutcome::Completed);
             }
@@ -554,6 +568,12 @@ impl TestAgent {
         let team = Arc::new(
             crate::team::TeamCtx::new(workdir.clone(), Arc::clone(&task_store)).unwrap(),
         );
+        let compactor = ContextCompactor::new(
+            workdir.join(".transcripts"),
+            workdir.join(".task_outputs").join("tool-results"),
+        );
+        let memory = MemoryStore::new_read_only(workdir.join(".memory"));
+
         let agent = Agent {
             client,
             registry,
@@ -563,11 +583,11 @@ impl TestAgent {
             todo_manager,
             workdir,
             cron_manager: None,
-            compactor: None,
-            memory: None,
+            compactor,
+            memory,
             hooks,
             base_system: "test system".into(),
-            max_turns: None,
+            max_turns: usize::MAX,
             kind: AgentKind::Lead,
             owner: "agent".to_string(),
             team: Some(team),
@@ -604,7 +624,7 @@ mod tests {
         // 全局单例已消除：可在同进程构造多个互不污染的 Agent（旧 OnceLock 不可并行）。
         let a = TestAgent::new();
         assert!(a.agent().kind == AgentKind::Lead);
-        assert!(a.agent().max_turns.is_none());
+        assert_eq!(a.agent().max_turns, usize::MAX);
         assert!(a.agent().cron_manager.is_none()); // TestAgent 跳过 cron
         let _b = TestAgent::new(); // 第二个，互不干扰
     }
@@ -620,10 +640,9 @@ mod tests {
         assert!(Arc::ptr_eq(&a.agent().bg_manager, &child.bg_manager));
         // per-loop 状态刷新
         assert!(child.kind == AgentKind::Subagent);
-        assert_eq!(child.max_turns, Some(30));
+        assert_eq!(child.max_turns, 30);
         assert!(child.cron_manager.is_none()); // 子 agent 不投递定时任务
-        assert!(child.compactor.is_none());
-        assert!(child.memory.is_none());
+        // compactor/memory 始终有值，但子 agent 使用隔离目录和 read_only 模式
         assert_eq!(child.base_system, "sub");
     }
 

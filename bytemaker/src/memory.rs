@@ -67,8 +67,11 @@ const TEMPORARY_MEMORY_MARKERS: &[&str] = &[
 ];
 
 /// 上下文记忆存储:只持 memory_dir,文件系统即状态。
+/// `read_only` 模式下可召回(load_memories)但不写盘(extract/consolidate 直接返回 0),
+/// 供 subagent/teammate 共享 Lead 的知识库而不污染。
 pub struct MemoryStore {
     memory_dir: PathBuf,
+    read_only: bool,
 }
 
 /// 一条已解析的记忆记录(供召回目录 / 提取查重 / 整理快照)。
@@ -111,7 +114,18 @@ struct FrontmatterOut<'a> {
 
 impl MemoryStore {
     pub fn new(memory_dir: PathBuf) -> Self {
-        Self { memory_dir }
+        Self {
+            memory_dir,
+            read_only: false,
+        }
+    }
+
+    /// 只读实例:可召回记忆但不写盘。Subagent / Teammate 用此共享 Lead 的知识库。
+    pub fn new_read_only(memory_dir: PathBuf) -> Self {
+        Self {
+            memory_dir,
+            read_only: true,
+        }
     }
 
     /// 把 name 归一为文件名片段:小写,非 [alphanumeric|_] 连段替成单 `-`,
@@ -436,7 +450,11 @@ impl MemoryStore {
     // ---- 提取 ----
 
     /// 回合结束后从对话里提取持久记忆并写盘;返回写入数。失败打印 skip 返回 0。
+    /// 只读模式下直接返回 0。
     pub async fn extract_memories(&self, client: &Client, messages: &[Message]) -> usize {
+        if self.read_only {
+            return 0;
+        }
         let dialogue = dialogue_text(messages, 12);
         if dialogue.is_empty() {
             return 0;
@@ -522,7 +540,11 @@ impl MemoryStore {
     }
     
     /// ≥10 条时让模型合并去重,快照 + 失败恢复。返回整理后条数;失败返回 0。
+    /// 只读模式下直接返回 0。
     pub async fn consolidate_memories(&self, client: &Client) -> usize {
+        if self.read_only {
+            return 0;
+        }
         let records = self.list_memory_files();
         if records.len() < CONSOLIDATE_THRESHOLD {
             return 0;
