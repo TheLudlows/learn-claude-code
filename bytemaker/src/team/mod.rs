@@ -302,10 +302,7 @@ pub fn drain_inbox(team: &TeamCtx, owner: &str, messages: &mut Vec<Message>) -> 
         }
     }
     if !work.is_empty() {
-        messages.push(Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text { text: work.join("\n") }],
-        });
+        messages.push(Message::user_text(work.join("\n")));
     }
     should_stop
 }

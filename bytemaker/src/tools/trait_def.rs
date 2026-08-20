@@ -135,7 +135,7 @@ impl<'a> ToolContext<'a> {
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
-    pub input_schema: serde_json::Value,
+    pub input_schema: Value,
 }
 
 /// Async trait that all tools must implement

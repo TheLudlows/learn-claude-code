@@ -31,10 +31,7 @@ impl TeammateRuntime {
     /// by the caller via `lead_agent.child_teammate(...)` — the runtime does NOT
     /// reference the Lead agent, avoiding a TeamCtx → Agent → TeamCtx Arc cycle.
     pub fn new(name: String, _role: &str, prompt: String, team: Arc<TeamCtx>, child_agent: Agent) -> Self {
-        let mut messages = vec![Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text { text: prompt }],
-        }];
+        let mut messages = vec![Message::user_text(prompt)];
         if let Some(a) = team.assignments.get(&name) {
             if let Ok(task) = team.task_store.load(&a.task_id) {
                 let block = format!(
@@ -137,10 +134,7 @@ impl TeammateRuntime {
                     task.description,
                     cwd.display()
                 );
-                self.messages.push(Message {
-                    role: "user".to_string(),
-                    content: vec![ContentBlock::Text { text }],
-                });
+                self.messages.push(Message::user_text(text));
                 return true;
             }
         }

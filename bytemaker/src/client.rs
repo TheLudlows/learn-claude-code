@@ -44,6 +44,135 @@ pub enum ContentBlock {
     },
 }
 
+impl Message {
+    /// 单条 user 文本消息（最常见的形状：role=`user` + 一个 Text 块）。
+    pub fn user_text(text: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// 单条 assistant 文本消息。
+    pub fn assistant_text(text: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// assistant 消息，直接包裹已有的 content 块（如把 API 响应回填进对话）。
+    pub fn assistant_content(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content,
+        }
+    }
+
+    /// user 消息，直接包裹已有的 content 块（tool 结果 / 提醒等透传）。
+    pub fn user_blocks(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content,
+        }
+    }
+
+    /// 返回一个 builder，用于在一则消息里混排 Text / ToolUse / ToolResult 块。
+    pub fn builder() -> MessageBuilder {
+        MessageBuilder::new()
+    }
+}
+
+/// 按块拼装 `Message` 的 builder。
+///
+/// 常见形状优先用 `Message::user_text` / `assistant_text` / `assistant_content`
+/// / `user_blocks` 等命名构造器；当一则消息里需要混排多个 Text / ToolUse /
+/// ToolResult 块时，用本 builder 链式追加，最后 `.build()` 成 `Message`。
+#[derive(Default)]
+pub struct MessageBuilder {
+    role: String,
+    content: Vec<ContentBlock>,
+}
+
+impl MessageBuilder {
+    /// 空 builder（role 与 content 均为空）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 设定角色为 user（等价于 `.role("user")`）。
+    pub fn user(mut self) -> Self {
+        self.role = "user".to_string();
+        self
+    }
+
+    /// 设定角色为 assistant（等价于 `.role("assistant")`）。
+    pub fn assistant(mut self) -> Self {
+        self.role = "assistant".to_string();
+        self
+    }
+
+    /// 设定角色。
+    pub fn role(mut self, role: impl Into<String>) -> Self {
+        self.role = role.into();
+        self
+    }
+
+    /// 追加一个 Text 块。
+    pub fn text(mut self, text: impl Into<String>) -> Self {
+        self.content.push(ContentBlock::Text { text: text.into() });
+        self
+    }
+
+    /// 追加一个 ToolUse 块。
+    pub fn tool_use(
+        mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        self.content.push(ContentBlock::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+        });
+        self
+    }
+
+    /// 追加一个 ToolResult 块。
+    pub fn tool_result(
+        mut self,
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        self.content.push(ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+        });
+        self
+    }
+
+    /// 追加任意一个 content 块。
+    pub fn block(mut self, block: ContentBlock) -> Self {
+        self.content.push(block);
+        self
+    }
+
+    /// 用给定块整体替换 content。
+    pub fn content(mut self, blocks: Vec<ContentBlock>) -> Self {
+        self.content = blocks;
+        self
+    }
+
+    /// 构造 `Message`。
+    pub fn build(self) -> Message {
+        Message {
+            role: self.role,
+            content: self.content,
+        }
+    }
+}
+
 /// Anthropic API 响应（流式累加后的完整结果）
 #[derive(Debug)]
 pub struct MessagesResponse {

@@ -137,6 +137,12 @@ impl SharedTodoManager {
         SharedTodoManager(Mutex::new(manager))
     }
 
+    /// 只读渲染当前 todo 列表（供 hook 注入用）。
+    pub fn render(&self) -> String {
+        let guard = self.0.lock().expect("todo mutex poisoned");
+        guard.render()
+    }
+
     /// todo_write 工具处理函数：锁内更新 + 渲染（原 free `run_todo_write` 逻辑）。
     pub fn run_todo_write(&self, todos: &serde_json::Value) -> String {
         let mut guard = self.0.lock().expect("todo mutex poisoned");

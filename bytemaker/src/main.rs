@@ -7,7 +7,7 @@ main.rs - REPL 入口（s13）
 */
 
 use bytemaker::agent::{Agent, AgentConfig};
-use bytemaker::client::{ContentBlock, Message};
+use bytemaker::client::Message;
 use bytemaker::error::AgentError;
 use bytemaker::output;
 use dotenv::dotenv;
@@ -83,10 +83,7 @@ async fn main() -> Result<(), AgentError> {
                 }
                 // 用户输入后、进入 LLM 前触发 UserPromptSubmit。
                 agent.trigger_prompt(&query);
-                messages.push(Message {
-                    role: "user".to_string(),
-                    content: vec![ContentBlock::Text { text: query.clone() }],
-                });
+                messages.push(Message::user_text(query.clone()));
                 if let Err(e) = agent.run_loop(&mut messages, &query).await {
                     output::error(&format!("Error: {}", e));
                 }
@@ -99,10 +96,7 @@ async fn main() -> Result<(), AgentError> {
                     continue;
                 }
                 let text = bytemaker::team::format_team_events(&inbox);
-                messages.push(Message {
-                    role: "user".to_string(),
-                    content: vec![ContentBlock::Text { text }],
-                });
+                messages.push(Message::user_text(text));
                 println!("[wake: {} team event(s) -> new turn]", inbox.len());
                 if let Err(e) = agent.run_loop(&mut messages, "[team events]").await {
                     output::error(&format!("Error: {}", e));

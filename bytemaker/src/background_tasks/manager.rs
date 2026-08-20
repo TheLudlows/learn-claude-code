@@ -150,10 +150,7 @@ impl BackgroundManager {
             .into_iter()
             .map(|n| crate::client::ContentBlock::Text { text: n })
             .collect();
-        messages.push(crate::client::Message {
-            role: "user".to_string(),
-            content: blocks,
-        });
+        messages.push(crate::client::Message::user_blocks(blocks));
         Some(count)
     }
 

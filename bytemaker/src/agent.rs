@@ -113,7 +113,7 @@ impl Agent {
 
         let registry = Arc::new(tools::build_registry());
         let base_system = build_base_system(&skills, &cfg.workdir);
-        let hooks = Self::build_hooks(&bg_manager);
+        let hooks = Self::build_hooks(&bg_manager, &todo_manager);
         let team = Arc::new(
             crate::team::TeamCtx::new(cfg.workdir.clone(), Arc::clone(&task_store))
                 .map_err(|e| AgentError::Other(format!("team init: {e}")))?,
@@ -154,7 +154,7 @@ impl Agent {
             cron_manager: None,
             compactor: None,
             memory: None,
-            hooks: Self::build_hooks(&self.bg_manager), // 刷新：TodoReminder 计数器归零（修 S4）
+            hooks: Self::build_hooks(&self.bg_manager, &self.todo_manager),
             base_system: sub_system.to_string(),
             max_turns: Some(max_turns),
             kind: AgentKind::Subagent,
@@ -176,13 +176,14 @@ impl Agent {
 
     /// 装配默认 hook 集（原 main.rs:299-305）。
     /// BackgroundStopHook 经构造器 DI 拿到 bg_manager（原读全局 get_manager）。
-    fn build_hooks(bg: &Arc<BackgroundManager>) -> Hooks {
+    /// TodoReminderHook 经构造器 DI 拿到 todo_manager（每次注入当前 todo 列表）。
+    fn build_hooks(bg: &Arc<BackgroundManager>, todo: &Arc<SharedTodoManager>) -> Hooks {
         let mut h = Hooks::new();
         h.on_prompt(builtins::ContextInjectHook);
         h.on_pre_tool(builtins::PermissionHook);
         h.on_post_tool(builtins::LargeOutputHook);
         h.on_stop(builtins::SummaryHook);
-        h.on_post_tool(builtins::TodoReminderHook::new());
+        h.on_post_tool(builtins::TodoReminderHook::new(Arc::clone(todo)));
         h.on_stop(BackgroundStopHook::new(Arc::clone(bg)));
         h
     }
@@ -339,12 +340,7 @@ impl Agent {
             if let Some(cron) = &self.cron_manager {
                 let jobs = cron.consume_queue();
                 for job in &jobs {
-                    messages.push(Message {
-                        role: "user".to_string(),
-                        content: vec![ContentBlock::Text {
-                            text: format!("[Scheduled] {}", job.prompt),
-                        }],
-                    });
+                    messages.push(Message::user_text(format!("[Scheduled] {}", job.prompt)));
                     let preview: String = job.prompt.chars().take(60).collect();
                     println!("  [cron] delivered {}: {}", job.id, preview);
                 }
@@ -408,10 +404,7 @@ impl Agent {
             }
 
             // 追加助手响应（含 text 与 tool_use 块，原样回传下一轮）。
-            messages.push(Message {
-                role: "assistant".to_string(),
-                content: response.content.clone(),
-            });
+            messages.push(Message::assistant_content(response.content.clone()));
 
             // 模型调用成功后确认定时任务。
             if !waiting_for_ack.is_empty() {
@@ -427,10 +420,7 @@ impl Agent {
             if response.stop_reason != "tool_use" {
                 // s04：退出前触发 Stop；返回 Some(msg) 则注入并继续，不退出。
                 if let Some(force) = self.hooks.trigger_stop(messages) {
-                    messages.push(Message {
-                        role: "user".to_string(),
-                        content: vec![ContentBlock::Text { text: force }],
-                    });
+                    messages.push(Message::user_text(force));
                     continue;
                 }
                 // s09：真退出前提取持久记忆（子 agent memory=None 跳过）。
@@ -456,12 +446,7 @@ impl Agent {
         let child = self.child_agent(max_turns, SUB_SYSTEM);
         output::status("[Subagent started]");
 
-        let mut messages: Vec<Message> = vec![Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-            }],
-        }];
+        let mut messages: Vec<Message> = vec![Message::user_text(prompt)];
 
         let outcome = child.run_loop(&mut messages, prompt).await?;
 
@@ -568,7 +553,7 @@ impl TestAgent {
         ));
         let todo_manager = Arc::new(SharedTodoManager::new(TodoManager::new()));
         let registry = Arc::new(tools::build_registry());
-        let hooks = Agent::build_hooks(&bg_manager);
+        let hooks = Agent::build_hooks(&bg_manager, &todo_manager);
         let team = Arc::new(
             crate::team::TeamCtx::new(workdir.clone(), Arc::clone(&task_store)).unwrap(),
         );

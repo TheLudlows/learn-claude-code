@@ -114,32 +114,20 @@ pub fn assemble_post_tool_messages(
     let mut out: Vec<Message> = Vec::new();
 
     if !tool_results.is_empty() {
-        out.push(Message {
-            role: "user".to_string(),
-            content: tool_results,
-        });
+        out.push(Message::user_blocks(tool_results));
     }
 
     if !reminders.is_empty() {
-        out.push(Message {
-            role: "user".to_string(),
-            content: reminders
-                .into_iter()
-                .map(|r| ContentBlock::Text { text: r })
-                .collect(),
-        });
+        out.push(Message::user_blocks(
+            reminders.into_iter().map(|r| ContentBlock::Text { text: r }).collect(),
+        ));
     }
 
     // 兜底：两者皆空时（stop_reason 被报为 tool_use 但 content 里没有 ToolUse 块，
     // 且无 PostToolUse 提醒），仍要回喂一条非空 user 消息——否则 Anthropic API 会以
     // "content cannot be empty" 返回 400。
     if out.is_empty() {
-        out.push(Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: "(no tool calls to execute)".to_string(),
-            }],
-        });
+        out.push(Message::user_text("(no tool calls to execute)"));
     }
 
     out

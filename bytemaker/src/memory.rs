@@ -357,10 +357,7 @@ impl MemoryStore {
             query,
             take_chars(&catalog, 12000)
         );
-        let req = vec![Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text { text: prompt }],
-        }];
+        let req = vec![Message::user_text(prompt)];
         match client.stream_messages("", &req, &[], 200).await.into_response() {
             Ok(response) => {
                 let text = response_text(&response);
@@ -477,10 +474,7 @@ impl MemoryStore {
             take_chars(&existing, 6000),
             dialogue
         );
-        let req = vec![Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text { text: prompt }],
-        }];
+        let req = vec![Message::user_text(prompt)];
         let response = match client.stream_messages("", &req, &[], 1000).await.into_response() {
             Ok(r) => r,
             Err(e) => {
@@ -561,10 +555,7 @@ impl MemoryStore {
              30 records.\n\n{}",
             catalog
         );
-        let req = vec![Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text { text: prompt }],
-        }];
+        let req = vec![Message::user_text(prompt)];
         let response = match client.stream_messages("", &req, &[], 3000).await.into_response() {
             Ok(r) => r,
             Err(e) => {
@@ -943,10 +934,7 @@ mod tests {
     }
 
     fn user_text(s: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text { text: s.to_string() }],
-        }
+        Message::user_text(s)
     }
 
     // ---- slug ----
@@ -1200,7 +1188,7 @@ mod tests {
 
     #[test]
     fn dialogue_text_prefixes_role() {
-        let msgs = vec![user_text("hello"), Message { role: "assistant".into(), content: vec![ContentBlock::Text { text: "hi back".into() }] }];
+        let msgs = vec![user_text("hello"), Message::assistant_text("hi back")];
         let d = dialogue_text(&msgs, 12);
         assert!(d.contains("user: hello"));
         assert!(d.contains("assistant: hi back"));
@@ -1322,7 +1310,7 @@ mod tests {
         let (store, dir) = temp_store("smoke-extract");
         let messages = vec![
             user_text("I prefer using tabs for indentation. Remember that."),
-            Message { role: "assistant".into(), content: vec![ContentBlock::Text { text: "Got it, I'll remember you prefer tabs.".into() }] },
+            Message::assistant_text("Got it, I'll remember you prefer tabs."),
         ];
         let stored = store.extract_memories(&client, &messages).await;
         eprintln!("stored: {}", stored);

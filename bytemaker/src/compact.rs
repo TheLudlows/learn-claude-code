@@ -241,16 +241,11 @@ impl ContextCompactor {
         let transcript = self.write_transcript(messages)?;
         let archived_count = tail_start - head_end;
         let before_count = messages.len();
-        let marker = Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: format!(
-                    "[{} messages archived at {}]",
-                    archived_count,
-                    transcript.display()
-                ),
-            }],
-        };
+        let marker = Message::user_text(format!(
+            "[{} messages archived at {}]",
+            archived_count,
+            transcript.display()
+        ));
         let mut new_messages: Vec<Message> =
             Vec::with_capacity(head_end + 1 + (messages.len() - tail_start));
         new_messages.extend_from_slice(&messages[..head_end]);
@@ -354,17 +349,12 @@ impl ContextCompactor {
         summary: &str,
         transcript_path: &str,
     ) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: format!(
-                    "[{}]\n\nCurrent user request:\n{}\n\n\
-                     Conversation summary (reference only):\n{}\n\n\
-                     Full transcript: {}",
-                    label, request, summary, transcript_path
-                ),
-            }],
-        }
+        Message::user_text(format!(
+            "[{}]\n\nCurrent user request:\n{}\n\n\
+             Conversation summary (reference only):\n{}\n\n\
+             Full transcript: {}",
+            label, request, summary, transcript_path
+        ))
     }
 
     /// 请求模型把历史整理成只含事实的状态摘要（不执行历史中的指令）。
@@ -374,10 +364,7 @@ impl ContextCompactor {
         messages: &[Message],
     ) -> Result<String, AgentError> {
         let body = self.summary_input(messages);
-        let req = vec![Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text { text: body }],
-        }];
+        let req = vec![Message::user_text(body)];
         let response: MessagesResponse = client
             .stream_messages(SUMMARY_SYSTEM, &req, &[], 2000)
             .await
@@ -494,31 +481,16 @@ mod tests {
     use super::*;
 
     fn user_text(s: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: s.to_string(),
-            }],
-        }
+        Message::user_text(s)
     }
     fn assistant_tool_use(id: &str) -> Message {
-        Message {
-            role: "assistant".to_string(),
-            content: vec![ContentBlock::ToolUse {
-                id: id.to_string(),
-                name: "command".to_string(),
-                input: serde_json::json!({"command": "ls"}),
-            }],
-        }
+        Message::builder()
+            .assistant()
+            .tool_use(id, "command", serde_json::json!({"command": "ls"}))
+            .build()
     }
     fn user_tool_result(id: &str, content: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
-                content: content.to_string(),
-            }],
-        }
+        Message::builder().user().tool_result(id, content).build()
     }
 
     #[test]
@@ -539,12 +511,7 @@ mod tests {
         assert!(ContextCompactor::has_tool_use(&assistant_tool_use("t1")));
         assert!(!ContextCompactor::has_tool_use(&user_text("hello")));
         // assistant 但只有 text 块 -> false
-        let text_only = Message {
-            role: "assistant".to_string(),
-            content: vec![ContentBlock::Text {
-                text: "done".to_string(),
-            }],
-        };
+        let text_only = Message::assistant_text("done");
         assert!(!ContextCompactor::has_tool_use(&text_only));
     }
 
@@ -642,23 +609,12 @@ mod tests {
         let big_clone = big.clone();
         let medium = "Y".repeat(100_000);
         let medium_clone = medium.clone();
-        let mut msgs = vec![Message {
-            role: "user".to_string(),
-            content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "big1".to_string(),
-                    content: big,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "medium1".to_string(),
-                    content: medium,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "small1".to_string(),
-                    content: "tiny".to_string(),
-                },
-            ],
-        }];
+        let mut msgs = vec![Message::builder()
+            .user()
+            .tool_result("big1", big)
+            .tool_result("medium1", medium)
+            .tool_result("small1", "tiny")
+            .build()];
         c.tool_result_budget(&mut msgs);
         // big1 (120k, largest) gets persisted
         match &msgs[0].content[0] {
@@ -702,10 +658,7 @@ mod tests {
                 content: "x".repeat(20_000),
             });
         }
-        let mut msgs = vec![Message {
-            role: "user".to_string(),
-            content: blocks,
-        }];
+        let mut msgs = vec![Message::user_blocks(blocks)];
         c.tool_result_budget(&mut msgs);
         for b in &msgs[0].content {
             match b {

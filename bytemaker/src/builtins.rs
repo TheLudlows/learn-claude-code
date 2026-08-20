@@ -5,55 +5,38 @@ main.rs 默认注册的钩子集中于此(5 个内置钩子全部到位):
   ContextInjectHook  UserPromptSubmit  记录工作目录
   LargeOutputHook    PostToolUse       输出过大提醒
   SummaryHook        Stop              收尾工具次数统计
-  TodoReminderHook   PostToolUse       3 轮未 todo_write 时提醒
+  TodoReminderHook   PostToolUse       每次工具执行后注入当前 todo 列表
   PermissionHook     PreToolUse        三道闸门权限管线
 
 均实现 hooks.rs 中对应 trait, 通过 hooks.on_* 注册。
 */
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::client::{ContentBlock, Message};
 use crate::hooks::{PostToolHook, PreToolHook, PromptHook, StopHook};
 use crate::output;
+use crate::todo::SharedTodoManager;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::trait_def::PermissionCheck;
 use crate::tools::workdir;
 
-/// PostToolUse: 在 3 轮未使用 todo_write 时注入提醒。
-/// 计数器为 owned 字段, 不再依赖 static 全局 —— 不同 Hooks 实例互不干扰。
+/// PostToolUse: 每次工具执行后注入当前 todo 列表。
+/// 持有 Arc<SharedTodoManager>，经 render() 只读获取当前状态。
 pub struct TodoReminderHook {
-    rounds_since_todo: AtomicUsize,
+    todo_manager: Arc<SharedTodoManager>,
 }
 
 impl TodoReminderHook {
-    pub fn new() -> Self {
-        Self {
-            rounds_since_todo: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl Default for TodoReminderHook {
-    fn default() -> Self {
-        Self::new()
+    pub fn new(todo_manager: Arc<SharedTodoManager>) -> Self {
+        Self { todo_manager }
     }
 }
 
 impl PostToolHook for TodoReminderHook {
-    fn on_post_tool(&self, name: &str, _input: &serde_json::Value, _output: &str) -> Option<String> {
-        if name == "todo_write" {
-            self.rounds_since_todo.store(0, Ordering::SeqCst);
-            None
-        } else {
-            let count = self.rounds_since_todo.fetch_add(1, Ordering::SeqCst) + 1;
-            if count >= 3 {
-                self.rounds_since_todo.store(0, Ordering::SeqCst);
-                Some("<reminder>Update your todos.</reminder>".to_string())
-            } else {
-                None
-            }
-        }
+    fn on_post_tool(&self, _name: &str, _input: &serde_json::Value, _output: &str) -> Option<String> {
+        let todos = self.todo_manager.render();
+        Some(format!("<reminder>\nCurrent todos:\n{}\n</reminder>", todos))
     }
 }
 
