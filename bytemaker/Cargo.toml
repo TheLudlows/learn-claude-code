@@ -6,6 +6,11 @@ edition = "2021"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Enable real teammate spawning in the ignored smoke test
+# (cargo test --test s13_agent_teams --features smoke -- --ignored).
+smoke = []
+
 [dependencies]
 dotenv = "0.15"
 chrono = { version = "0.4", features = ["serde"] }

@@ -195,9 +195,11 @@ pub fn spawn_teammate_thread(
     let system = teammate_system_prompt(name, role);
     let agent = lead_agent.child_teammate(name, &system, Arc::clone(team));
     let rt = TeammateRuntime::new(name.into(), role, prompt.into(), Arc::clone(team), agent);
-    #[cfg(not(test))]
+    // Spawn a live runtime unless we're in a unit-test build without the smoke
+    // feature (so unit tests don't spawn real runtimes / hit the network).
+    #[cfg(any(not(test), feature = "smoke"))]
     tokio::spawn(async move { rt.run().await });
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "smoke")))]
     {
         drop(rt);
     }
