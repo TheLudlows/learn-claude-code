@@ -2,13 +2,14 @@ pub mod lock;
 pub mod bus;
 pub mod assignment;
 pub mod protocols;
-// pub mod runtime;    // Task 10
+pub mod runtime;
 pub mod tools;
 pub mod worktree;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::client::{ContentBlock, Message};
 use crate::task_system::task::{Task, TaskStatus};
@@ -151,6 +152,114 @@ fn incomplete_deps(team: &TeamCtx, task: &Task) -> Vec<String> {
 
 fn incomplete_deps_empty(team: &TeamCtx, task: &Task) -> bool {
     incomplete_deps(team, task).is_empty()
+}
+
+// ---- s13 teammate lifecycle helpers (Task 10) ----
+
+/// How long a teammate blocks on its inbox before falling back to a task scan.
+pub const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+
+pub fn is_reserved_teammate_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "lead" || lower == "agent"
+}
+
+pub fn teammate_system_prompt(name: &str, role: &str) -> String {
+    format!(
+        "You are '{name}', a {role}. Use tools to complete the assigned Task, then call \
+         complete_task and report a concise result. If the first user message contains \
+         [Assigned task], that Task is already claimed; do not call claim_task for it \
+         again. When asked for a plan, call submit_plan and wait for approval before \
+         bash or file changes. File and shell tools use the Task's working directory; \
+         that directory is not a sandbox. The runtime delivers your final text to Lead. \
+         Use send_message only for intermediate coordination, addressing the coordinator \
+         as 'lead'."
+    )
+}
+
+/// Drop a teammate's assignment if its task is completed + still owned by it.
+pub fn release_completed_assignment(team: &TeamCtx, owner: &str) -> bool {
+    let g = team.assignments.get(owner);
+    if g.is_none() {
+        return false;
+    }
+    let a = g.unwrap();
+    let task = match team.task_store.load(&a.task_id) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if task.status != TaskStatus::Completed || task.owner.as_deref() != Some(owner) {
+        return false;
+    }
+    team.assignments.remove(owner);
+    team.assignments.advance_version(owner);
+    team.protocols.set_gate(owner, GateStatus::NotRequired);
+    true
+}
+
+/// Release a teammate's assignment on shutdown: return any in-progress task it
+/// owned to Pending, clear the assignment, and reset the gate.
+pub fn release_teammate_assignment(team: &TeamCtx, owner: &str) {
+    let _g = match team.lock.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    for t in team.task_store.list().unwrap_or_default() {
+        if t.status == TaskStatus::InProgress && t.owner.as_deref() == Some(owner) {
+            let mut t = t;
+            t.status = TaskStatus::Pending;
+            t.owner = None;
+            let _ = team.task_store.save(&t);
+        }
+    }
+    team.assignments.remove(owner);
+    team.assignments.advance_version(owner);
+    team.protocols.set_gate(owner, GateStatus::NotRequired);
+}
+
+/// Pending, unowned, deps-complete tasks whose worktree binding (if any) resolves.
+pub fn scan_unclaimed_tasks(team: &TeamCtx) -> Vec<Task> {
+    let mut out = Vec::new();
+    for t in team.task_store.list().unwrap_or_default() {
+        if t.status == TaskStatus::Pending
+            && t.owner.is_none()
+            && incomplete_deps_empty(team, &t)
+        {
+            let (_cwd, err) = crate::team::worktree::task_worktree_cwd(&team.workdir, &t);
+            if err.is_none() {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Claim the first scannable task for `owner` (no-op if already assigned).
+pub fn claim_next_task(team: &TeamCtx, owner: &str) -> Option<Task> {
+    if team.assignments.get(owner).is_some() {
+        return None;
+    }
+    for t in scan_unclaimed_tasks(team) {
+        let r = claim_task(team, &t.id, owner);
+        if r.starts_with("Claimed") {
+            return team.task_store.load(&t.id).ok();
+        }
+    }
+    None
+}
+
+/// Last assistant text block in the conversation (the teammate's "result").
+pub fn extract_last_assistant_text(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .and_then(|m| {
+            m.content.iter().rev().find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+        })
 }
 
 // ---- s13 run-loop inbox drain + protocol application (Task 7) ----

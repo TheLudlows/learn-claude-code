@@ -89,6 +89,42 @@ impl Tool for SubmitPlanTool {
     }
 }
 
+/// Lead tool: spawn a persistent teammate bound to an optional task.
+pub struct SpawnTeammateTool;
+
+#[async_trait]
+impl Tool for SpawnTeammateTool {
+    fn name(&self) -> &str {
+        "spawn_teammate"
+    }
+    fn description(&self) -> &str {
+        "Spawn a persistent teammate. Propose a team and wait for user confirmation first."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{
+            "name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+            "role":{"type":"string"},
+            "prompt":{"type":"string"},
+            "task_id":{"type":"string","pattern":"^task_[0-9a-f]{8}$"},
+            "require_plan":{"type":"boolean"}
+        },"required":["name","role","prompt"]})
+    }
+    fn check_permission(&self, _: &Value) -> PermissionCheck {
+        PermissionCheck::Pass
+    }
+    fn available_for(&self, kind: AgentKind) -> bool {
+        kind == AgentKind::Lead
+    }
+    async fn execute(&self, ctx: &ToolContext<'_>, input: &Value) -> String {
+        let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let role = input.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let task_id = input.get("task_id").and_then(|v| v.as_str());
+        let require_plan = input.get("require_plan").and_then(|v| v.as_bool()).unwrap_or(false);
+        crate::team::runtime::spawn_teammate_thread(ctx.agent, name, role, prompt, task_id, require_plan)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

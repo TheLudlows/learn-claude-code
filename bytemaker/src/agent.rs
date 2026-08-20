@@ -569,6 +569,9 @@ impl TestAgent {
         let todo_manager = Arc::new(SharedTodoManager::new(TodoManager::new()));
         let registry = Arc::new(tools::build_registry());
         let hooks = Agent::build_hooks(&bg_manager);
+        let team = Arc::new(
+            crate::team::TeamCtx::new(workdir.clone(), Arc::clone(&task_store)).unwrap(),
+        );
         let agent = Agent {
             client,
             registry,
@@ -585,7 +588,7 @@ impl TestAgent {
             max_turns: None,
             kind: AgentKind::Lead,
             owner: "agent".to_string(),
-            team: None,
+            team: Some(team),
             max_tokens: MAX_TOKENS,
         };
         Self { _tmp: tmp, agent }
