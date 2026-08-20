@@ -1,0 +1,595 @@
+/*
+agent.rs - Agent 对象抽象 (s13)
+
+持有 conf/tools/hooks/compactor/memory 以及原本散落在进程级全局单例里的共享状态
+(skills / todo / task_store / bg_manager / cron_manager) 作为成员，通过 ToolContext
+下传给工具，不再依赖 OnceLock/LazyLock 全局。子 agent 是 `child_agent` 产出的嵌套
+实例：Arc-clone 共享 infra、刷新 per-loop 状态，从而：
+
+- 修 S2：子 agent 工具调用经统一 `execute_tool`（含 trigger_pre_tool），不再旁路权限。
+- 修 S4：child 拿到刷新的 Hooks（TodoReminder 计数器归零），hook 状态不跨隔离边界泄漏。
+- 修 S8：`Agent::new` 返回 Result，TaskStore/CronManager 构造失败显式传播而非 panic。
+- 修 D2：`max_turns` 从 task 工具入参真正传入循环。
+- 修 A2：父子共用同一个 `run_loop`，消除手抄循环。
+*/
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::background_tasks::manager::BackgroundManager;
+use crate::background_tasks::BackgroundStopHook;
+use crate::builtins;
+use crate::client::{CallResult, Client, ContentBlock, Message};
+use crate::compact::{ContextCompactor, MAX_REACTIVE_RETRIES};
+use crate::cron_scheduler::{self, CronManager};
+use crate::error::AgentError;
+use crate::hooks::{assemble_post_tool_messages, Hooks};
+use crate::memory::{build_system, MemoryStore};
+use crate::output;
+use crate::skills::SkillLoader;
+use crate::task_system::store::TaskStore;
+use crate::todo::{SharedTodoManager, TodoManager};
+use crate::tools;
+use crate::tools::registry::ToolRegistry;
+use crate::tools::trait_def::{ToolContext, ToolResult};
+
+/// 所有 stream_messages 调用共用的 max_tokens（原 main.rs/subagent.rs 各硬编码 8000）。
+pub const MAX_TOKENS: u32 = 8000;
+
+/// 子 agent 的 system prompt（原 subagent.rs:21）。
+const SUB_SYSTEM: &str = "You are a focused coding agent. Complete your task efficiently. Use tools as needed. Return a concise summary of your work.";
+
+/// 循环终止结果。
+pub enum LoopOutcome {
+    /// 模型结束（非 tool_use 且 Stop 钩子未强制继续）。
+    Completed,
+    /// 达到 max_turns 上限（仅子 agent）。
+    MaxTurnsReached,
+}
+
+/// 构造 Agent 所需的配置。
+pub struct AgentConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+    pub workdir: PathBuf,
+    pub skills_dir: PathBuf,
+}
+
+pub struct Agent {
+    // ---- 共享 infra：child_agent Arc-clone ----
+    pub(crate) client: Arc<Client>,
+    pub(crate) registry: Arc<ToolRegistry>,
+    pub(crate) skills: Arc<SkillLoader>,
+    pub(crate) task_store: Arc<TaskStore>,
+    pub(crate) bg_manager: Arc<BackgroundManager>,
+    pub(crate) todo_manager: Arc<SharedTodoManager>,
+    pub(crate) workdir: PathBuf,
+
+    // ---- per-loop 状态：child 刷新 ----
+    pub(crate) cron_manager: Option<Arc<CronManager>>,
+    pub(crate) compactor: Option<ContextCompactor>,
+    pub(crate) memory: Option<MemoryStore>,
+    pub(crate) hooks: Hooks,
+    pub(crate) base_system: String,
+    pub(crate) max_turns: Option<usize>,
+    pub(crate) for_subagent: bool,
+    pub(crate) max_tokens: u32,
+}
+
+impl Agent {
+    /// 构造主 agent。TaskStore / CronManager 构造失败在此传播（修 S8）。
+    pub async fn new(cfg: AgentConfig) -> Result<Agent, AgentError> {
+        let client = Arc::new(Client::new(cfg.api_key, cfg.base_url, cfg.model));
+        let skills = Arc::new(SkillLoader::scan(cfg.skills_dir.clone()));
+        let task_store = Arc::new(
+            TaskStore::new(cfg.workdir.clone())
+                .map_err(|e| AgentError::Other(format!("task store init: {e}")))?,
+        );
+        let bg_manager = Arc::new(BackgroundManager::new(
+            cfg.workdir.join(".task_outputs").join("background"),
+        ));
+        let todo_manager = Arc::new(SharedTodoManager::new(TodoManager::new()));
+
+        let cron_manager = Some({
+            let cm = Arc::new(
+                CronManager::new(cfg.workdir.clone())
+                    .await
+                    .map_err(|e| AgentError::Other(format!("cron init: {e}")))?,
+            );
+            let _ = cm.load_durable().await;
+            cm
+        });
+
+        let compactor = Some(ContextCompactor::new(
+            cfg.workdir.join(".transcripts"),
+            cfg.workdir.join(".task_outputs").join("tool-results"),
+        ));
+        let memory = Some(MemoryStore::new(cfg.workdir.join(".memory")));
+
+        let registry = Arc::new(tools::build_registry());
+        let base_system = build_base_system(&skills, &cfg.workdir);
+        let hooks = Self::build_hooks(&bg_manager);
+
+        Ok(Agent {
+            client,
+            registry,
+            skills,
+            task_store,
+            bg_manager,
+            todo_manager,
+            workdir: cfg.workdir,
+            cron_manager,
+            compactor,
+            memory,
+            hooks,
+            base_system,
+            max_turns: None,
+            for_subagent: false,
+            max_tokens: MAX_TOKENS,
+        })
+    }
+
+    /// 产出嵌套子 agent：Arc-clone 共享 infra，刷新 per-loop 状态。
+    /// cron/compactor/memory 置 None（子 agent 不投递定时任务、不压缩、不读写持久记忆）。
+    pub fn child_agent(&self, max_turns: usize, sub_system: &str) -> Agent {
+        Agent {
+            client: Arc::clone(&self.client),
+            registry: Arc::clone(&self.registry),
+            skills: Arc::clone(&self.skills),
+            task_store: Arc::clone(&self.task_store),
+            bg_manager: Arc::clone(&self.bg_manager),
+            todo_manager: Arc::clone(&self.todo_manager),
+            workdir: self.workdir.clone(),
+            cron_manager: None,
+            compactor: None,
+            memory: None,
+            hooks: Self::build_hooks(&self.bg_manager), // 刷新：TodoReminder 计数器归零（修 S4）
+            base_system: sub_system.to_string(),
+            max_turns: Some(max_turns),
+            for_subagent: true,
+            max_tokens: self.max_tokens,
+        }
+    }
+
+    /// 启动 cron 调度器（原 init_manager + start_runtime）。
+    pub async fn start_cron_runtime(&self) -> Result<(), AgentError> {
+        if let Some(cron) = &self.cron_manager {
+            cron.start_scheduler()
+                .await
+                .map_err(|e| AgentError::Other(format!("cron start: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// 装配默认 hook 集（原 main.rs:299-305）。
+    /// BackgroundStopHook 经构造器 DI 拿到 bg_manager（原读全局 get_manager）。
+    fn build_hooks(bg: &Arc<BackgroundManager>) -> Hooks {
+        let mut h = Hooks::new();
+        h.on_prompt(builtins::ContextInjectHook);
+        h.on_pre_tool(builtins::PermissionHook);
+        h.on_post_tool(builtins::LargeOutputHook);
+        h.on_stop(builtins::SummaryHook);
+        h.on_post_tool(builtins::TodoReminderHook::new());
+        h.on_stop(BackgroundStopHook::new(Arc::clone(bg)));
+        h
+    }
+
+    /// 用户输入提交后触发 UserPromptSubmit 钩子。
+    pub fn trigger_prompt(&self, query: &str) {
+        self.hooks.trigger_prompt(query);
+    }
+
+    /// 当前工作目录（供 main 的 banner 等使用）。
+    pub fn workdir(&self) -> &PathBuf {
+        &self.workdir
+    }
+
+    pub fn base_system(&self) -> &str {
+        &self.base_system
+    }
+
+    /// 已加载技能数（供 main 的启动 banner）。
+    pub fn skills_len(&self) -> usize {
+        self.skills.len()
+    }
+
+    // ---- 内部工具执行（父子共用，修 S2）----
+
+    /// 单个工具调用 + PreToolUse 拦截。子 agent 也走这里 → trigger_pre_tool 不再旁路。
+    async fn execute_tool(&self, name: &str, input: &serde_json::Value) -> ToolResult {
+        if let Some(reason) = self.hooks.trigger_pre_tool(&self.registry, name, input) {
+            return ToolResult::Denied {
+                name: name.to_string(),
+                reason,
+            };
+        }
+        let ctx = ToolContext { agent: self };
+        self.registry.dispatch(name, &ctx, input, self.for_subagent).await
+    }
+
+    /// 执行本轮所有 ToolUse 块，返回要追加的 user 消息（不原地改 messages，规避
+    /// `&self` 与 `&mut messages` 借用冲突）。`as_content()` 绑一次（原 main 3×/subagent 2×）。
+    async fn execute_tool_use_blocks(&self, content: &[ContentBlock]) -> Vec<Message> {
+        let mut tool_results = Vec::new();
+        let mut reminders: Vec<String> = Vec::new();
+        for block in content {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                let result = self.execute_tool(name, input).await;
+                let content_str = result.as_content();
+                {
+                    let mut out = std::io::stdout().lock();
+                    output::render_tool_result(name, &content_str, &mut out);
+                }
+                if result.was_executed() {
+                    if let Some(msg) = self.hooks.trigger_post_tool(name, input, &content_str) {
+                        reminders.push(msg);
+                    }
+                }
+                tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: content_str,
+                });
+            }
+        }
+        assemble_post_tool_messages(tool_results, reminders)
+    }
+
+    /// 统一循环（原 main.rs::agent_loop + subagent.rs::run_subagent_loop 合并）。
+    /// Option 字段门控子 agent 差异（cron/compactor/memory 仅主 agent 有；max_turns 仅子 agent 有）。
+    pub async fn run_loop(
+        &self,
+        messages: &mut Vec<Message>,
+        active_request: &str,
+    ) -> Result<LoopOutcome, AgentError> {
+        // s09：召回相关记忆拼进 system（每请求一次，与压缩正交）。子 agent memory=None 跳过。
+        let system = if let Some(mem) = &self.memory {
+            let recalled = mem.load_memories(&self.client, messages).await;
+            let index = mem.read_memory_index();
+            build_system(&self.base_system, &index, &recalled)
+        } else {
+            self.base_system.clone()
+        };
+
+        let mut reactive_retries = 0u32;
+        let max = self.max_turns.unwrap_or(usize::MAX);
+
+        for _turn in 1..=max {
+            // 循环顶部：被动兜底收集已完成后台任务（子 agent 不在顶部拉取，与现状一致）。
+            if !self.for_subagent {
+                let _ = self.bg_manager.collect_and_inject(messages);
+            }
+
+            // s12：循环顶部收集待交付的定时任务（子 agent cron_manager=None 跳过）。
+            let mut waiting_for_ack: Vec<cron_scheduler::CronJob> = Vec::new();
+            let scheduled_start = messages.len();
+            if let Some(cron) = &self.cron_manager {
+                let jobs = cron.consume_queue();
+                for job in &jobs {
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: format!("[Scheduled] {}", job.prompt),
+                        }],
+                    });
+                    let preview: String = job.prompt.chars().take(60).collect();
+                    println!("  [cron] delivered {}: {}", job.id, preview);
+                }
+                waiting_for_ack = jobs;
+            }
+
+            // s08：每次调用模型前运行压缩管线（子 agent compactor=None 跳过）。
+            if let Some(c) = &self.compactor {
+                c.prepare(&self.client, messages, active_request).await?;
+            }
+
+            let defs = if self.for_subagent {
+                self.registry.definitions_for_subagent()
+            } else {
+                self.registry.definitions()
+            };
+            let response = match self
+                .client
+                .stream_messages(&system, messages, &defs, self.max_tokens)
+                .await
+            {
+                CallResult::Success(r) => {
+                    reactive_retries = 0;
+                    r
+                }
+                // prompt_too_long 且有 compactor、还有重试预算：压缩后重试（子 agent 无 compactor → 走失败臂）。
+                CallResult::PromptTooLong(_)
+                    if reactive_retries < MAX_REACTIVE_RETRIES && self.compactor.is_some() =>
+                {
+                    output::status("[reactive compact]");
+                    self.compactor
+                        .as_ref()
+                        .expect("compactor checked above")
+                        .reactive_compact(&self.client, messages, active_request)
+                        .await?;
+                    reactive_retries += 1;
+                    continue;
+                }
+                // prompt_too_long 耗尽重试 / 无 compactor / 其他错误：恢复定时任务后返回。
+                CallResult::PromptTooLong(e) | CallResult::Failure(e) => {
+                    if !waiting_for_ack.is_empty() {
+                        messages.truncate(scheduled_start);
+                        if let Some(cron) = &self.cron_manager {
+                            cron.restore_jobs(&waiting_for_ack);
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+
+            // 打印这一轮的 LLM 内容；client 自身不打印。
+            {
+                let mut out = std::io::stdout().lock();
+                output::render(&response, &mut out);
+            }
+
+            // 追加助手响应（含 text 与 tool_use 块，原样回传下一轮）。
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: response.content.clone(),
+            });
+
+            // 模型调用成功后确认定时任务。
+            if !waiting_for_ack.is_empty() {
+                if let Some(cron) = &self.cron_manager {
+                    if let Err(e) = cron.acknowledge_jobs(&waiting_for_ack).await {
+                        println!("  [cron] acknowledgement failed: {}", e);
+                    }
+                }
+                waiting_for_ack.clear();
+            }
+
+            // 检查是否需要调用工具。
+            if response.stop_reason != "tool_use" {
+                // s04：退出前触发 Stop；返回 Some(msg) 则注入并继续，不退出。
+                if let Some(force) = self.hooks.trigger_stop(messages) {
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text { text: force }],
+                    });
+                    continue;
+                }
+                // s09：真退出前提取持久记忆（子 agent memory=None 跳过）。
+                if let Some(mem) = &self.memory {
+                    if mem.extract_memories(&self.client, messages).await > 0 {
+                        let _ = mem.consolidate_memories(&self.client).await;
+                    }
+                }
+                return Ok(LoopOutcome::Completed);
+            }
+
+            // 执行本轮工具调用 + PostToolUse 提醒（父子共用 helper）。
+            messages.extend(self.execute_tool_use_blocks(&response.content).await);
+        }
+
+        Ok(LoopOutcome::MaxTurnsReached)
+    }
+
+    /// 子 agent 入口（原 subagent.rs::run_subagent_loop）。
+    /// 产出 child agent（共享 infra、刷新状态），跑 run_loop，提取最终文本。
+    pub async fn run_subagent(&self, prompt: &str, max_turns: usize) -> Result<String, AgentError> {
+        let max_turns = max_turns.clamp(1, 50);
+        let child = self.child_agent(max_turns, SUB_SYSTEM);
+        output::status("[Subagent started]");
+
+        let mut messages: Vec<Message> = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: prompt.to_string(),
+            }],
+        }];
+
+        let outcome = child.run_loop(&mut messages, prompt).await?;
+
+        let result = match outcome {
+            LoopOutcome::Completed => {
+                let last_assistant = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role.as_str() == "assistant")
+                    .map(|m| m.content.as_slice())
+                    .unwrap_or(&[]);
+                match extract_final_text(last_assistant) {
+                    Some(text) => {
+                        output::status("[Subagent done]");
+                        text
+                    }
+                    None => {
+                        output::status("[Subagent done - no text]");
+                        "(no summary)".to_string()
+                    }
+                }
+            }
+            LoopOutcome::MaxTurnsReached => {
+                output::status(&format!(
+                    "[Subagent stopped after {} turns without final answer]",
+                    max_turns
+                ));
+                format!(
+                    "Subagent stopped after {} turns without a final answer.",
+                    max_turns
+                )
+            }
+        };
+        Ok(result)
+    }
+}
+
+/// 提取响应中的最终文本（不含 tool_use）。无 Text 块返回 None（原 subagent.rs:28-44）。
+fn extract_final_text(content: &[ContentBlock]) -> Option<String> {
+    let texts: Vec<String> = content
+        .iter()
+        .filter_map(|block| {
+            if let ContentBlock::Text { text } = block {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    }
+}
+
+/// 组装 system prompt（原 main.rs:283-296）。
+fn build_base_system(skills: &SkillLoader, workdir: &std::path::Path) -> String {
+    let catalog = skills.catalog();
+    let os = std::env::consts::OS;
+    if catalog.is_empty() {
+        format!(
+            "You are a coding agent at {} on {}. Before starting any multi-step task, use todo_write to plan your steps. Update status as you go. You can use tools as needed.",
+            workdir.display(),
+            os
+        )
+    } else {
+        format!(
+            "You are a coding agent at {} on {}. Before starting any multi-step task, use todo_write to plan your steps. Update status as you go. You can use tools as needed.\n\n\
+             Skills available:\n{}\n\n\
+             Use load_skill to read the full instructions when a skill applies.",
+            workdir.display(),
+            os,
+            catalog
+        )
+    }
+}
+
+/// 测试专用：在 tempdir 内构造一个隔离的 Agent（无 cron/compactor/memory），
+/// 替代原 `TestToolContext`。全局单例已消除，可在同一进程并行构造多个互不污染。
+#[cfg(test)]
+pub struct TestAgent {
+    // 保持 tempdir 活着，隔离 task/bg/skills 文件
+    _tmp: tempfile::TempDir,
+    agent: Agent,
+}
+
+#[cfg(test)]
+impl TestAgent {
+    pub fn new() -> Self {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workdir = tmp.path().to_path_buf();
+        let client = Arc::new(Client::new(
+            "test-key".into(),
+            "http://localhost".into(),
+            "test-model".into(),
+        ));
+        let skills = Arc::new(SkillLoader::scan(workdir.join("skills"))); // 空目录 -> 空
+        // TaskStore::new 会把传入目录与 current_dir 比较以拦越界，tempdir 不在工作区，
+        // 故用 cfg-test 的 create_test_store 直接装配（绕过校验）。
+        let task_store = Arc::new(crate::task_system::store::create_test_store(&workdir));
+        let bg_manager = Arc::new(BackgroundManager::new(
+            workdir.join(".task_outputs").join("background"),
+        ));
+        let todo_manager = Arc::new(SharedTodoManager::new(TodoManager::new()));
+        let registry = Arc::new(tools::build_registry());
+        let hooks = Agent::build_hooks(&bg_manager);
+        let agent = Agent {
+            client,
+            registry,
+            skills,
+            task_store,
+            bg_manager,
+            todo_manager,
+            workdir,
+            cron_manager: None,
+            compactor: None,
+            memory: None,
+            hooks,
+            base_system: "test system".into(),
+            max_turns: None,
+            for_subagent: false,
+            max_tokens: MAX_TOKENS,
+        };
+        Self { _tmp: tmp, agent }
+    }
+
+    pub fn context(&self) -> ToolContext<'_> {
+        ToolContext { agent: &self.agent }
+    }
+
+    pub fn agent(&self) -> &Agent {
+        &self.agent
+    }
+}
+
+#[cfg(test)]
+impl Default for TestAgent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::trait_def::ToolResult;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_agent_constructs_isolated() {
+        // 全局单例已消除：可在同进程构造多个互不污染的 Agent（旧 OnceLock 不可并行）。
+        let a = TestAgent::new();
+        assert!(!a.agent().for_subagent);
+        assert!(a.agent().max_turns.is_none());
+        assert!(a.agent().cron_manager.is_none()); // TestAgent 跳过 cron
+        let _b = TestAgent::new(); // 第二个，互不干扰
+    }
+
+    #[test]
+    fn child_agent_shares_infra_and_scopes_per_loop_state() {
+        let a = TestAgent::new();
+        let child = a.agent().child_agent(30, "sub");
+        // 共享 infra：Arc 指针相同
+        assert!(Arc::ptr_eq(&a.agent().client, &child.client));
+        assert!(Arc::ptr_eq(&a.agent().registry, &child.registry));
+        assert!(Arc::ptr_eq(&a.agent().task_store, &child.task_store));
+        assert!(Arc::ptr_eq(&a.agent().bg_manager, &child.bg_manager));
+        // per-loop 状态刷新
+        assert!(child.for_subagent);
+        assert_eq!(child.max_turns, Some(30));
+        assert!(child.cron_manager.is_none()); // 子 agent 不投递定时任务
+        assert!(child.compactor.is_none());
+        assert!(child.memory.is_none());
+        assert_eq!(child.base_system, "sub");
+    }
+
+    #[tokio::test]
+    async fn subagent_execute_tool_runs_pre_tool_denies_destructive() {
+        // S2 回归：child agent 的 execute_tool 必须经 trigger_pre_tool。
+        // 旧 subagent.rs 直接 registry.dispatch(for_subagent=true) 旁路了 pre_tool。
+        let a = TestAgent::new();
+        let child = a.agent().child_agent(30, "sub");
+        let result = child.execute_tool("command", &json!({"command": "rm -rf /"})).await;
+        assert!(
+            matches!(result, ToolResult::Denied { .. }),
+            "destructive command must be denied via pre_tool, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_new_propagates_task_store_failure() {
+        // S8 回归：TaskStore 构造失败时 Agent::new 返回 Err（旧 LazyLock 在首次工具调用 panic）。
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        let cfg = AgentConfig {
+            api_key: "k".into(),
+            base_url: "http://localhost".into(),
+            model: "m".into(),
+            workdir: file.path().to_path_buf(),
+            skills_dir: file.path().join("skills"),
+        };
+        let result = Agent::new(cfg).await;
+        assert!(
+            result.is_err(),
+            "Agent::new should fail when task store can't be created"
+        );
+    }
+}

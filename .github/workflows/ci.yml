@@ -1,17 +1,17 @@
 name: CI
 
-# 只关注 rust-agent:仅当 rust-agent/ 或本 workflow 文件变动时才跑。
+# 只关注 bytemaker:仅当 bytemaker/ 或本 workflow 文件变动时才跑。
 # web/ 与各 s0x 章节(Python)不再纳入 CI。
 on:
   push:
     branches: [main]
     paths:
-      - rust-agent/**
+      - bytemaker/**
       - .github/workflows/ci.yml
   pull_request:
     branches: [main]
     paths:
-      - rust-agent/**
+      - bytemaker/**
       - .github/workflows/ci.yml
 
 jobs:
@@ -19,14 +19,14 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: rust-agent
+        working-directory: bytemaker
 
     steps:
       # actions/checkout@v6
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       # ubuntu-latest 自带 Rust stable,rustc/cargo/rustfmt/clippy 都在 PATH 上,
-      # 无需额外安装 toolchain。若以后要锁版本,在 rust-agent/ 放 rust-toolchain.toml。
+      # 无需额外安装 toolchain。若以后要锁版本,在 bytemaker/ 放 rust-toolchain.toml。
       - name: Format check
         run: cargo fmt --check
 
