@@ -10,7 +10,7 @@ BackgroundStopHook 经构造器 DI 拿到 manager，不再用进程级全局。
 
 use crate::background_tasks::manager::BackgroundManager;
 use crate::hooks::StopHook;
-use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
+use crate::tools::trait_def::{AgentKind, PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
@@ -79,8 +79,11 @@ impl Tool for TaskOutputTool {
         ctx.agent.bg_manager.output(task_id, block, timeout_ms).await
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
+    /// Background-task tools stay available to Lead and subagents, but are
+    /// withheld from teammates (s13: "do not bring s11 background tasks into
+    /// teammate logic").
+    fn available_for(&self, kind: AgentKind) -> bool {
+        kind != AgentKind::Teammate
     }
 }
 
@@ -118,8 +121,8 @@ impl Tool for TaskStopTool {
         ctx.agent.bg_manager.stop(task_id)
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
+    fn available_for(&self, kind: AgentKind) -> bool {
+        kind != AgentKind::Teammate
     }
 }
 
@@ -138,7 +141,8 @@ mod tests {
         assert_eq!(s["required"][0], "task_id");
         assert_eq!(s["properties"]["block"]["type"], "boolean");
         assert_eq!(t.check_permission(&json!({})), PermissionCheck::Pass);
-        assert!(t.available_for_subagent());
+        assert!(t.available_for(AgentKind::Subagent));
+        assert!(!t.available_for(AgentKind::Teammate));
     }
 
     #[test]
@@ -148,7 +152,8 @@ mod tests {
         let s = t.input_schema();
         assert_eq!(s["required"][0], "task_id");
         assert_eq!(t.check_permission(&json!({})), PermissionCheck::Pass);
-        assert!(t.available_for_subagent());
+        assert!(t.available_for(AgentKind::Subagent));
+        assert!(!t.available_for(AgentKind::Teammate));
     }
 
     #[test]

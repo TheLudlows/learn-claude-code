@@ -76,10 +76,6 @@ impl Tool for TodoWriteTool {
         ctx.agent.todo_manager.run_todo_write(todos)
     }
 
-    /// Todo write tool should be available to subagents
-    fn available_for_subagent(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]
@@ -91,7 +87,7 @@ mod tests {
     fn test_todo_write_tool_name() {
         let tool = TodoWriteTool;
         assert_eq!(tool.name(), "todo_write");
-        assert!(tool.available_for_subagent());
+        assert!(tool.available_for(crate::tools::trait_def::AgentKind::Teammate));
     }
 
 

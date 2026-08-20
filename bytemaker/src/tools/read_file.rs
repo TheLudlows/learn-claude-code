@@ -86,9 +86,6 @@ impl Tool for ReadFileTool {
         run_read_file(path, limit)
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

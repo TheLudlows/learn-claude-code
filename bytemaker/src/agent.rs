@@ -31,7 +31,7 @@ use crate::task_system::store::TaskStore;
 use crate::todo::{SharedTodoManager, TodoManager};
 use crate::tools;
 use crate::tools::registry::ToolRegistry;
-use crate::tools::trait_def::{ToolContext, ToolResult};
+use crate::tools::trait_def::{AgentKind, ToolContext, ToolResult};
 
 /// 所有 stream_messages 调用共用的 max_tokens（原 main.rs/subagent.rs 各硬编码 8000）。
 pub const MAX_TOKENS: u32 = 8000;
@@ -73,7 +73,7 @@ pub struct Agent {
     pub(crate) hooks: Hooks,
     pub(crate) base_system: String,
     pub(crate) max_turns: Option<usize>,
-    pub(crate) for_subagent: bool,
+    pub(crate) kind: AgentKind,
     pub(crate) max_tokens: u32,
 }
 
@@ -125,7 +125,7 @@ impl Agent {
             hooks,
             base_system,
             max_turns: None,
-            for_subagent: false,
+            kind: AgentKind::Lead,
             max_tokens: MAX_TOKENS,
         })
     }
@@ -147,7 +147,7 @@ impl Agent {
             hooks: Self::build_hooks(&self.bg_manager), // 刷新：TodoReminder 计数器归零（修 S4）
             base_system: sub_system.to_string(),
             max_turns: Some(max_turns),
-            for_subagent: true,
+            kind: AgentKind::Subagent,
             max_tokens: self.max_tokens,
         }
     }
@@ -205,7 +205,7 @@ impl Agent {
             };
         }
         let ctx = ToolContext { agent: self };
-        self.registry.dispatch(name, &ctx, input, self.for_subagent).await
+        self.registry.dispatch(name, &ctx, input, self.kind).await
     }
 
     /// 执行本轮所有 ToolUse 块，返回要追加的 user 消息（不原地改 messages，规避
@@ -256,7 +256,7 @@ impl Agent {
 
         for _turn in 1..=max {
             // 循环顶部：被动兜底收集已完成后台任务（子 agent 不在顶部拉取，与现状一致）。
-            if !self.for_subagent {
+            if self.kind == AgentKind::Lead {
                 let _ = self.bg_manager.collect_and_inject(messages);
             }
 
@@ -283,11 +283,7 @@ impl Agent {
                 c.prepare(&self.client, messages, active_request).await?;
             }
 
-            let defs = if self.for_subagent {
-                self.registry.definitions_for_subagent()
-            } else {
-                self.registry.definitions()
-            };
+            let defs = self.registry.definitions_for(self.kind);
             let response = match self
                 .client
                 .stream_messages(&system, messages, &defs, self.max_tokens)
@@ -504,7 +500,7 @@ impl TestAgent {
             hooks,
             base_system: "test system".into(),
             max_turns: None,
-            for_subagent: false,
+            kind: AgentKind::Lead,
             max_tokens: MAX_TOKENS,
         };
         Self { _tmp: tmp, agent }
@@ -537,7 +533,7 @@ mod tests {
     fn test_agent_constructs_isolated() {
         // 全局单例已消除：可在同进程构造多个互不污染的 Agent（旧 OnceLock 不可并行）。
         let a = TestAgent::new();
-        assert!(!a.agent().for_subagent);
+        assert!(a.agent().kind == AgentKind::Lead);
         assert!(a.agent().max_turns.is_none());
         assert!(a.agent().cron_manager.is_none()); // TestAgent 跳过 cron
         let _b = TestAgent::new(); // 第二个，互不干扰
@@ -553,7 +549,7 @@ mod tests {
         assert!(Arc::ptr_eq(&a.agent().task_store, &child.task_store));
         assert!(Arc::ptr_eq(&a.agent().bg_manager, &child.bg_manager));
         // per-loop 状态刷新
-        assert!(child.for_subagent);
+        assert!(child.kind == AgentKind::Subagent);
         assert_eq!(child.max_turns, Some(30));
         assert!(child.cron_manager.is_none()); // 子 agent 不投递定时任务
         assert!(child.compactor.is_none());

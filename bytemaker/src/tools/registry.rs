@@ -11,7 +11,7 @@ and definition generation. It provides:
 
 use std::collections::BTreeMap;
 
-use crate::tools::trait_def::{PermissionCheck, Tool, ToolDefinition, ToolContext, ToolResult};
+use crate::tools::trait_def::{AgentKind, PermissionCheck, Tool, ToolDefinition, ToolContext, ToolResult};
 use serde_json::Value;
 
 /// Registry for managing and dispatching tools
@@ -42,35 +42,35 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
-    /// Dispatch a tool call by name
+    /// Dispatch a tool call by name.
     ///
-    /// `for_subagent` 为 `true` 时（子 agent 上下文），对 `available_for_subagent() == false`
-    /// 的工具返回 `ToolResult::Rejected` 而非执行——`definitions_for_subagent` 已在**声明层**
-    /// 过滤掉这类工具，此处在**派发层**再挡一道，防止模型幻觉出 `task` 调用导致子 agent 递归委托。
+    /// 对 `available_for(kind) == false` 的工具返回 `ToolResult::Rejected` 而非执行——
+    /// `definitions_for(kind)` 已在**声明层**过滤掉这类工具，此处在**派发层**再挡一道，
+    /// 防止模型幻觉出受限工具调用（如子 agent / teammate 调 `task` 导致递归委托）。
     ///
     /// # Arguments
     /// * `name` - The name of the tool to dispatch
     /// * `ctx` - The execution context
     /// * `input` - The parsed input JSON for the tool call
-    /// * `for_subagent` - 是否在子 agent 上下文中派发
+    /// * `kind` - The agent context dispatching this call (Lead/Subagent/Teammate)
     ///
     /// # Returns
     /// * `ToolResult::Output(result)` - 工具执行成功
-    /// * `ToolResult::Rejected` - 子 agent 上下文调用受限工具
+    /// * `ToolResult::Rejected` - 该 kind 上下文调用受限工具
     /// * `ToolResult::NotFound` - 工具未注册
     pub async fn dispatch(
         &self,
         name: &str,
         ctx: &ToolContext<'_>,
         input: &Value,
-        for_subagent: bool,
+        kind: AgentKind,
     ) -> ToolResult {
         match self.tools.get(name) {
             Some(tool) => {
-                if for_subagent && !tool.available_for_subagent() {
+                if !tool.available_for(kind) {
                     ToolResult::Rejected {
                         name: name.to_string(),
-                        reason: "Tool is not available in subagent context".to_string(),
+                        reason: format!("Tool not available in {:?} context", kind),
                     }
                 } else {
                     ToolResult::Output(tool.execute(ctx, input).await)
@@ -116,16 +116,16 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Generate ToolDefinition list for tools available to subagents
+    /// Generate ToolDefinition list for tools available in the given agent context.
     ///
     /// Definitions are returned in alphabetical order by tool name.
     ///
     /// # Returns
-    /// A vector of ToolDefinition structs for subagent API integration
-    pub fn definitions_for_subagent(&self) -> Vec<ToolDefinition> {
+    /// A vector of ToolDefinition structs for API integration
+    pub fn definitions_for(&self, kind: AgentKind) -> Vec<ToolDefinition> {
         self.tools
             .values()
-            .filter(|tool| tool.available_for_subagent())
+            .filter(|tool| tool.available_for(kind))
             .map(|tool| ToolDefinition {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
@@ -234,8 +234,8 @@ mod tests {
             format!("RestrictedTestTool executed with: {:?}", input)
         }
 
-        fn available_for_subagent(&self) -> bool {
-            false
+        fn available_for(&self, kind: AgentKind) -> bool {
+            kind == AgentKind::Lead
         }
     }
 
@@ -256,7 +256,7 @@ mod tests {
         let tagent = TestAgent::new();
         let ctx = tagent.context();
 
-        let result = registry.dispatch("known_tool", &ctx, &input, false).await;
+        let result = registry.dispatch("known_tool", &ctx, &input, AgentKind::Lead).await;
 
         assert!(matches!(result, ToolResult::Output(_)));
         assert_eq!(result.as_content(), "TestTool executed with: Object {\"input\": String(\"test_value\")}");
@@ -273,7 +273,7 @@ mod tests {
         let tagent = TestAgent::new();
         let ctx = tagent.context();
 
-        let result = registry.dispatch("unknown_tool", &ctx, &input, false).await;
+        let result = registry.dispatch("unknown_tool", &ctx, &input, AgentKind::Lead).await;
 
         assert!(matches!(&result, ToolResult::NotFound { name: _, available: _ }));
         assert!(!result.was_executed());
@@ -372,7 +372,7 @@ mod tests {
         }));
 
         let all_definitions = registry.definitions();
-        let subagent_definitions = registry.definitions_for_subagent();
+        let subagent_definitions = registry.definitions_for(AgentKind::Subagent);
 
         assert_eq!(all_definitions.len(), 2);
         assert_eq!(subagent_definitions.len(), 1);
@@ -502,7 +502,7 @@ mod tests {
         registry.register(Box::new(TaskTool));
 
         let all_definitions = registry.definitions();
-        let subagent_definitions = registry.definitions_for_subagent();
+        let subagent_definitions = registry.definitions_for(AgentKind::Subagent);
 
         // All tools should be in the full definitions
         assert_eq!(all_definitions.len(), 3);
@@ -530,11 +530,11 @@ mod tests {
 
         // 子 agent 上下文派发 task：返回 Rejected，不执行（不触发递归、不触网络）
         let result = registry
-            .dispatch("task", &ctx, &json!({"prompt": "recurse"}), true)
+            .dispatch("task", &ctx, &json!({"prompt": "recurse"}), AgentKind::Subagent)
             .await;
         assert!(matches!(&result, ToolResult::Rejected { name: _, reason: _ }), "dispatch should return Rejected, got {:?}", result);
         assert!(
-            result.as_content().contains("not available in subagent context"),
+            result.as_content().contains("not available in"),
             "subagent dispatch of task must be rejected, got: {}",
             result.as_content()
         );

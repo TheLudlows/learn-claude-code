@@ -237,9 +237,6 @@ impl Tool for CommandTool {
         }
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

@@ -99,9 +99,6 @@ impl Tool for EditFileTool {
         run_edit_file(path, old_text, new_text)
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

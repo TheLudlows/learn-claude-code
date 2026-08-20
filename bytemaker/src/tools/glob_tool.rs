@@ -115,9 +115,6 @@ impl Tool for GlobTool {
         }
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

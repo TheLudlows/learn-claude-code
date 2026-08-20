@@ -86,9 +86,6 @@ impl Tool for WriteFileTool {
         run_write_file(path, content)
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

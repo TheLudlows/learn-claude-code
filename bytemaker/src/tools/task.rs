@@ -8,7 +8,7 @@ This module implements the TaskTool for running subagent tasks.
 - Not available for subagents (avoids recursion)
 */
 
-use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
+use crate::tools::trait_def::{AgentKind, PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -71,9 +71,9 @@ impl Tool for TaskTool {
         }
     }
 
-    /// Task tool should not be available to subagents to avoid recursion
-    fn available_for_subagent(&self) -> bool {
-        false
+    /// Task tool is Lead-only: subagents/teammates must not call it (avoids recursion).
+    fn available_for(&self, kind: AgentKind) -> bool {
+        kind == AgentKind::Lead
     }
 }
 
@@ -132,8 +132,10 @@ mod tests {
     }
 
     #[test]
-    fn test_available_for_subagent() {
+    fn test_available_for_kinds() {
         let tool = TaskTool;
-        assert!(!tool.available_for_subagent(), "Task tool should not be available to subagents");
+        assert!(!tool.available_for(AgentKind::Subagent), "Task tool should not be available to subagents");
+        assert!(!tool.available_for(AgentKind::Teammate), "Task tool should not be available to teammates");
+        assert!(tool.available_for(AgentKind::Lead), "Task tool should be available to Lead");
     }
 }

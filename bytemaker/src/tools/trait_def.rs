@@ -11,6 +11,15 @@ use async_trait::async_trait;
 use serde_json::Value;
 use crate::error::AgentError;
 
+/// Which agent context a tool call is dispatched in (s13).
+/// Drives tool visibility (Lead-only vs subagent/teammate) and the plan gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentKind {
+    Lead,
+    Subagent,
+    Teammate,
+}
+
 /// Permission check result from a tool's permission check
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissionCheck {
@@ -141,14 +150,37 @@ pub trait Tool: Send + Sync {
     /// The tool's output as a string, which will be sent back to the AI model
     async fn execute(&self, ctx: &ToolContext<'_>, input: &Value) -> String;
 
-    /// Indicates whether this tool should be available to subagents
+    /// Indicates whether this tool should be available in the given agent context.
     ///
-    /// Default implementation returns `true`. Some tools (like the task tool)
-    /// should only be available to the main agent to prevent infinite recursion.
-    ///
-    /// # Returns
-    /// `true` if the tool should be available to subagents, `false` otherwise
-    fn available_for_subagent(&self) -> bool {
+    /// Default returns `true` (available to Lead, Subagent, and Teammate).
+    /// Restricted tools (e.g. `task` to prevent recursion, or Lead-only
+    /// coordination tools) override this. Drives both the definition list sent
+    /// to the model and the dispatch-layer `Rejected` short-circuit.
+    fn available_for(&self, _kind: AgentKind) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct LeadOnly;
+    #[async_trait]
+    impl Tool for LeadOnly {
+        fn name(&self) -> &str { "lead_only" }
+        fn description(&self) -> &str { "lead only" }
+        fn input_schema(&self) -> serde_json::Value { serde_json::json!({"type":"object","properties":{}}) }
+        async fn execute(&self, _: &ToolContext<'_>, _: &serde_json::Value) -> String { "x".into() }
+        fn available_for(&self, kind: AgentKind) -> bool { kind == AgentKind::Lead }
+    }
+
+    #[test]
+    fn available_for_filters_by_kind() {
+        let t = LeadOnly;
+        assert!(t.available_for(AgentKind::Lead));
+        assert!(!t.available_for(AgentKind::Teammate));
+        assert!(!t.available_for(AgentKind::Subagent));
     }
 }

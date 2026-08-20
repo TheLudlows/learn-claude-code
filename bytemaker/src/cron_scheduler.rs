@@ -383,7 +383,7 @@ pub fn cron_matches(cron_expr: &str, moment: &chrono::DateTime<chrono::Local>) -
 // Tool 实现
 // ---------------------------------------------------------------------------
 
-use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
+use crate::tools::trait_def::{AgentKind, PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -433,8 +433,10 @@ impl Tool for ScheduleCronTool {
         }
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
+    /// Cron tools stay available to Lead and subagents, but are withheld from
+    /// teammates (s13: "do not bring s12 cron into teammate logic").
+    fn available_for(&self, kind: AgentKind) -> bool {
+        kind != AgentKind::Teammate
     }
 }
 
@@ -487,8 +489,8 @@ impl Tool for ListCronsTool {
             .join("\n")
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
+    fn available_for(&self, kind: AgentKind) -> bool {
+        kind != AgentKind::Teammate
     }
 }
 
@@ -531,8 +533,8 @@ impl Tool for CancelCronTool {
         }
     }
 
-    fn available_for_subagent(&self) -> bool {
-        true
+    fn available_for(&self, kind: AgentKind) -> bool {
+        kind != AgentKind::Teammate
     }
 }
 
