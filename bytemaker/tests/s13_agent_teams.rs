@@ -18,12 +18,16 @@ async fn spawn_teammate_delivers_result_and_idle() {
         .unwrap_or_else(|_| "https://api.anthropic.com".into());
     let model = std::env::var("MODEL_ID").unwrap();
     let cwd = std::env::current_dir().unwrap();
+    let coordinator = std::sync::Arc::new(std::sync::Mutex::new(
+        bytemaker::render::Coordinator::new(bytemaker::render::CrosstermBackend::new())
+    ));
     let agent = Agent::new(AgentConfig {
         api_key,
         base_url,
         model,
         workdir: cwd.clone(),
         skills_dir: cwd.join("skills"),
+        coordinator,
     })
     .await
     .unwrap();

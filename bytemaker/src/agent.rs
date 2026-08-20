@@ -45,6 +45,8 @@ pub enum LoopOutcome {
     Completed,
     /// 达到 max_turns 上限（仅子 agent）。
     MaxTurnsReached,
+    /// 用户取消（Ctrl+C）。
+    Cancelled,
 }
 
 /// 构造 Agent 所需的配置。
@@ -54,6 +56,7 @@ pub struct AgentConfig {
     pub model: String,
     pub workdir: PathBuf,
     pub skills_dir: PathBuf,
+    pub coordinator: Arc<std::sync::Mutex<crate::render::Coordinator<crate::render::CrosstermBackend>>>,
 }
 
 pub struct Agent {
@@ -64,6 +67,7 @@ pub struct Agent {
     pub(crate) task_store: Arc<TaskStore>,
     pub(crate) bg_manager: Arc<BackgroundManager>,
     pub(crate) todo_manager: Arc<SharedTodoManager>,
+    pub(crate) coordinator: Arc<std::sync::Mutex<crate::render::Coordinator<crate::render::CrosstermBackend>>>,
     pub(crate) workdir: PathBuf,
 
     // ---- per-loop 状态：child 刷新 ----
@@ -126,6 +130,7 @@ impl Agent {
             task_store,
             bg_manager,
             todo_manager,
+            coordinator: cfg.coordinator,
             workdir: cfg.workdir,
             cron_manager,
             compactor,
@@ -163,6 +168,7 @@ impl Agent {
             task_store: Arc::clone(&self.task_store),
             bg_manager: Arc::clone(&self.bg_manager),
             todo_manager: Arc::clone(&self.todo_manager),
+            coordinator: Arc::clone(&self.coordinator),
             workdir: self.workdir.clone(),
             cron_manager: None,
             compactor,
@@ -223,6 +229,7 @@ impl Agent {
             task_store: Arc::clone(&self.task_store),
             bg_manager: Arc::clone(&self.bg_manager),
             todo_manager: Arc::clone(&self.todo_manager),
+            coordinator: Arc::clone(&self.coordinator),
             workdir: self.workdir.clone(),
             cron_manager: None,
             compactor,
@@ -382,9 +389,33 @@ impl Agent {
             self.compactor.prepare(&self.client, messages, active_request).await?;
 
             let defs = self.registry.definitions_for(self.kind);
+
+            // 构造 delta sink（流式渲染到 coordinator）
+            let mut sink = crate::client::DeltaSink::new({
+                let coord = Arc::clone(&self.coordinator);
+                move |d| match d {
+                    crate::client::Delta::Text(t) => {
+                        let _ = coord.lock().unwrap().emit_partial(&t);
+                    }
+                    crate::client::Delta::ToolUseStart { id: _, name, input } => {
+                        let mut c = coord.lock().unwrap();
+                        // ⚙ 渲染：先写工具名，再换行写输入
+                        let _ = c.emit(&format!("⚙ {}", name));
+                        // 简化输入格式化（直接 JSON pretty）
+                        if input != serde_json::json!(null) {
+                            let input_str = serde_json::to_string_pretty(&input).unwrap_or_default();
+                            for line in input_str.lines() {
+                                let _ = c.emit(&format!("  {}", line));
+                            }
+                        }
+                    }
+                }
+            });
+            let cancel = tokio_util::sync::CancellationToken::new();
+
             let response = match self
                 .client
-                .stream_messages(&system, messages, &defs, self.max_tokens, None, tokio_util::sync::CancellationToken::new())
+                .stream_messages(&system, messages, &defs, self.max_tokens, Some(&mut sink), cancel.clone())
                 .await
             {
                 CallResult::Success(r) => {
@@ -417,14 +448,12 @@ impl Agent {
                             cron.restore_jobs(&waiting_for_ack);
                         }
                     }
-                    return Err(AgentError::Other("Cancelled".to_string()));
+                    return Ok(LoopOutcome::Cancelled);
                 }
             };
 
-            {
-                let mut out = std::io::stdout().lock();
-                output::render(&response, &mut out);
-            }
+            // 流式已通过 delta sink 发送，无需再 post-stream render
+            // { let mut out = std::io::stdout().lock(); output::render(&response, &mut out); }
 
             // 追加助手响应（含 text 与 tool_use 块，原样回传下一轮）。
             messages.push(Message::assistant_content(response.content.clone()));
@@ -498,6 +527,10 @@ impl Agent {
                     "Subagent stopped after {} turns without a final answer.",
                     max_turns
                 )
+            }
+            LoopOutcome::Cancelled => {
+                output::status("[Subagent cancelled]");
+                "(cancelled)".to_string()
             }
         };
         Ok(result)
@@ -583,6 +616,10 @@ impl TestAgent {
         );
         let memory = MemoryStore::new_read_only(workdir.join(".memory"));
 
+        let coordinator = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::render::Coordinator::new(crate::render::CrosstermBackend::new())
+        ));
+
         let agent = Agent {
             client,
             registry,
@@ -590,6 +627,7 @@ impl TestAgent {
             task_store,
             bg_manager,
             todo_manager,
+            coordinator,
             workdir,
             cron_manager: None,
             compactor,
@@ -679,6 +717,9 @@ mod tests {
             model: "m".into(),
             workdir: file.path().to_path_buf(),
             skills_dir: file.path().join("skills"),
+            coordinator: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::render::Coordinator::new(crate::render::CrosstermBackend::new())
+            )),
         };
         let result = Agent::new(cfg).await;
         assert!(
@@ -727,5 +768,10 @@ mod tests {
             "should not be gated when approved, got {:?}",
             r
         );
+    }
+
+    #[test]
+    fn loop_outcome_cancelled_variant_exists() {
+        assert!(matches!(LoopOutcome::Cancelled, LoopOutcome::Cancelled));
     }
 }

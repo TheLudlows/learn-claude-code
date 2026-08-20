@@ -72,13 +72,23 @@ impl Backend for VirtualTerm {
     fn size(&self) -> (usize, usize) { (self.rows, self.cols) }
 }
 
-/// 真终端后端。
-pub struct CrosstermBackend;
+/// 真终端后端（使用 Mutex 包装以支持 Arc 共享）。
+pub struct CrosstermBackend(std::sync::Mutex<()>); // 零大小的 Mutex，用于同步
+impl CrosstermBackend {
+    pub fn new() -> Self { Self(std::sync::Mutex::new(())) }
+}
+impl Default for CrosstermBackend {
+    fn default() -> Self { Self::new() }
+}
 impl Backend for CrosstermBackend {
     fn write_str(&mut self, s: &str) -> io::Result<()> {
+        let _guard = self.0.lock().unwrap();
         io::Write::write_all(&mut io::stdout().lock(), s.as_bytes())
     }
-    fn flush(&mut self) -> io::Result<()> { io::stdout().lock().flush() }
+    fn flush(&mut self) -> io::Result<()> {
+        let _guard = self.0.lock().unwrap();
+        io::stdout().lock().flush()
+    }
     fn size(&self) -> (usize, usize) {
         let (r, c) = ct::size().unwrap_or((24, 80));
         (r as usize, c as usize)

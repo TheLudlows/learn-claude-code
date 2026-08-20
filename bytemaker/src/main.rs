@@ -10,6 +10,7 @@ use bytemaker::agent::{Agent, AgentConfig};
 use bytemaker::client::Message;
 use bytemaker::error::AgentError;
 use bytemaker::output;
+use bytemaker::render::{Coordinator, CrosstermBackend};
 use dotenv::dotenv;
 use std::env;
 use std::path::PathBuf;
@@ -46,12 +47,16 @@ async fn main() -> Result<(), AgentError> {
         base_url, model, "***"
     ));
 
+    let coordinator = std::sync::Arc::new(std::sync::Mutex::new(
+        Coordinator::new(CrosstermBackend::new())
+    ));
     let cfg = AgentConfig {
         api_key,
         base_url,
         model,
         workdir: cwd.clone(),
         skills_dir: PathBuf::from(&skills_dir),
+        coordinator,
     };
     let agent = Agent::new(cfg).await?;
     agent.start_cron_runtime().await?;
