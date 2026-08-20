@@ -172,6 +172,16 @@ pub fn build_registry() -> ToolRegistry {
     registry.register(Box::new(crate::cron_scheduler::ListCronsTool));
     registry.register(Box::new(crate::cron_scheduler::CancelCronTool));
 
+    // s13 team tools
+    registry.register(Box::new(crate::team::tools::SpawnTeammateTool));
+    registry.register(Box::new(crate::team::tools::ListTeammatesTool));
+    registry.register(Box::new(crate::team::tools::SendMessageTool));
+    registry.register(Box::new(crate::team::tools::RequestShutdownTool));
+    registry.register(Box::new(crate::team::tools::RequestPlanTool));
+    registry.register(Box::new(crate::team::tools::ReviewPlanTool));
+    registry.register(Box::new(crate::team::tools::SubmitPlanTool));
+    // CreateWorktreeTool registered in Phase 2 (Task 18).
+
     registry
 }
 
@@ -246,5 +256,54 @@ mod safe_path_tests {
         assert_eq!(got.unwrap(), dunce::canonicalize(&file).unwrap());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod team_visibility_tests {
+    use super::build_registry;
+    use crate::tools::trait_def::AgentKind;
+
+    #[test]
+    fn teammate_tool_set_excludes_lead_tools() {
+        let reg = build_registry();
+        let defs = reg.definitions_for(AgentKind::Teammate);
+        let teammate_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        // Lead-only coordination tools + cron/bg tools must be withheld from teammates.
+        for lead_only in [
+            "spawn_teammate",
+            "request_shutdown",
+            "request_plan",
+            "review_plan",
+            "create_worktree",
+            "schedule_cron",
+            "task_output",
+            "task_stop",
+        ] {
+            assert!(
+                !teammate_names.contains(&lead_only),
+                "teammate must not see {}, got {:?}",
+                lead_only,
+                teammate_names
+            );
+        }
+        // Teammate-visible tools.
+        assert!(teammate_names.contains(&"submit_plan"));
+        assert!(teammate_names.contains(&"claim_task"));
+        assert!(teammate_names.contains(&"complete_task"));
+        assert!(teammate_names.contains(&"command"));
+    }
+
+    #[test]
+    fn lead_tool_set_excludes_submit_plan() {
+        let reg = build_registry();
+        let defs = reg.definitions_for(AgentKind::Lead);
+        let lead_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(lead_names.contains(&"spawn_teammate"));
+        assert!(
+            !lead_names.contains(&"submit_plan"),
+            "Lead must not see submit_plan, got {:?}",
+            lead_names
+        );
     }
 }
