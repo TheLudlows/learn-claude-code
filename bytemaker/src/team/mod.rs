@@ -1,5 +1,5 @@
 pub mod lock;
-// pub mod bus;        // Task 3
+pub mod bus;
 // pub mod assignment; // Task 4
 // pub mod protocols;  // Task 5
 // pub mod runtime;    // Task 10
