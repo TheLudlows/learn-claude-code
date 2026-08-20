@@ -4,12 +4,9 @@ cron_scheduler.rs - Cron Scheduler (s12)
 定时任务调度器：使用 cron 表达式在指定时间将 prompt 注入到 agent 循环。
 
 实现说明：
-- cron 表达式解析/匹配直接用 croner crate（5 字段 Vixie cron，默认 OR 语义）。
-- 运行时调度用 tokio-cron-scheduler 的 JobScheduler：每个任务注册一个 JobBuilder 回调，
-  到点时回调把任务推入 delivery_queue，由主循环 (main.rs) 拉取交付。
-- JobBuilder 强制 Seconds::Required，故注册前把 5 字段归一化为 6 字段（秒位补 0）。
-- 调用异步 scheduler API 的方法为 async（new/schedule/cancel/acknowledge_jobs/load_durable 等），
-  纯队列/文件操作保持同步。
+- cron 表达式解析/匹配使用 croner crate（5 字段 Vixie cron，默认 OR 语义）。
+- 调度由单个 tokio::spawn 后台任务驱动，每 60 秒检查一次到期任务。
+- 到期任务推入 delivery_queue，由主循环 (main.rs) 拉取交付。
 */
 
 use chrono::{Local, Timelike};
@@ -18,9 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-use tokio_cron_scheduler::{JobBuilder, JobScheduler, JobToRunAsync};
-use tokio_cron_scheduler::job::JobId;
 
 /// Cron 任务
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -41,30 +35,13 @@ pub struct CronJob {
     pub last_fired: Option<String>,
 }
 
-/// 共享状态
+/// 共享状态（纯业务数据，不再持有外部调度器）
 struct CronState {
     /// id -> job
     jobs: HashMap<String, CronJob>,
     /// 待交付的任务队列
     delivery_queue: VecDeque<CronJob>,
-    /// tokio-cron-scheduler 调度器
-    scheduler: JobScheduler,
-    /// cron_ id -> scheduler job uuid（用于 remove）
-    job_uuids: HashMap<String, JobId>,
 }
-
-impl CronState {
-    fn new(scheduler: JobScheduler) -> Self {
-        Self {
-            jobs: HashMap::new(),
-            delivery_queue: VecDeque::new(),
-            scheduler,
-            job_uuids: HashMap::new(),
-        }
-    }
-}
-
-use fastrand;
 
 /// Cron 任务管理器
 #[derive(Clone)]
@@ -77,15 +54,17 @@ impl CronManager {
     const MAX_ID_RETRIES: usize = 100;
     const DURABLE_FILE: &str = ".scheduled_tasks.json";
 
-    /// 创建管理器（fallible：JobScheduler 构造失败在此传播，修 S8，原 `.expect` panic）。
+    /// 创建管理器，同时启动后台调度循环。
     pub async fn new(workdir: PathBuf) -> Result<Self, String> {
-        let scheduler = JobScheduler::new()
-            .await
-            .map_err(|e| format!("failed to create JobScheduler: {e}"))?;
-        Ok(Self {
-            state: Arc::new(Mutex::new(CronState::new(scheduler))),
-            workdir,
-        })
+        let state = Arc::new(Mutex::new(CronState {
+            jobs: HashMap::new(),
+            delivery_queue: VecDeque::new(),
+        }));
+
+        // 启动后台 tick 循环（每 60 秒检查到期任务）
+        tokio::spawn(tick_loop(Arc::clone(&state), workdir.clone()));
+
+        Ok(Self { state, workdir })
     }
 
     /// 生成唯一的任务 ID
@@ -106,7 +85,13 @@ impl CronManager {
     }
 
     /// 调度一个 cron 任务
-    pub async fn schedule(&self, cron: &str, prompt: &str, recurring: bool, durable: bool) -> Result<CronJob, String> {
+    pub fn schedule(
+        &self,
+        cron: &str,
+        prompt: &str,
+        recurring: bool,
+        durable: bool,
+    ) -> Result<CronJob, String> {
         validate_cron(cron)?;
         if prompt.trim().is_empty() {
             return Err("Prompt cannot be empty".to_string());
@@ -127,12 +112,9 @@ impl CronManager {
             last_fired: None,
         };
 
-        let uuid = self.register_job(&id, cron).await?;
-
         {
             let mut state = self.state.lock().expect("state mutex poisoned");
-            state.jobs.insert(id.clone(), job.clone());
-            state.job_uuids.insert(id.clone(), uuid);
+            state.jobs.insert(id, job.clone());
         }
 
         if durable {
@@ -143,33 +125,21 @@ impl CronManager {
     }
 
     /// 取消一个 cron 任务
-    pub async fn cancel(&self, job_id: &str) -> Result<String, String> {
-        let (removed_job, was_durable, maybe_uuid) = {
+    pub fn cancel(&self, job_id: &str) -> Result<String, String> {
+        let was_durable = {
             let mut state = self.state.lock().expect("state mutex poisoned");
-            let job = state.jobs.get(job_id).ok_or_else(|| format!("Job {} not found", job_id))?;
+            let job = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| format!("Job {} not found", job_id))?;
             let was_durable = job.durable;
-
-            // 从队列中移除
             state.delivery_queue.retain(|j| j.id != job_id);
-
-            let removed_job = state.jobs.remove(job_id).unwrap();
-            let maybe_uuid = state.job_uuids.remove(job_id);
-            (removed_job, was_durable, maybe_uuid)
+            state.jobs.remove(job_id);
+            was_durable
         };
 
-        // 从调度器移除（释放锁后再 await）
-        if let Some(uuid) = maybe_uuid {
-            let sched = self.state.lock().expect("state mutex poisoned").scheduler.clone();
-            let _ = sched.remove(&uuid).await;
-        }
-
         if was_durable {
-            if let Err(e) = self.save_durable() {
-                // 恢复
-                let mut state = self.state.lock().expect("state mutex poisoned");
-                state.jobs.insert(job_id.to_string(), removed_job);
-                return Err(format!("Failed to save after cancel: {}", e));
-            }
+            self.save_durable()?;
         }
 
         Ok(format!("Cancelled {}", job_id))
@@ -186,55 +156,40 @@ impl CronManager {
         persist_durable_jobs(&self.state, &self.workdir)
     }
 
-    /// 从磁盘加载 durable 任务
+    /// 从磁盘加载 durable 任务（无需重新注册调度器，tick 循环自动覆盖）
     pub async fn load_durable(&self) -> Result<usize, String> {
         let file_path = self.workdir.join(Self::DURABLE_FILE);
         if !file_path.exists() {
             return Ok(0);
         }
 
-        let content = std::fs::read_to_string(&file_path)
-            .map_err(|e| format!("Failed to read: {}", e))?;
+        let content =
+            std::fs::read_to_string(&file_path).map_err(|e| format!("Failed to read: {}", e))?;
 
-        let payload: Vec<CronJob> = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse: {}", e))?;
+        let payload: Vec<CronJob> =
+            serde_json::from_str(&content).map_err(|e| format!("Failed to parse: {}", e))?;
 
         let mut loaded = 0;
-        // 先在锁内把任务塞进 jobs/queue，再逐个注册到调度器（注册需 await）
-        let mut to_register: Vec<CronJob> = Vec::new();
-        {
-            let mut state = self.state.lock().expect("state mutex poisoned");
-            for job in payload {
-                if let Err(e) = validate_cron(&job.cron) {
-                    eprintln!("  [cron] skipped invalid saved job: {}", e);
-                    continue;
-                }
-                if !job.id.starts_with("cron_") {
-                    eprintln!("  [cron] skipped invalid job ID: {}", job.id);
-                    continue;
-                }
-                if job.prompt.trim().is_empty() {
-                    eprintln!("  [cron] skipped job with empty prompt: {}", job.id);
-                    continue;
-                }
-
-                state.jobs.insert(job.id.clone(), job.clone());
-                if job.pending_delivery {
-                    state.delivery_queue.push_back(job.clone());
-                }
-                to_register.push(job);
-                loaded += 1;
+        let mut state = self.state.lock().expect("state mutex poisoned");
+        for job in payload {
+            if let Err(e) = validate_cron(&job.cron) {
+                eprintln!("  [cron] skipped invalid saved job: {}", e);
+                continue;
             }
-        }
-
-        for job in to_register {
-            match self.register_job(&job.id, &job.cron).await {
-                Ok(uuid) => {
-                    let mut state = self.state.lock().expect("state mutex poisoned");
-                    state.job_uuids.insert(job.id.clone(), uuid);
-                }
-                Err(e) => eprintln!("  [cron] failed to re-register job {}: {}", job.id, e),
+            if !job.id.starts_with("cron_") {
+                eprintln!("  [cron] skipped invalid job ID: {}", job.id);
+                continue;
             }
+            if job.prompt.trim().is_empty() {
+                eprintln!("  [cron] skipped job with empty prompt: {}", job.id);
+                continue;
+            }
+
+            state.jobs.insert(job.id.clone(), job.clone());
+            if job.pending_delivery {
+                state.delivery_queue.push_back(job);
+            }
+            loaded += 1;
         }
 
         if loaded > 0 {
@@ -244,49 +199,18 @@ impl CronManager {
         Ok(loaded)
     }
 
-    /// 把一个 cron 表达式注册到调度器，返回 job uuid。
-    /// 不改动 jobs/job_uuids，由调用方维护（schedule 与 load_durable 各自处理）。
-    async fn register_job(&self, job_id: &str, cron: &str) -> Result<JobId, String> {
-        let sched = self.state.lock().expect("state mutex poisoned").scheduler.clone();
-        // JobBuilder 强制 Seconds::Required，故把 5 字段归一化为 6 字段（秒位补 0）
-        let six_field = format!("0 {}", cron);
-
-        // 回调持有 state 引用 + workdir，到点时把任务推入 delivery_queue
-        let state_ref = Arc::clone(&self.state);
-        let workdir = self.workdir.clone();
-        let job_id_for_cb = job_id.to_string();
-        let callback: Box<JobToRunAsync> = Box::new(move |_uuid, _sched| {
-            let state_ref = Arc::clone(&state_ref);
-            let workdir = workdir.clone();
-            let job_id = job_id_for_cb.clone();
-            Box::pin(async move {
-                on_job_fire(&state_ref, &workdir, &job_id);
-            })
-        });
-
-        let built = JobBuilder::new()
-            .with_cron_job_type()
-            .with_schedule(&six_field)
-            .map_err(|e| format!("Failed to build job: {}", e))?
-            .with_run_async(callback)
-            .build()
-            .map_err(|e| format!("Failed to build job: {}", e))?;
-
-        sched.add(built).await.map_err(|e| format!("Failed to add job: {}", e))
-    }
-
     /// 消费待交付队列
     pub fn consume_queue(&self) -> Vec<CronJob> {
         let mut state = self.state.lock().expect("state mutex poisoned");
         state.delivery_queue.drain(..).collect()
     }
 
-    /// 确认任务已交付
+    /// 确认任务已交付（保持 async 签名以兼容 agent.rs 调用方）
     pub async fn acknowledge_jobs(&self, jobs: &[CronJob]) -> Result<(), String> {
-        let (removed_uuids, has_durable) = {
+        let has_durable = {
             let mut state = self.state.lock().expect("state mutex poisoned");
-            let mut removed_uuids: Vec<JobId> = Vec::new();
             let mut has_durable = false;
+            let mut to_remove: Vec<String> = Vec::new();
 
             for delivered in jobs {
                 if let Some(current) = state.jobs.get_mut(&delivered.id) {
@@ -294,25 +218,17 @@ impl CronManager {
                     if current.recurring {
                         current.pending_delivery = false;
                     } else {
-                        // one-shot 任务交付后移除，并准备从调度器移除
-                        state.jobs.remove(&delivered.id);
-                        if let Some(uuid) = state.job_uuids.remove(&delivered.id) {
-                            removed_uuids.push(uuid);
-                        }
+                        to_remove.push(delivered.id.clone());
                     }
                 }
             }
 
-            (removed_uuids, has_durable)
-        };
-
-        // 释放锁后从调度器移除（async）
-        if !removed_uuids.is_empty() {
-            let sched = self.state.lock().expect("state mutex poisoned").scheduler.clone();
-            for uuid in removed_uuids {
-                let _ = sched.remove(&uuid).await;
+            for id in to_remove {
+                state.jobs.remove(&id);
             }
-        }
+
+            has_durable
+        };
 
         if has_durable {
             self.save_durable()?;
@@ -328,17 +244,21 @@ impl CronManager {
             state.delivery_queue.iter().map(|j| j.id.clone()).collect();
 
         for delivered in jobs {
-            let current_clone = {
+            // 先在嵌套作用域内完成 jobs 的可变借用，再操作 delivery_queue
+            let to_push = {
                 if let Some(current) = state.jobs.get_mut(&delivered.id) {
                     current.pending_delivery = true;
-                    current.clone()
+                    if !queued_ids.contains(&delivered.id) {
+                        Some(current.clone())
+                    } else {
+                        None
+                    }
                 } else {
-                    continue;
+                    None
                 }
             };
-
-            if !queued_ids.contains(&delivered.id) {
-                state.delivery_queue.push_back(current_clone);
+            if let Some(job_clone) = to_push {
+                state.delivery_queue.push_back(job_clone);
             }
         }
     }
@@ -349,72 +269,91 @@ impl CronManager {
         !state.delivery_queue.is_empty()
     }
 
-    /// 启动调度器
+    /// 启动调度器（tick 循环已在 new() 中启动，此方法保留以兼容 agent.rs）
     pub async fn start_scheduler(&self) -> Result<(), String> {
-        let sched = self.state.lock().expect("state mutex poisoned").scheduler.clone();
-        sched.start().await.map_err(|e| format!("Failed to start scheduler: {}", e))
+        Ok(())
     }
 
-    /// 停止调度器（best-effort，与旧 stop_runtime 行为一致：进程退出即清理）
+    /// 停止调度器（best-effort，进程退出即清理）
     pub async fn shutdown_scheduler(&self) {
-        let mut sched = self.state.lock().expect("state mutex poisoned").scheduler.clone();
-        let _ = sched.shutdown().await;
+        // tick 循环随进程退出自动终止
     }
 }
 
-/// JobScheduler 回调：任务到点时把任务入队（等价于旧 poll_due_jobs 的入队逻辑）
-fn on_job_fire(state: &Arc<Mutex<CronState>>, workdir: &Path, job_id: &str) {
-    let minute_marker = Local::now().format("%Y-%m-%d %H:%M").to_string();
+// ---------------------------------------------------------------------------
+// 自由函数
+// ---------------------------------------------------------------------------
 
-    let job_clone = {
-        let mut st = state.lock().expect("state mutex poisoned");
-        let job = match st.jobs.get_mut(job_id) {
-            Some(j) => j,
-            None => return,
-        };
-        if job.pending_delivery {
-            return;
-        }
-        if job.last_fired.as_ref() == Some(&minute_marker) {
-            return;
-        }
-        job.pending_delivery = true;
-        job.last_fired = Some(minute_marker.clone());
-        job.clone()
-    };
+/// 后台调度循环：每 60 秒检查到期任务并推入 delivery_queue
+async fn tick_loop(state: Arc<Mutex<CronState>>, workdir: PathBuf) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
-    {
-        let mut st = state.lock().expect("state mutex poisoned");
-        st.delivery_queue.push_back(job_clone.clone());
+        let now = Local::now();
+        let minute_marker = now.format("%Y-%m-%d %H:%M").to_string();
+        let mut fired_jobs: Vec<CronJob> = Vec::new();
+
+        {
+            let mut st = state.lock().expect("state mutex poisoned");
+
+            // 第一遍：标记到期任务并收集 clone（不操作 delivery_queue，避免双重借用）
+            for job in st.jobs.values_mut() {
+                if job.pending_delivery {
+                    continue;
+                }
+                if !cron_matches(&job.cron, &now) {
+                    continue;
+                }
+                if job.last_fired.as_ref() == Some(&minute_marker) {
+                    continue;
+                }
+
+                job.pending_delivery = true;
+                job.last_fired = Some(minute_marker.clone());
+                fired_jobs.push(job.clone());
+            }
+
+            // 第二遍：推入交付队列（jobs 的借用已释放）
+            for job in &fired_jobs {
+                st.delivery_queue.push_back(job.clone());
+            }
+        }
+
+        // 持久化 + 日志（锁外执行）
+        let has_durable = fired_jobs.iter().any(|j| j.durable);
+        if has_durable {
+            if let Err(e) = persist_durable_jobs(&state, &workdir) {
+                eprintln!("  [cron] failed to persist on fire: {}", e);
+            }
+        }
+
+        for job in &fired_jobs {
+            let preview_len = job.prompt.len().min(60);
+            println!(
+                "  [cron] due {}: {}",
+                job.id,
+                &job.prompt[..preview_len]
+            );
+        }
     }
-
-    if job_clone.durable {
-        if let Err(e) = persist_durable_jobs(state, workdir) {
-            eprintln!("  [cron] failed to persist on fire: {}", e);
-        }
-    }
-
-    println!("  [cron] due {}: {}", job_clone.id, &job_clone.prompt[..job_clone.prompt.len().min(60)]);
 }
 
-/// 把 durable 任务写入磁盘（提取为自由函数，供 CronManager::save_durable 与 on_job_fire 复用）
+/// 把 durable 任务写入磁盘
 fn persist_durable_jobs(state: &Arc<Mutex<CronState>>, workdir: &Path) -> Result<(), String> {
     let payload: Vec<CronJob> = {
         let st = state.lock().expect("state mutex poisoned");
         st.jobs.values().filter(|j| j.durable).cloned().collect()
     };
 
-    let json = serde_json::to_string_pretty(&payload)
-        .map_err(|e| format!("Failed to serialize: {}", e))?;
+    let json =
+        serde_json::to_string_pretty(&payload).map_err(|e| format!("Failed to serialize: {}", e))?;
 
     let file_path = workdir.join(CronManager::DURABLE_FILE);
     let temp_path = file_path.with_extension(format!("tmp.{}", std::process::id()));
 
-    std::fs::write(&temp_path, json)
-        .map_err(|e| format!("Failed to write temp file: {}", e))?;
+    std::fs::write(&temp_path, json).map_err(|e| format!("Failed to write temp file: {}", e))?;
 
-    std::fs::rename(&temp_path, &file_path)
-        .map_err(|e| format!("Failed to rename temp file: {}", e))?;
+    std::fs::rename(&temp_path, &file_path).map_err(|e| format!("Failed to rename temp file: {}", e))?;
 
     Ok(())
 }
@@ -439,6 +378,10 @@ pub fn cron_matches(cron_expr: &str, moment: &chrono::DateTime<chrono::Local>) -
     let aligned = moment.with_second(0).unwrap_or(*moment);
     schedule.is_time_matching(&aligned).unwrap_or(false)
 }
+
+// ---------------------------------------------------------------------------
+// Tool 实现
+// ---------------------------------------------------------------------------
 
 use crate::tools::trait_def::{PermissionCheck, Tool, ToolContext};
 use async_trait::async_trait;
@@ -484,7 +427,7 @@ impl Tool for ScheduleCronTool {
         let recurring = input.get("recurring").and_then(|v| v.as_bool()).unwrap_or(true);
         let durable = input.get("durable").and_then(|v| v.as_bool()).unwrap_or(true);
 
-        match manager.schedule(cron, prompt, recurring, durable).await {
+        match manager.schedule(cron, prompt, recurring, durable) {
             Ok(job) => format!("Scheduled {}: {} -> {}", job.id, job.cron, job.prompt),
             Err(e) => format!("Error: {}", e),
         }
@@ -535,7 +478,10 @@ impl Tool for ListCronsTool {
                 let frequency = if job.recurring { "recurring" } else { "one-shot" };
                 let storage = if job.durable { "durable" } else { "session" };
                 let preview: String = job.prompt.chars().take(60).collect();
-                format!("{}: {} -> {} [{}, {}]", job.id, job.cron, preview, frequency, storage)
+                format!(
+                    "{}: {} -> {} [{}, {}]",
+                    job.id, job.cron, preview, frequency, storage
+                )
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -579,7 +525,7 @@ impl Tool for CancelCronTool {
         };
 
         let job_id = input.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
-        match manager.cancel(job_id).await {
+        match manager.cancel(job_id) {
             Ok(msg) => msg,
             Err(e) => format!("Error: {}", e),
         }
@@ -590,11 +536,15 @@ impl Tool for CancelCronTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use chrono::TimeZone;
+    use tempfile::tempdir;
 
     #[test]
     fn validate_cron_all_wildcards() {
@@ -712,7 +662,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = CronManager::new(dir.path().to_path_buf()).await.unwrap();
 
-        let job = manager.schedule("0 9 * * *", "run tests", true, false).await.unwrap();
+        let job = manager
+            .schedule("0 9 * * *", "run tests", true, false)
+            .unwrap();
         assert!(job.id.starts_with("cron_"));
         assert_eq!(job.cron, "0 9 * * *");
         assert_eq!(job.prompt, "run tests");
@@ -727,7 +679,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = CronManager::new(dir.path().to_path_buf()).await.unwrap();
 
-        assert!(manager.schedule("* * *", "test", true, false).await.is_err());
+        assert!(manager.schedule("* * *", "test", true, false).is_err());
     }
 
     #[tokio::test]
@@ -735,7 +687,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = CronManager::new(dir.path().to_path_buf()).await.unwrap();
 
-        assert!(manager.schedule("0 9 * * *", "", true, false).await.is_err());
+        assert!(manager.schedule("0 9 * * *", "", true, false).is_err());
     }
 
     #[tokio::test]
@@ -743,8 +695,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = CronManager::new(dir.path().to_path_buf()).await.unwrap();
 
-        let job = manager.schedule("0 9 * * *", "run tests", true, false).await.unwrap();
-        let result = manager.cancel(&job.id).await;
+        let job = manager
+            .schedule("0 9 * * *", "run tests", true, false)
+            .unwrap();
+        let result = manager.cancel(&job.id);
         assert!(result.is_ok());
 
         let jobs = manager.list();
@@ -756,7 +710,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = CronManager::new(dir.path().to_path_buf()).await.unwrap();
 
-        let result = manager.cancel("cron_deadbeef").await;
+        let result = manager.cancel("cron_deadbeef");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -766,7 +720,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager1 = CronManager::new(dir.path().to_path_buf()).await.unwrap();
 
-        let job = manager1.schedule("0 9 * * *", "run tests", true, true).await.unwrap();
+        let job = manager1
+            .schedule("0 9 * * *", "run tests", true, true)
+            .unwrap();
 
         let jobs = manager1.list();
         assert_eq!(jobs.len(), 1);
@@ -788,7 +744,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = CronManager::new(dir.path().to_path_buf()).await.unwrap();
 
-        let job = manager.schedule("0 9 * * *", "run tests", true, false).await.unwrap();
+        let job = manager
+            .schedule("0 9 * * *", "run tests", true, false)
+            .unwrap();
 
         // 手动入队（测试可访问私有字段）
         {
@@ -810,7 +768,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = CronManager::new(dir.path().to_path_buf()).await.unwrap();
 
-        let job = manager.schedule("0 9 * * *", "run tests", true, false).await.unwrap();
+        let job = manager
+            .schedule("0 9 * * *", "run tests", true, false)
+            .unwrap();
 
         // 标记为待交付（测试可访问私有字段）
         {
@@ -832,7 +792,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let manager = CronManager::new(dir.path().to_path_buf()).await.unwrap();
 
-        let job = manager.schedule("0 9 * * *", "run tests", false, false).await.unwrap();
+        let job = manager
+            .schedule("0 9 * * *", "run tests", false, false)
+            .unwrap();
 
         // 标记为待交付（测试可访问私有字段）
         {
