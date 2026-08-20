@@ -308,9 +308,6 @@ impl Tool for SendMessageTool {
     fn check_permission(&self, _: &Value) -> PermissionCheck {
         PermissionCheck::Pass
     }
-    fn available_for(&self, kind: AgentKind) -> bool {
-        kind == AgentKind::Lead
-    }
     async fn execute(&self, ctx: &ToolContext<'_>, input: &Value) -> String {
         let Some(team) = &ctx.agent.team else {
             return "Error: not in team context".into();
@@ -318,6 +315,9 @@ impl Tool for SendMessageTool {
         let to = input.get("to").and_then(|v| v.as_str()).unwrap_or("");
         let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("");
         send_message(team, to, content)
+    }
+    fn available_for(&self, kind: AgentKind) -> bool {
+        kind == AgentKind::Lead
     }
 }
 

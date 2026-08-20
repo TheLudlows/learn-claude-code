@@ -261,12 +261,26 @@ impl Client {
             tools: tools.to_vec(),
         };
 
+        // 粗估输入规模，用于诊断上下文增长：system 长度 + 历史消息里的文本/工具结果
+        // 正文字符数（ToolUse 的 input 是 JSON Value，序列化成本高且非主要内容，跳过）。
+        let system_chars = system.chars().count();
+        let msg_chars: usize = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .map(|b| match b {
+                ContentBlock::Text { text } => text.chars().count(),
+                ContentBlock::ToolResult { content, .. } => content.chars().count(),
+                ContentBlock::ToolUse { .. } => 0,
+            })
+            .sum();
         tracing::info!(
-            "[req] model={}, messages={}, tools={}, max_tokens={}",
+            "[req] model={}, messages={}, tools={}, max_tokens={}, system_chars={}, input_chars={}",
             self.model,
             messages.len(),
             tools.len(),
-            max_tokens
+            max_tokens,
+            system_chars,
+            system_chars + msg_chars
         );
 
         let response = match self
@@ -315,6 +329,11 @@ impl Client {
             },
         }
         let mut current: Option<BlockAcc> = None;
+        // token 用量：message_start.message.usage 带 input_tokens（完整值），
+        // message_delta.usage 带 output_tokens（累加后的最终值，覆盖 start 的初值）。
+        // 某些网关不发 usage 字段，则保持 None，日志记为 `?`。
+        let mut input_tokens: Option<u64> = None;
+        let mut output_tokens: Option<u64> = None;
 
         while let Some(event) = es.next().await {
             let event = match event {
@@ -423,9 +442,30 @@ impl Client {
                     {
                         stop_reason = sr.to_string();
                     }
+                    // message_delta.usage.output_tokens 是累加后的最终输出 token 数，
+                    // 覆盖 message_start 给出的初值。
+                    if let Some(ot) = ev
+                        .get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        output_tokens = Some(ot);
+                    }
                 }
                 "message_stop" => {}
-                "message_start" | "ping" => {}
+                "message_start" => {
+                    // message_start.message.usage 带 input_tokens（完整）与 output_tokens
+                    // （初值，之后被 message_delta 的最终值覆盖）。
+                    if let Some(usage) = ev.get("message").and_then(|m| m.get("usage")) {
+                        if let Some(it) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                            input_tokens = Some(it);
+                        }
+                        if let Some(ot) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                            output_tokens = Some(ot);
+                        }
+                    }
+                }
+                "ping" => {}
                 "error" => {
                     let msg = ev
                         .get("error")
@@ -438,10 +478,27 @@ impl Client {
             }
         }
 
+        // 拆分块类型 + 收集本轮调用的工具名，让"模型这一轮做了什么"一目了然。
+        let text_blocks = content
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Text { .. }))
+            .count();
+        let tool_names: Vec<&str> = content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         tracing::info!(
-            "[resp] stop_reason={}, blocks={}",
+            "[resp] stop_reason={}, blocks={}, text={}, tool_use={}, tools=[{}], input_tokens={}, output_tokens={}",
             stop_reason,
-            content.len()
+            content.len(),
+            text_blocks,
+            tool_names.len(),
+            tool_names.join(","),
+            input_tokens.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+            output_tokens.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
         );
 
         CallResult::Success(MessagesResponse { content, stop_reason })

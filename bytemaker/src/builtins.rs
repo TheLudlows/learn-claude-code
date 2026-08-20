@@ -141,33 +141,6 @@ fn requires_approval(command: &str) -> Option<&'static str> {
     None
 }
 
-/// 检查命令是否包含编码绕过尝试
-fn detect_encoding_bypass(command: &str) -> Option<&'static str> {
-    // 检查是否有十六进制编码的命令
-    if command.contains(r"\x") || command.contains(r"\u") {
-        return Some("command contains escape sequences (encoding bypass attempt)");
-    }
-
-    // 检查是否有明显的 base64 编码
-    if command.len() > 100 {
-        let alphanumeric_count = command.chars()
-            .filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
-            .count();
-        if alphanumeric_count > command.len() * 9 / 10 {
-            return Some("command appears to be encoded (base64-like pattern)");
-        }
-    }
-
-    // 检查是否有重复的引号或转义字符（可能是混淆）
-    let backslash_count = command.chars().filter(|&c| c == '\\').count();
-    let quote_count = command.chars().filter(|&c| c == '"' || c == '\'').count();
-    if backslash_count > 5 || quote_count > 10 {
-        return Some("command contains suspicious escaping or quoting");
-    }
-
-    None
-}
-
 /// 闸门 3: 暂停等用户确认
 fn ask_user(name: &str, input: &serde_json::Value, reason: &str) -> bool {
     output::permission(reason, name, input);
@@ -185,15 +158,6 @@ pub struct PermissionHook;
 
 impl PreToolHook for PermissionHook {
     fn on_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
-        // 闸门 0: 检测编码绕过尝试
-        if name == "command" {
-            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(reason) = detect_encoding_bypass(cmd) {
-                output::blocked(reason);
-                return Some(format!("Permission denied: {}", reason));
-            }
-        }
-
         // 闸门 1: 硬拒绝（使用正则模式匹配）
         if name == "command" {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -202,16 +166,7 @@ impl PreToolHook for PermissionHook {
                 return Some(format!("Permission denied: {}", reason));
             }
         }
-
-        // 闸门 1.5: 命令结构验证
-        if name == "command" {
-            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(reason) = validate_command_structure(cmd) {
-                output::blocked(reason);
-                return Some(format!("Permission denied: {}", reason));
-            }
-        }
-
+        
         // 闸门 2: 检查是否需要用户批准
         if name == "command" {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -241,72 +196,4 @@ impl PreToolHook for PermissionHook {
     }
 }
 
-/// PreToolUse hook for teammates: non-interactive version of PermissionHook.
-///
-/// 同样的 deny/approval 闸门，但**不读 stdin**：任何需要用户批准的命令/路径
-/// 在 teammate 上下文里直接拒绝（teammate 是后台非交互的）。返回 Some(reason)
-/// 表示拦截，None 表示放行。
-pub struct TeammatePermissionHook;
-
-impl PreToolHook for TeammatePermissionHook {
-    fn on_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
-        if name == "command" {
-            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(reason) = detect_encoding_bypass(cmd) {
-                return Some(format!("Permission denied: {}", reason));
-            }
-            if let Some(reason) = check_deny_patterns(cmd) {
-                return Some(format!("Permission denied: {}", reason));
-            }
-            if let Some(reason) = validate_command_structure(cmd) {
-                return Some(format!("Permission denied: {}", reason));
-            }
-            if requires_approval(cmd).is_some() {
-                return Some("Permission denied: teammate context cannot prompt for approval".to_string());
-            }
-        }
-        // File tools' check_permission returns NeedsApproval for paths escaping
-        // the workspace — teammates can't prompt, so deny those too.
-        if let Some(permission_check) = registry.check_permission(name, input) {
-            match permission_check {
-                PermissionCheck::Pass => {}
-                PermissionCheck::NeedsApproval(reason) => {
-                    return Some(format!("Permission denied (teammate, non-interactive): {}", reason));
-                }
-            }
-        }
-        None
-    }
-}
-
-/// 验证命令结构，防止命令注入和混淆攻击
-fn validate_command_structure(command: &str) -> Option<&'static str> {
-    // 检查是否有命令分隔符（子命令）
-    if command.contains(';') || command.contains("&&") || command.contains("||") {
-        return Some("command contains command separators (injection attempt)");
-    }
-
-    // 检查是否有管道到 shell
-    if command.contains('|') || command.contains(">") || command.contains("<") {
-        // 简单的输出重定向通常允许，但需要验证
-        let has_shell_redirect = regex::Regex::new(r"\|\s*(bash|sh|zsh|fish)").is_ok()
-            && regex::Regex::new(r"\|\s*(bash|sh|zsh|fish)").unwrap().is_match(command);
-
-        if has_shell_redirect {
-            return Some("command pipes to shell (injection attempt)");
-        }
-    }
-
-    // 检查是否有命令替换（$() 或 ``）
-    if regex::Regex::new(r"\$\(|`[^`]*`").unwrap().is_match(command) {
-        return Some("command contains command substitution (injection attempt)");
-    }
-
-    // 检查是否有 $(...) 模式
-    if regex::Regex::new(r"\$\{").unwrap().is_match(command) {
-        return Some("command contains variable expansion (injection attempt)");
-    }
-
-    None
-}
 

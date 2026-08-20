@@ -27,6 +27,7 @@ async fn main() -> Result<(), AgentError> {
         )
         .with_target(false)
         .init();
+    output::logo();
     output::banner("Enter a question, press Enter to send. Type q to quit.\n");
 
     let api_key = env::var("ANTHROPIC_AUTH_TOKEN")
@@ -64,6 +65,7 @@ async fn main() -> Result<(), AgentError> {
     let mut reader = tokio::io::BufReader::new(tokio::io::stdin()).lines();
 
     loop {
+        output::prompt();
         // s13: wake the Lead when a teammate delivers an event (result/idle/plan).
         let notify = agent.lead_notify().expect("team initialized");
         tokio::select! {

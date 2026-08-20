@@ -217,7 +217,7 @@ impl Agent {
     /// reminder. No TodoReminder/Summary — teammates are non-interactive.
     fn build_teammate_hooks() -> Hooks {
         let mut h = Hooks::new();
-        h.on_pre_tool(builtins::TeammatePermissionHook);
+        h.on_pre_tool(builtins::PermissionHook);
         h.on_post_tool(builtins::LargeOutputHook);
         h
     }
@@ -397,7 +397,6 @@ impl Agent {
                 }
             };
 
-            // 打印这一轮的 LLM 内容；client 自身不打印。
             {
                 let mut out = std::io::stdout().lock();
                 output::render(&response, &mut out);
@@ -418,12 +417,10 @@ impl Agent {
 
             // 检查是否需要调用工具。
             if response.stop_reason != "tool_use" {
-                // s04：退出前触发 Stop；返回 Some(msg) 则注入并继续，不退出。
                 if let Some(force) = self.hooks.trigger_stop(messages) {
                     messages.push(Message::user_text(force));
                     continue;
                 }
-                // s09：真退出前提取持久记忆（子 agent memory=None 跳过）。
                 if let Some(mem) = &self.memory {
                     if mem.extract_memories(&self.client, messages).await > 0 {
                         let _ = mem.consolidate_memories(&self.client).await;

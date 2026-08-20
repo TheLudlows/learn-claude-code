@@ -188,6 +188,54 @@ pub fn prompt() {
     let _ = out.flush();
 }
 
+/// ByteMaker 启动 logo：5 行像素字标，cyan；`NO_COLOR` 置位时降级为原样。
+///
+/// 每个 glyph 固定 5 列宽，逐行用 2 空格拼接 9 个字母（B-y-t-e-M-a-k-e-r），
+/// 保证各字母在每一行的列位对齐。整行拼好后 `trim_end` 只裁掉末字母右侧的
+/// 占位空格（右缘参差，不影响对齐）。
+pub fn logo() {
+    let glyphs: [[&str; 5]; 9] = [
+        // B
+        ["#### ", "#   #", "#### ", "#   #", "#### "],
+        // y
+        ["#   #", " # # ", "  #  ", "  #  ", "   # "],
+        // t
+        ["  #  ", "#####", "  #  ", "  #  ", "  ## "],
+        // e
+        [" ####", "#   #", "#####", "#    ", " ### "],
+        // M
+        ["#   #", "## ##", "# # #", "#   #", "#   #"],
+        // a
+        [" ### ", "#   #", "#####", "#   #", "#   #"],
+        // k
+        ["#   #", "#  # ", "###  ", "#  # ", "#   #"],
+        // e
+        [" ####", "#   #", "#####", "#    ", " ### "],
+        // r
+        ["#### ", "#  # ", "#    ", "#    ", "#    "],
+    ];
+    let mut rows: [String; 5] = Default::default();
+    for glyph in &glyphs {
+        for (i, row) in glyph.iter().enumerate() {
+            if !rows[i].is_empty() {
+                rows[i].push_str("  ");
+            }
+            rows[i].push_str(row);
+        }
+    }
+    // 保留每个 glyph 的完整 5 列宽以维持列对齐；只在整行拼好后裁掉末尾占位空格。
+    for row in &mut rows {
+        let len = row.trim_end().len();
+        row.truncate(len);
+    }
+    let art = rows.join("\n");
+    if colors_enabled() {
+        println!("{}", art.cyan());
+    } else {
+        println!("{art}");
+    }
+}
+
 /// 普通横幅行（不着色）。
 pub fn banner(msg: &str) {
     println!("{msg}");

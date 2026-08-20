@@ -24,7 +24,7 @@ use crate::team::worktree::task_worktree_cwd;
 /// active-teammate registry, a Notify for waking the Lead REPL, the task
 /// store, the repo workdir, and the cross-process TaskStoreLock.
 pub struct TeamCtx {
-    pub bus: crate::team::bus::MessageBus,
+    pub bus: bus::MessageBus,
     pub assignments: AssignmentRegistry,
     pub protocols: ProtocolRegistry,
     pub active: Mutex<HashMap<String, TeammateStatus>>,
