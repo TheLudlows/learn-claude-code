@@ -213,34 +213,6 @@ impl CallResult {
     }
 }
 
-/// 流式增量回调。
-pub struct DeltaSink {
-    cb: Box<dyn FnMut(Delta) + Send>,
-}
-/// 一条增量。
-pub enum Delta { Text(String), ToolUseStart { id: String, name: String, input: serde_json::Value } }
-
-impl DeltaSink {
-    /// 生产构造：传入转发闭包。
-    pub fn new(cb: impl FnMut(Delta) + Send + 'static) -> Self { Self { cb: Box::new(cb) } }
-    /// 测试用收集器（仅累 text）。
-    #[cfg(test)]
-    pub fn collect() -> CollectSink { CollectSink::default() }
-    pub fn feed(&mut self, d: Delta) { (self.cb)(d); }
-}
-
-/// 测试用文本收集器。
-#[cfg(test)]
-#[derive(Default)]
-pub struct CollectSink {
-    text: String,
-}
-#[cfg(test)]
-impl CollectSink {
-    pub fn drain_text(&mut self) -> String { std::mem::take(&mut self.text) }
-    pub fn text(&mut self, t: &str) { self.text.push_str(t); }
-}
-
 /// 封装 Anthropic API 交互。
 pub struct Client {
     http: reqwest::Client,
@@ -271,15 +243,14 @@ impl Client {
     /// 流式调用 /v1/messages。
     ///
     /// 累加 text 与 tool_use 的 input_json delta，最后返回 `CallResult`。
-    /// 本函数不直接打印——流式 delta 经 `DeltaSink` 回调交由调用方（Coordinator）渲染。
-    /// `agent_loop` 拿到后照旧判断 stop_reason。
+    /// 本函数不直接打印——收集完所有 SSE 事件后返回 `CallResult`，由调用方
+    /// （run_loop）统一渲染。`agent_loop` 拿到后照旧判断 stop_reason。
     pub async fn stream_messages(
         &self,
         system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
         max_tokens: u32,
-        mut delta: Option<&mut DeltaSink>,
         cancel: CancellationToken,
     ) -> CallResult {
         // base_url 末尾的 '/' 会拼出 `//v1/messages`，先 trim 掉。
@@ -375,7 +346,7 @@ impl Client {
                 ev = es_stream.next() => match ev {
                     Some(Ok(e)) => e,
                     Some(Err(e)) => return self.classify_error(AgentError::Stream(e.to_string())),
-                    None => return self.classify_error(AgentError::Stream("stream ended unexpectedly".to_string())),
+                    None => break,
                 },
             };
 
@@ -438,10 +409,6 @@ impl Client {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
                                 text_buf.push_str(t);
-                                // 发送 delta 到 sink
-                                if let Some(sink) = delta.as_mut() {
-                                    sink.feed(Delta::Text(t.to_string()));
-                                }
                             }
                             (BlockAcc::ToolUse { partial_json, .. }, "input_json_delta") => {
                                 let p = delta_val
@@ -471,14 +438,6 @@ impl Client {
                                     serde_json::from_str(&partial_json)
                                         .unwrap_or(serde_json::Value::Null)
                                 };
-                                // 发送 ToolUseStart delta
-                                if let Some(sink) = delta.as_mut() {
-                                    sink.feed(Delta::ToolUseStart {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        input: input.clone(),
-                                    });
-                                }
                                 content.push(ContentBlock::ToolUse { id, name, input });
                             }
                         }
@@ -619,14 +578,6 @@ mod tests {
         let client = Client::new("key".into(), "https://api.example.com".into(), "model".into());
         let err = AgentError::Other("random failure".into());
         assert!(matches!(client.classify_error(err), CallResult::Failure(_)));
-    }
-
-    #[test]
-    fn delta_sink_collects_text_deltas() {
-        let mut sink = DeltaSink::collect();
-        sink.text("foo");
-        sink.text("bar");
-        assert_eq!(sink.drain_text(), "foobar");
     }
 
     #[test]

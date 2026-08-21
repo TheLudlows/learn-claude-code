@@ -372,7 +372,7 @@ impl MemoryStore {
             take_chars(&catalog, 12000)
         );
         let req = vec![Message::user_text(prompt)];
-        match client.stream_messages("", &req, &[], 200, None, tokio_util::sync::CancellationToken::new()).await.into_response() {
+        match client.stream_messages("", &req, &[], 200, tokio_util::sync::CancellationToken::new()).await.into_response() {
             Ok(response) => {
                 let text = response_text(&response);
                 let indices = extract_json_array(&text);
@@ -493,7 +493,7 @@ impl MemoryStore {
             dialogue
         );
         let req = vec![Message::user_text(prompt)];
-        let response = match client.stream_messages("", &req, &[], 1000, None, tokio_util::sync::CancellationToken::new()).await.into_response() {
+        let response = match client.stream_messages("", &req, &[], 1000, tokio_util::sync::CancellationToken::new()).await.into_response() {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("[Memory extraction skipped: {}]", e);
@@ -578,7 +578,7 @@ impl MemoryStore {
             catalog
         );
         let req = vec![Message::user_text(prompt)];
-        let response = match client.stream_messages("", &req, &[], 3000, None, tokio_util::sync::CancellationToken::new()).await.into_response() {
+        let response = match client.stream_messages("", &req, &[], 3000, tokio_util::sync::CancellationToken::new()).await.into_response() {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("[Memory consolidation skipped: {}]", e);

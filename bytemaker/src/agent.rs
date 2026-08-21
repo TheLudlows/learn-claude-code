@@ -397,32 +397,12 @@ impl Agent {
 
             let defs = self.registry.definitions_for(self.kind);
 
-            // 构造 delta sink（流式渲染到 coordinator）
-            let mut sink = crate::client::DeltaSink::new({
-                let coord = Arc::clone(&self.coordinator);
-                move |d| match d {
-                    crate::client::Delta::Text(t) => {
-                        let _ = coord.lock().unwrap().emit_partial(&t);
-                    }
-                    crate::client::Delta::ToolUseStart { id: _, name, input } => {
-                        let mut c = coord.lock().unwrap();
-                        // ⚙ 渲染：先写工具名，再换行写输入
-                        let _ = c.emit(&format!("⚙ {}", name));
-                        // 简化输入格式化（直接 JSON pretty）
-                        if input != serde_json::json!(null) {
-                            let input_str = serde_json::to_string_pretty(&input).unwrap_or_default();
-                            for line in input_str.lines() {
-                                let _ = c.emit(&format!("  {}", line));
-                            }
-                        }
-                    }
-                }
-            });
             let cancel = tokio_util::sync::CancellationToken::new();
 
+            // client 收集完所有 SSE 事件后返回；此处统一渲染（不再流式增量打印）。
             let response = match self
                 .client
-                .stream_messages(&system, messages, &defs, self.max_tokens, Some(&mut sink), cancel.clone())
+                .stream_messages(&system, messages, &defs, self.max_tokens, cancel.clone())
                 .await
             {
                 CallResult::Success(r) => {
@@ -459,7 +439,27 @@ impl Agent {
                 }
             };
 
-            // 流式已通过 delta sink 发送，无需再 post-stream render。
+            // client 收集完返回后，统一渲染本轮内容（text 整行 emit，tool_use 显示 ⚙ + JSON）。
+            {
+                let mut c = self.coordinator.lock().unwrap();
+                for block in &response.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            let _ = c.emit(text);
+                        }
+                        ContentBlock::ToolUse { name, input, .. } => {
+                            let _ = c.emit(&format!("⚙ {}", name));
+                            if *input != serde_json::Value::Null {
+                                let input_str = serde_json::to_string_pretty(input).unwrap_or_default();
+                                for line in input_str.lines() {
+                                    let _ = c.emit(&format!("  {}", line));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
             // 追加助手响应（含 text 与 tool_use 块，原样回传下一轮）。
             messages.push(Message::assistant_content(response.content.clone()));
