@@ -47,6 +47,7 @@ pub struct McpTool {
     /// Server's original tool name (for calling back to MCP server)
     raw_name: String,
     /// Server name (for identification)
+    #[allow(dead_code)]
     server_name: String,
     /// Tool description
     description: String,
@@ -115,41 +116,41 @@ mod mcp_tool_tests {
 
     #[test]
     fn mcp_tool_name_returns_prefixed_name() {
-        let tool = McpTool {
-            prefixed_name: "mcp__test__tool".to_string(),
-            raw_name: "tool".to_string(),
-            server_name: "test".to_string(),
-            description: "test tool".to_string(),
-            input_schema: serde_json::json!({}),
-            client: Arc::new(MockMcpClient::new()),
-        };
+        let tool = McpTool::new(
+            "mcp__test__tool".to_string(),
+            "tool".to_string(),
+            "test".to_string(),
+            "test tool".to_string(),
+            serde_json::json!({}),
+            Arc::new(MockMcpClient::new()),
+        );
         assert_eq!(tool.name(), "mcp__test__tool");
     }
 
     #[test]
     fn mcp_tool_requires_approval() {
-        let tool = McpTool {
-            prefixed_name: "mcp__test__tool".to_string(),
-            raw_name: "tool".to_string(),
-            server_name: "test".to_string(),
-            description: "test tool".to_string(),
-            input_schema: serde_json::json!({}),
-            client: Arc::new(MockMcpClient::new()),
-        };
+        let tool = McpTool::new(
+            "mcp__test__tool".to_string(),
+            "tool".to_string(),
+            "test".to_string(),
+            "test tool".to_string(),
+            serde_json::json!({}),
+            Arc::new(MockMcpClient::new()),
+        );
         let check = tool.check_permission(&serde_json::json!({}));
         assert!(matches!(check, PermissionCheck::NeedsApproval(_)));
     }
 
     #[test]
     fn mcp_tool_available_for_all_kinds() {
-        let tool = McpTool {
-            prefixed_name: "mcp__test__tool".to_string(),
-            raw_name: "tool".to_string(),
-            server_name: "test".to_string(),
-            description: "test tool".to_string(),
-            input_schema: serde_json::json!({}),
-            client: Arc::new(MockMcpClient::new()),
-        };
+        let tool = McpTool::new(
+            "mcp__test__tool".to_string(),
+            "tool".to_string(),
+            "test".to_string(),
+            "test tool".to_string(),
+            serde_json::json!({}),
+            Arc::new(MockMcpClient::new()),
+        );
         assert!(tool.available_for(AgentKind::Lead));
         assert!(tool.available_for(AgentKind::Subagent));
         assert!(tool.available_for(AgentKind::Teammate));
