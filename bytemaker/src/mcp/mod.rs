@@ -7,6 +7,9 @@ This module implements:
 - Collision detection: Prevents duplicate prefixed tool names
 */
 
+pub mod tool;
+pub use tool::{McpTool, McpClientTrait};
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use regex::Regex;
