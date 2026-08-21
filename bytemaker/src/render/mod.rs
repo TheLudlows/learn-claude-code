@@ -39,11 +39,11 @@ impl<B: Backend> Coordinator<B> {
     /// 写一行完整输出到滚动区。若当前半行未换行，先补换行。
     pub fn emit(&mut self, line: &str) -> io::Result<()> {
         if self.mid_line {
-            self.backend.write_str("\r\n")?;
+            self.backend.write_str("\n")?;
             self.mid_line = false;
         }
         self.backend.write_str(line)?;
-        self.backend.write_str("\r\n")?;
+        self.backend.write_str("\n")?;
         self.backend.flush()?;
         Ok(())
     }
@@ -212,42 +212,6 @@ impl Backend for CrosstermBackend {
     }
 }
 
-/// raw 模式 RAII 守卫：构造开启、Drop 恢复，保证 panic/早退也复位终端。
-///
-/// 交互模式下同时设置滚动区 `行 1..rows-1`（末行留给 reedline 输入栏），
-/// 把"输出区滚动"与"输入栏固定末行"解耦。`reedline::read_line` 自身会在
-/// 每次读取进出时 toggle raw 模式，但滚动区（DECSTBM）是终端级设置，
-/// 跨 raw/cooked 切换持续生效，故只需在此设置一次。
-pub struct RawModeGuard { enabled: bool }
-impl RawModeGuard {
-    /// `interactive=true` 才真正进 raw 模式 + 设滚动区（非 TTY 传 false）。
-    pub fn new(interactive: bool) -> Self {
-        if interactive {
-            let _ = ct::enable_raw_mode();
-            // DECSTBM：ESC[<top>;<bottom>r，1-indexed。末行(rows)留给输入栏。
-            if let Ok((_, rows)) = ct::size() {
-                let bottom = rows.saturating_sub(1);
-                let mut out = io::stdout().lock();
-                let _ = write!(out, "\x1b[1;{bottom}r");
-                let _ = write!(out, "\x1b[H"); // 光标归位（DECSTBM 规定光标移到原点）
-                let _ = out.flush();
-            }
-        }
-        Self { enabled: interactive }
-    }
-}
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        if self.enabled {
-            let mut out = io::stdout().lock();
-            let _ = write!(out, "\x1b[r"); // 重置滚动区为全屏
-            let _ = write!(out, "\x1b[?25h"); // 确保光标可见
-            let _ = out.flush();
-            let _ = ct::disable_raw_mode();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,11 +221,10 @@ mod tests {
         let mut c = Coordinator::new(VirtualTerm::new(24, 80));
         c.emit_partial("hello").unwrap();
         c.emit("world").unwrap();
-        let v = c.into_backend();
-        // partial "hello" 后 emit "world"：应先补换行再写 world。
-        assert!(v.screendump().contains("hello\r\nworld\r\n")
-            || v.screendump().contains("hello\nworld"),
-            "got: {:?}", v.screendump());
+        let dump = c.into_backend().screendump();
+        // 逐行 I/O（cooked 模式）：emit 用 \n，不应出现 \r。
+        assert!(dump.contains("hello\nworld\n"), "got: {dump:?}");
+        assert!(!dump.contains('\r'), "raw-mode \\r no longer used: {dump:?}");
     }
 
     #[test]
@@ -271,13 +234,6 @@ mod tests {
         c.emit("b").unwrap();
         let s = c.into_backend().screendump();
         assert!(s.contains("a") && s.contains("b"), "got: {:?}", s);
-    }
-
-    #[test]
-    fn raw_mode_guard_is_drop_safe_when_not_a_tty() {
-        // 非 TTY（CI）下不应 panic，构造/析构皆 Ok。
-        let g = RawModeGuard::new(false);
-        drop(g); // 不 panic 即过
     }
 
     #[test]
@@ -300,19 +256,4 @@ mod tests {
         assert!(s.contains("已截断"), "{s}");
     }
 
-    #[test]
-    fn non_tty_coordinator_writes_plain_no_scroll_region() {
-        // 非 TTY（CI）路径：RawModeGuard::new(false) 不进 raw、不设滚动区；
-        // Coordinator 直写后端（VirtualTerm 累字节），输出原样不含滚动区转义码。
-        let g = RawModeGuard::new(false);
-        let mut c = Coordinator::new(VirtualTerm::new(24, 80));
-        c.emit("hi").unwrap();
-        let dump = c.into_backend().screendump();
-        assert!(dump.contains("hi"), "plain write should contain 'hi': {dump:?}");
-        assert!(
-            !dump.contains("\x1b[1;"),
-            "non-TTY path must not emit a scroll-region sequence: {dump:?}"
-        );
-        drop(g); // 守卫析构在非 TTY 下应为 no-op，不 panic
-    }
 }

@@ -14,17 +14,12 @@
 //! reedline 自带编辑/历史，不在此重测。
 //!
 //! 终端卫生：reedline 的 `read_line` 每次进出会自行 `enable_raw_mode` /
-//! `disable_raw_mode`，并以**当前光标行**作为提示符锚点（见
-//! `Reedline::read_line_helper` 的 `initialize_prompt_position`）。故每次
-//! 读取前线程都把光标移到末行（滚动区之外），让输入栏固定在末行，输出
-//! 区在其上方滚动。滚动区由 `RawModeGuard` 在交互模式进入时设置。
+//! `disable_raw_mode`（瞬态，仅读期间 raw 开）。逐行 I/O 模型下，输出在
+//! 回合内（cooked 模式，`\n` 正常）流式渲染；读期间不产生输出，故无需
+//! 滚动区 / 末行锚定，`move_to_input_line` 已移除。
 
 use std::borrow::Cow;
-use std::io;
 
-use crossterm::cursor::MoveTo;
-use crossterm::execute;
-use crossterm::terminal;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::hooks::PermissionQuery;
@@ -86,17 +81,8 @@ impl reedline::Prompt for ReplPrompt {
     }
 }
 
-/// 把光标移到末行（滚动区之外），让 reedline 把输入栏锚定在末行。
-/// 仅在交互模式（真 TTY）下有意义；InputTask 只在交互模式下被 spawn。
-fn move_to_input_line() {
-    if let Ok((_, rows)) = terminal::size() {
-        let _ = execute!(io::stdout(), MoveTo(0, rows.saturating_sub(1)));
-    }
-}
-
 /// 读一行用户输入。`Success` → `Some(line)`；其余（CtrlC/CtrlD/Err/…）→ `None`。
 fn read_line(ed: &mut reedline::Reedline, prompt: &ReplPrompt) -> Option<String> {
-    move_to_input_line();
     match ed.read_line(prompt) {
         Ok(reedline::Signal::Success(line)) => Some(line),
         _ => None,
@@ -105,7 +91,6 @@ fn read_line(ed: &mut reedline::Reedline, prompt: &ReplPrompt) -> Option<String>
 
 /// 读一行权限确认。`y`（大小写不敏感）→ `true`；其余 → `false`。
 fn read_permission(ed: &mut reedline::Reedline, prompt: &ReplPrompt) -> bool {
-    move_to_input_line();
     match ed.read_line(prompt) {
         Ok(reedline::Signal::Success(l)) => l.trim().eq_ignore_ascii_case("y"),
         _ => false,

@@ -1,17 +1,18 @@
 /*
-main.rs - REPL 入口（s13 / 控制台 I/O 分离）
+main.rs - REPL 入口（逐行 I/O 简化模型）
 
 核心循环与共享状态都移入 lib 的 `Agent`（agent.rs）：main 只做 CLI 装配——
-读 env、构造 Agent、启动 cron、REPL 调 `agent.run_loop`。原 `execute_tool`/`agent_loop`
-/`set_instance`/`init_manager`/`start_runtime` 全部并入 Agent，此处不再出现。
+读 env、构造 Agent、启动 cron、REPL 调 `agent.run_loop`。
 
-控制台 I/O 分离（spec 2026-08-20）：
-- 交互模式（真 TTY）：`RawModeGuard` 进 raw 模式 + 设滚动区（末行留输入栏）；
-  `InputTask`（reedline）独占 stdin，经单一命令通道收 `ReadLine` / `AskPermission`；
-  main 在 `select!{ line_rx, lead_notify }` 上等待，team 事件打断输入等待时
-  **保留在途的 ReadLine**（用户在 team 回合期间键入的行成为下一轮用户回合）。
-- 非交互模式（管道/CI）：退化到 tokio 行读取，不进 raw、不设滚动区、不 spawn
-  InputTask；权限钩子无 ask 通道 → 需批准的命令直接拒绝（不挂起）。
+终端交互（简化后，2026-08-21）：不再用 raw 模式 + 滚动区维持"末行固定输入栏"，
+改为普通逐行 I/O。
+- 交互模式（真 TTY）：`InputTask`（reedline）独占 stdin，经单一命令通道收
+  `ReadLine` / `AskPermission`；main 只 `await` 该行（不再 `select!` notify）。
+  team 事件**延迟到下一轮用户回合开头**排空（`run_team_wake` 内部 consume，
+  空则 no-op）——不再打断正在打字的回合，避免在 reedline 阻塞读期间流式输出糊屏。
+- 非交互模式（管道/CI）：tokio 行读取 + `select!{ line, lead_notify }`，team
+  事件立即唤醒（async future 可 drop，无 raw 模式糊屏问题）；不 spawn InputTask。
+  权限钩子无 ask 通道 → 需批准的命令直接拒绝（不挂起）。
 两种模式的用户回合 / team 唤醒逻辑共享 `run_user_turn` / `run_team_wake`。
 */
 
@@ -25,7 +26,7 @@ use bytemaker::client::Message;
 use bytemaker::error::AgentError;
 use bytemaker::output;
 use bytemaker::render::input::InputCmd;
-use bytemaker::render::{Coordinator, CrosstermBackend, RawModeGuard};
+use bytemaker::render::{Coordinator, CrosstermBackend};
 use bytemaker::team;
 use dotenv::dotenv;
 use tokio::io::AsyncBufReadExt;
@@ -44,7 +45,7 @@ async fn main() -> Result<(), AgentError> {
         .with_target(false)
         .init();
 
-    // logo 在进 raw 模式前打印（cooked 模式下 `\n` 正常；进 raw 后所有输出走 Coordinator 的 `\r\n`）。
+    // logo：cooked 模式 `\n` 正常（reedline 仅在读期间瞬态开 raw，不影响此处）。
     output::logo();
 
     let api_key = env::var("ANTHROPIC_AUTH_TOKEN")
@@ -60,7 +61,6 @@ async fn main() -> Result<(), AgentError> {
 
     // 控制台 I/O 分离：交互模式进 raw + 设滚动区；非 TTY 全部跳过。
     let interactive = std::io::stdout().is_terminal();
-    let _guard = RawModeGuard::new(interactive);
 
     let coordinator: Arc<Mutex<Coordinator<CrosstermBackend>>> =
         Arc::new(Mutex::new(Coordinator::new(CrosstermBackend::new())));
@@ -109,7 +109,9 @@ async fn main() -> Result<(), AgentError> {
     Ok(())
 }
 
-/// 交互模式 REPL：reedline InputTask + select{line, lead_notify}。
+/// 交互模式 REPL：reedline InputTask，纯 await line（不再 select! notify）。
+/// team 事件 defer 到下一轮用户回合开头排空（`run_team_wake` 内部 consume，
+/// 空则 no-op）——避免在 reedline 阻塞读期间流式输出糊屏。
 async fn run_interactive(
     agent: &Agent,
     messages: &mut Vec<Message>,
@@ -118,43 +120,32 @@ async fn run_interactive(
 ) -> Result<(), AgentError> {
     loop {
         // 请求 InputTask 读一行查询（reedline 自行渲染 ` >> ` 提示符）。
-        let (line_tx, mut line_rx) = oneshot::channel();
+        let (line_tx, line_rx) = oneshot::channel();
         if cmd_tx.send(InputCmd::ReadLine(line_tx)).await.is_err() {
             break; // InputTask 线程已退出
         }
-        let notify = agent.lead_notify().expect("team initialized");
-        loop {
-            tokio::select! {
-                biased;
-                res = &mut line_rx => {
-                    let line = match res {
-                        Ok(Some(l)) => l,
-                        _ => break, // EOF / Ctrl+C：InputTask 已退出，本路也结束
-                    };
-                    let query = line.trim().to_string();
-                    if query.is_empty() {
-                        break; // 空行：重新发 ReadLine
-                    }
-                    if query.eq_ignore_ascii_case("q") || query == "exit" {
-                        let _ = cmd_tx.send(InputCmd::Shutdown).await;
-                        return Ok(());
-                    }
-                    if run_user_turn(agent, messages, &query, coordinator).await {
-                        let _ = cmd_tx.send(InputCmd::Shutdown).await;
-                        return Ok(());
-                    }
-                    break; // 本轮结束：重新发 ReadLine
-                }
-                _ = notify.notified() => {
-                    // team 事件打断输入等待。在途的 ReadLine 保留在 InputTask 线程上
-                    // （用户在 team 回合期间键入的行将在 team 回合后由本 select 取回）。
-                    if run_team_wake(agent, messages, coordinator).await {
-                        let _ = cmd_tx.send(InputCmd::Shutdown).await;
-                        return Ok(());
-                    }
-                    continue; // 重新 select 同一个 line_rx（仍在途，或用户已键入则就绪）
-                }
-            }
+        let line = match line_rx.await {
+            Ok(Some(l)) => l,
+            _ => break, // EOF / Ctrl+C：InputTask 已退出
+        };
+        let query = line.trim().to_string();
+        if query.is_empty() {
+            continue; // 空行：重新发 ReadLine
+        }
+        if query.eq_ignore_ascii_case("q") || query == "exit" {
+            let _ = cmd_tx.send(InputCmd::Shutdown).await;
+            return Ok(());
+        }
+        // defer 唤醒：每轮用户回合开头排空 Lead 收件箱。`run_team_wake`
+        // 内部自己 `consume_lead_inbox`，空收件箱 → is_empty → 返回 false
+        //（no-op）；勿在外层预 consume（会与内部 consume 重复排空成空）。
+        if run_team_wake(agent, messages, coordinator).await {
+            let _ = cmd_tx.send(InputCmd::Shutdown).await;
+            return Ok(());
+        }
+        if run_user_turn(agent, messages, &query, coordinator).await {
+            let _ = cmd_tx.send(InputCmd::Shutdown).await;
+            return Ok(());
         }
     }
     Ok(())
