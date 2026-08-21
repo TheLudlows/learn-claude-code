@@ -304,4 +304,20 @@ mod tests {
         assert!(s.contains("…"), "should be truncated: {s}");
         assert!(s.contains("已截断"), "{s}");
     }
+
+    #[test]
+    fn non_tty_coordinator_writes_plain_no_scroll_region() {
+        // 非 TTY（CI）路径：RawModeGuard::new(false) 不进 raw、不设滚动区；
+        // Coordinator 直写后端（VirtualTerm 累字节），输出原样不含滚动区转义码。
+        let g = RawModeGuard::new(false);
+        let mut c = Coordinator::new(VirtualTerm::new(24, 80));
+        c.emit("hi").unwrap();
+        let dump = c.into_backend().screendump();
+        assert!(dump.contains("hi"), "plain write should contain 'hi': {dump:?}");
+        assert!(
+            !dump.contains("\x1b[1;"),
+            "non-TTY path must not emit a scroll-region sequence: {dump:?}"
+        );
+        drop(g); // 守卫析构在非 TTY 下应为 no-op，不 panic
+    }
 }
