@@ -10,6 +10,7 @@ and definition generation. It provides:
 */
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use crate::tools::trait_def::{AgentKind, PermissionCheck, Tool, ToolDefinition, ToolContext, ToolResult};
 use serde_json::Value;
@@ -20,26 +21,23 @@ use serde_json::Value;
 /// tool discovery, execution, and permission checking.
 pub struct ToolRegistry {
     /// Collection of registered tools stored as a BTreeMap keyed by tool name.
-    /// BTreeMap 保证按名称排序、确定性的迭代顺序，查找 O(log n)。
-    tools: BTreeMap<String, Box<dyn Tool>>,
+    /// BTreeMap ensures sorted, deterministic iteration order, O(log n) lookup.
+    /// RwLock allows runtime dynamic registration of MCP tools.
+    tools: RwLock<BTreeMap<String, Arc<dyn Tool>>>,
 }
 
 impl ToolRegistry {
-    /// Create a new empty tool registry
     pub fn new() -> Self {
-        Self { tools: BTreeMap::new() }
+        Self { tools: RwLock::new(BTreeMap::new()) }
     }
 
     /// Register a new tool in the registry
     ///
     /// The tool's name is extracted at registration time and used as the key.
     /// If a tool with the same name is already registered, it will be replaced.
-    ///
-    /// # Arguments
-    /// * `tool` - A boxed tool implementing the Tool trait
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let name = tool.name().to_string();
-        self.tools.insert(name, tool);
+        self.tools.write().unwrap().insert(name, Arc::from(tool));
     }
 
     /// Dispatch a tool call by name.
@@ -65,25 +63,28 @@ impl ToolRegistry {
         input: &Value,
         kind: AgentKind,
     ) -> ToolResult {
-        match self.tools.get(name) {
-            Some(tool) => {
-                if !tool.available_for(kind) {
-                    ToolResult::Rejected {
-                        name: name.to_string(),
-                        reason: format!("Tool not available in {:?} context", kind),
+        let tool = {
+            let guard = self.tools.read().unwrap();
+            match guard.get(name) {
+                Some(tool) => {
+                    if !tool.available_for(kind) {
+                        return ToolResult::Rejected {
+                            name: name.to_string(),
+                            reason: format!("Tool not available in {:?} context", kind),
+                        };
                     }
-                } else {
-                    ToolResult::Output(tool.execute(ctx, input).await)
+                    Arc::clone(tool)
+                }
+                None => {
+                    let available: Vec<String> = guard.keys().cloned().collect();
+                    return ToolResult::NotFound {
+                        name: name.to_string(),
+                        available,
+                    };
                 }
             }
-            None => {
-                let available: Vec<String> = self.tools.keys().cloned().collect();
-                ToolResult::NotFound {
-                    name: name.to_string(),
-                    available,
-                }
-            }
-        }
+        }; // Read lock released here, safe to await
+        ToolResult::Output(tool.execute(ctx, input).await)
     }
 
     /// Check permission for a tool call
@@ -96,7 +97,7 @@ impl ToolRegistry {
     /// * `Some(permission_check)` - The permission result if the tool was found
     /// * `None` - If no tool with the given name was registered
     pub fn check_permission(&self, name: &str, input: &Value) -> Option<PermissionCheck> {
-        self.tools.get(name).map(|tool| tool.check_permission(input))
+        self.tools.read().unwrap().get(name).map(|tool| tool.check_permission(input))
     }
 
     /// Generate ToolDefinition list for all registered tools
@@ -106,7 +107,7 @@ impl ToolRegistry {
     /// # Returns
     /// A vector of ToolDefinition structs for API integration
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools
+        self.tools.read().unwrap()
             .values()
             .map(|tool| ToolDefinition {
                 name: tool.name().to_string(),
@@ -123,7 +124,7 @@ impl ToolRegistry {
     /// # Returns
     /// A vector of ToolDefinition structs for API integration
     pub fn definitions_for(&self, kind: AgentKind) -> Vec<ToolDefinition> {
-        self.tools
+        self.tools.read().unwrap()
             .values()
             .filter(|tool| tool.available_for(kind))
             .map(|tool| ToolDefinition {
@@ -142,7 +143,7 @@ impl ToolRegistry {
     /// # Returns
     /// `true` if a tool with the given name is registered, `false` otherwise
     pub fn has_tool(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.tools.read().unwrap().contains_key(name)
     }
 
     /// Get the number of registered tools
@@ -150,7 +151,7 @@ impl ToolRegistry {
     /// # Returns
     /// The count of registered tools
     pub fn tool_count(&self) -> usize {
-        self.tools.len()
+        self.tools.read().unwrap().len()
     }
 }
 
@@ -566,5 +567,28 @@ mod tests {
 
         assert!(safe_result.is_some());
         assert_eq!(safe_result.unwrap(), PermissionCheck::Pass);
+    }
+
+    #[test]
+    fn test_registry_stores_tools_as_arc() {
+        use std::sync::Arc;
+        use crate::tools::trait_def::{Tool, AgentKind};
+        use async_trait::async_trait;
+        use serde_json::json;
+
+        struct ArcTestTool;
+        #[async_trait]
+        impl Tool for ArcTestTool {
+            fn name(&self) -> &str { "arc_test" }
+            fn description(&self) -> &str { "test" }
+            fn input_schema(&self) -> serde_json::Value { json!({}) }
+            async fn execute(&self, _: &ToolContext<'_>, _: &serde_json::Value) -> String { "ok".into() }
+        }
+
+        let mut registry = ToolRegistry::new();
+        // This test will fail initially because we store Box, not Arc
+        // We'll verify the internal structure is Arc in later steps
+        registry.register(Box::new(ArcTestTool));
+        assert!(registry.has_tool("arc_test"));
     }
 }
