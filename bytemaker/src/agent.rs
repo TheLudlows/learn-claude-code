@@ -56,7 +56,7 @@ pub struct AgentConfig {
     pub workdir: PathBuf,
     pub skills_dir: PathBuf,
     pub coordinator: Arc<std::sync::Mutex<crate::render::Coordinator<crate::render::CrosstermBackend>>>,
-    pub team_input_sender: Option<tokio::sync::mpsc::Sender<crate::hooks::PermissionQuery>>,
+    pub team_input_sender: Option<tokio::sync::mpsc::Sender<crate::render::input::InputCmd>>,
 }
 
 pub struct Agent {
@@ -68,7 +68,7 @@ pub struct Agent {
     pub(crate) bg_manager: Arc<BackgroundManager>,
     pub(crate) todo_manager: Arc<SharedTodoManager>,
     pub(crate) coordinator: Arc<std::sync::Mutex<crate::render::Coordinator<crate::render::CrosstermBackend>>>,
-    pub(crate) team_input_sender: Option<tokio::sync::mpsc::Sender<crate::hooks::PermissionQuery>>,
+    pub(crate) team_input_sender: Option<tokio::sync::mpsc::Sender<crate::render::input::InputCmd>>,
     pub(crate) workdir: PathBuf,
 
     // ---- per-loop 状态：child 刷新 ----

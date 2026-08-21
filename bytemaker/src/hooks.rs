@@ -31,8 +31,9 @@ use crate::tools::registry::ToolRegistry;
 /// 钩子运行时上下文：pre_tool 需要的 coordinator + 权限应答通道。
 pub struct HookContext {
     pub coordinator: Arc<Mutex<Coordinator<CrosstermBackend>>>,
-    /// Lead 的 InputTask 权限查询发送端；非交互 agent（无 InputTask）为 None。
-    pub ask: Option<mpsc::Sender<PermissionQuery>>,
+    /// Lead 的 InputTask 命令发送端（下发 `InputCmd::AskPermission`）；
+    /// 非交互 agent（无 InputTask）为 None。
+    pub ask: Option<mpsc::Sender<crate::render::input::InputCmd>>,
 }
 
 impl HookContext {

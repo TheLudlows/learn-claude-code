@@ -9,6 +9,8 @@ use std::io::{self, Write};
 use crossterm::terminal as ct;
 use colored::{Colorize, control as colored_control};
 
+pub mod input;
+
 /// 输出栏状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status { Idle, Running, Queued(usize), Permission }
@@ -216,12 +218,25 @@ impl Backend for CrosstermBackend {
 }
 
 /// raw 模式 RAII 守卫：构造开启、Drop 恢复，保证 panic/早退也复位终端。
+///
+/// 交互模式下同时设置滚动区 `行 1..rows-1`（末行留给 reedline 输入栏），
+/// 把"输出区滚动"与"输入栏固定末行"解耦。`reedline::read_line` 自身会在
+/// 每次读取进出时 toggle raw 模式，但滚动区（DECSTBM）是终端级设置，
+/// 跨 raw/cooked 切换持续生效，故只需在此设置一次。
 pub struct RawModeGuard { enabled: bool }
 impl RawModeGuard {
-    /// `interactive=true` 才真正进 raw 模式（非 TTY 传 false）。
+    /// `interactive=true` 才真正进 raw 模式 + 设滚动区（非 TTY 传 false）。
     pub fn new(interactive: bool) -> Self {
         if interactive {
             let _ = ct::enable_raw_mode();
+            // DECSTBM：ESC[<top>;<bottom>r，1-indexed。末行(rows)留给输入栏。
+            if let Ok((_, rows)) = ct::size() {
+                let bottom = rows.saturating_sub(1);
+                let mut out = io::stdout().lock();
+                let _ = write!(out, "\x1b[1;{bottom}r");
+                let _ = write!(out, "\x1b[H"); // 光标归位（DECSTBM 规定光标移到原点）
+                let _ = out.flush();
+            }
         }
         Self { enabled: interactive }
     }
@@ -229,6 +244,10 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if self.enabled {
+            let mut out = io::stdout().lock();
+            let _ = write!(out, "\x1b[r"); // 重置滚动区为全屏
+            let _ = write!(out, "\x1b[?25h"); // 确保光标可见
+            let _ = out.flush();
             let _ = ct::disable_raw_mode();
         }
     }

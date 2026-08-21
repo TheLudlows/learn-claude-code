@@ -155,12 +155,12 @@ async fn ask_via_input(ctx: &HookContext, name: &str, input: &serde_json::Value,
     };
     let (tx, rx) = oneshot::channel();
     ctx.coordinator.lock().unwrap().permission(reason, name, input);
-    let _ = ask.send(PermissionQuery {
+    let _ = ask.send(crate::render::input::InputCmd::AskPermission(PermissionQuery {
         reason: reason.into(),
         name: name.into(),
         input: input.clone(),
         reply: tx,
-    }).await;
+    })).await;
     rx.await.unwrap_or(false)
 }
 
