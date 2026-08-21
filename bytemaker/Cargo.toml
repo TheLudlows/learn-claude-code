@@ -7,8 +7,8 @@ edition = "2021"
 path = "src/lib.rs"
 
 [features]
-# Enable real teammate spawning in the ignored smoke test
-# (cargo test --test s13_agent_teams --features smoke -- --ignored).
+# Under `cfg(test)`, spawn teammates for real (instead of the test stub) when on
+# (see team/runtime.rs). cargo test -p bytemaker --features smoke
 smoke = []
 
 [dependencies]
@@ -33,7 +33,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fastrand = "2.1"
 regex = "1"
 croner = "3"
-tokio-cron-scheduler = "0.15"
 fs4 = "0.9"
 crossterm = "0.29"
 reedline = { version = "0.50", features = ["bashisms"] }
@@ -41,4 +40,3 @@ tokio-util = "0.7"
 
 [dev-dependencies]
 tempfile = "3"
-portable-pty = "0.9"

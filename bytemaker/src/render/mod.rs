@@ -119,10 +119,9 @@ impl<B: Backend> Coordinator<B> {
 
     /// 工具执行结果渲染（折叠+截断）。
     pub fn render_tool_result(&mut self, name: &str, result: &str, color: bool) {
-        if color {
-            colored::control::set_override(true);
-        }
-
+        // 着色双重门控：调用方传 `color`（按 NO_COLOR）且 `should_colorize`
+        // （按 TTY/NO_COLOR）都为真才着色——不碰全局 `set_override`，避免
+        // 一次着色把进程后续所有 colored 输出关掉的副作用。
         const TRUNCATE_AT: usize = 200;
         let size = if result.len() < 1024 {
             format!("{} B", result.len())
@@ -168,10 +167,6 @@ impl<B: Backend> Coordinator<B> {
                     trunc_msg
                 }
             ));
-        }
-
-        if color {
-            colored_control::set_override(false);
         }
     }
 }

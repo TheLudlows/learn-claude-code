@@ -271,7 +271,7 @@ impl Client {
     /// 流式调用 /v1/messages。
     ///
     /// 累加 text 与 tool_use 的 input_json delta，最后返回 `CallResult`。
-    /// 本函数不打印任何内容——展示交给 `output::render`，由调用方拿到响应后调用。
+    /// 本函数不直接打印——流式 delta 经 `DeltaSink` 回调交由调用方（Coordinator）渲染。
     /// `agent_loop` 拿到后照旧判断 stop_reason。
     pub async fn stream_messages(
         &self,

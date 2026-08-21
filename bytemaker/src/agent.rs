@@ -331,7 +331,7 @@ impl Agent {
                 let result = self.execute_tool(name, input).await;
                 let content_str = result.as_content();
                 {
-                    self.coordinator.lock().unwrap().render_tool_result(name, &content_str, false);
+                    self.coordinator.lock().unwrap().render_tool_result(name, &content_str, crate::output::colors_enabled());
                 }
                 if result.was_executed() {
                     if let Some(msg) = self.hooks.trigger_post_tool(name, input, &content_str).await {
@@ -459,8 +459,7 @@ impl Agent {
                 }
             };
 
-            // 流式已通过 delta sink 发送，无需再 post-stream render
-            // { let mut out = std::io::stdout().lock(); output::render(&response, &mut out); }
+            // 流式已通过 delta sink 发送，无需再 post-stream render。
 
             // 追加助手响应（含 text 与 tool_use 块，原样回传下一轮）。
             messages.push(Message::assistant_content(response.content.clone()));
