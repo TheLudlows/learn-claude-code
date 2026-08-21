@@ -27,8 +27,9 @@ impl BackgroundStopHook {
     }
 }
 
+#[async_trait]
 impl StopHook for BackgroundStopHook {
-    fn on_stop(&self, _messages: &[crate::client::Message]) -> Option<String> {
+    async fn on_stop(&self, _messages: &[crate::client::Message]) -> Option<String> {
         let notifications = self.bg_manager.collect();
         if notifications.is_empty() {
             None

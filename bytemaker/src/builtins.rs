@@ -13,9 +13,11 @@ main.rs 默认注册的钩子集中于此(5 个内置钩子全部到位):
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use tokio::sync::oneshot;
+
 use crate::client::{ContentBlock, Message};
-use crate::hooks::{PostToolHook, PreToolHook, PromptHook, StopHook};
-use crate::output;
+use crate::hooks::{HookContext, PermissionQuery, PostToolHook, PreToolHook, PromptHook, StopHook};
 use crate::todo::SharedTodoManager;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::trait_def::PermissionCheck;
@@ -33,8 +35,9 @@ impl TodoReminderHook {
     }
 }
 
+#[async_trait]
 impl PostToolHook for TodoReminderHook {
-    fn on_post_tool(&self, _name: &str, _input: &serde_json::Value, _output: &str) -> Option<String> {
+    async fn on_post_tool(&self, _name: &str, _input: &serde_json::Value, _output: &str) -> Option<String> {
         let todos = self.todo_manager.render();
         Some(format!("<reminder>\nCurrent todos:\n{}\n</reminder>", todos))
     }
@@ -43,8 +46,9 @@ impl PostToolHook for TodoReminderHook {
 /// UserPromptSubmit: 记录当前工作目录。
 pub struct ContextInjectHook;
 
+#[async_trait]
 impl PromptHook for ContextInjectHook {
-    fn on_prompt(&self, _query: &str) {
+    async fn on_prompt(&self, _query: &str) {
         tracing::info!("[HOOK] UserPromptSubmit: working in {}", workdir().display());
     }
 }
@@ -52,8 +56,9 @@ impl PromptHook for ContextInjectHook {
 /// PostToolUse: 输出过大时提醒。
 pub struct LargeOutputHook;
 
+#[async_trait]
 impl PostToolHook for LargeOutputHook {
-    fn on_post_tool(&self, name: &str, _input: &serde_json::Value, output: &str) -> Option<String> {
+    async fn on_post_tool(&self, name: &str, _input: &serde_json::Value, output: &str) -> Option<String> {
         if output.len() > 100_000 {
             tracing::warn!("[HOOK] Large output from {}: {} chars", name, output.len());
         }
@@ -64,8 +69,9 @@ impl PostToolHook for LargeOutputHook {
 /// Stop: 收尾统计本轮用过的工具次数。
 pub struct SummaryHook;
 
+#[async_trait]
 impl StopHook for SummaryHook {
-    fn on_stop(&self, messages: &[Message]) -> Option<String> {
+    async fn on_stop(&self, messages: &[Message]) -> Option<String> {
         let tool_count = messages
             .iter()
             .flat_map(|m| m.content.iter())
@@ -141,12 +147,21 @@ fn requires_approval(command: &str) -> Option<&'static str> {
     None
 }
 
-/// 闸门 3: 暂停等用户确认
-fn ask_user(name: &str, input: &serde_json::Value, reason: &str) -> bool {
-    output::permission(reason, name, input);
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).ok();
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+/// 经 InputTask 询问用户批准。无 ask 通道（非交互 agent）→ 渲染 blocked 并拒绝。
+async fn ask_via_input(ctx: &HookContext, name: &str, input: &serde_json::Value, reason: &str) -> bool {
+    let Some(ask) = ctx.ask.as_ref() else {
+        ctx.coordinator.lock().unwrap().error(&format!("cannot approve {name}: no interactive input channel"));
+        return false;
+    };
+    let (tx, rx) = oneshot::channel();
+    ctx.coordinator.lock().unwrap().permission(reason, name, input);
+    let _ = ask.send(PermissionQuery {
+        reason: reason.into(),
+        name: name.into(),
+        input: input.clone(),
+        reply: tx,
+    }).await;
+    rx.await.unwrap_or(false)
 }
 
 /// PreToolUse 钩子: 三道闸门串联, 返回 Some(reason) 表示拦截, None 表示放行。
@@ -156,23 +171,30 @@ fn ask_user(name: &str, input: &serde_json::Value, reason: &str) -> bool {
 /// 末尾 `return false` 把所有工具都拒掉的 bug。
 pub struct PermissionHook;
 
+#[async_trait]
 impl PreToolHook for PermissionHook {
-    fn on_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
+    async fn on_pre_tool(
+        &self,
+        registry: &ToolRegistry,
+        ctx: &HookContext,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Option<String> {
         // 闸门 1: 硬拒绝（使用正则模式匹配）
         if name == "command" {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(reason) = check_deny_patterns(cmd) {
-                output::blocked(reason);
+                ctx.coordinator.lock().unwrap().blocked(reason);
                 return Some(format!("Permission denied: {}", reason));
             }
         }
-        
+
         // 闸门 2: 检查是否需要用户批准
         if name == "command" {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(reason) = requires_approval(cmd) {
                 // 闸门 3: 向用户请求确认
-                if !ask_user(name, input, reason) {
+                if !ask_via_input(ctx, name, input, reason).await {
                     return Some("Permission denied by user".to_string());
                 }
             }
@@ -186,13 +208,50 @@ impl PreToolHook for PermissionHook {
                 }
                 PermissionCheck::NeedsApproval(reason) => {
                     // 闸门 3: 向用户请求确认
-                    if !ask_user(name, input, reason) {
+                    if !ask_via_input(ctx, name, input, reason).await {
                         return Some("Permission denied by user".to_string());
                     }
                 }
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::{HookContext, PreToolHook};
+    use crate::tools::registry::ToolRegistry;
+
+    #[tokio::test]
+    async fn permission_hook_gate1_denies_destructive() {
+        let hook = PermissionHook;
+        let ctx = HookContext::test_noop();
+        let registry = ToolRegistry::new();
+        let result = hook
+            .on_pre_tool(&registry, &ctx, "command", &serde_json::json!({"command": "rm -rf /"}))
+            .await;
+        assert!(
+            matches!(result, Some(ref r) if r.contains("Permission denied")),
+            "destructive command must be denied at gate 1, got {:?}", result
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_hook_non_interactive_denies_approval_gated() {
+        // ctx.ask = None (no InputTask wired yet) → approval-gated command is denied, never hangs.
+        let hook = PermissionHook;
+        let ctx = HookContext::test_noop();
+        let registry = ToolRegistry::new();
+        let result = hook
+            .on_pre_tool(&registry, &ctx, "command", &serde_json::json!({"command": "rm foo"}))
+            .await;
+        assert_eq!(
+            result,
+            Some("Permission denied by user".to_string()),
+            "non-interactive approval must deny, got {:?}", result
+        );
     }
 }
 

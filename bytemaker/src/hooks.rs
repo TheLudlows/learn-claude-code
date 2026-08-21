@@ -20,21 +20,62 @@ hooks.rs - 钩子系统 (s04)
 具体逻辑全在回调里 —— 这正是 s04 的要点。
 */
 
+use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
+
 use crate::client::{ContentBlock, Message};
+use crate::render::{Coordinator, CrosstermBackend};
 use crate::tools::registry::ToolRegistry;
 
+/// 钩子运行时上下文：pre_tool 需要的 coordinator + 权限应答通道。
+pub struct HookContext {
+    pub coordinator: Arc<Mutex<Coordinator<CrosstermBackend>>>,
+    /// Lead 的 InputTask 权限查询发送端；非交互 agent（无 InputTask）为 None。
+    pub ask: Option<mpsc::Sender<PermissionQuery>>,
+}
+
+impl HookContext {
+    /// 测试用：独立 coordinator、无 ask 通道。
+    #[cfg(test)]
+    pub(crate) fn test_noop() -> Self {
+        Self {
+            coordinator: Arc::new(Mutex::new(Coordinator::new(CrosstermBackend::new()))),
+            ask: None,
+        }
+    }
+}
+
+/// 一条权限查询：钩子发往 InputTask，InputTask 读 y/N 后经 reply 回答。
+pub struct PermissionQuery {
+    pub reason: String,
+    pub name: String,
+    pub input: serde_json::Value,
+    pub reply: oneshot::Sender<bool>,
+}
+
 // ---- 回调 trait ----
+#[async_trait]
 pub trait PromptHook: Send + Sync {
-    fn on_prompt(&self, query: &str);
+    async fn on_prompt(&self, query: &str);
 }
+#[async_trait]
 pub trait PreToolHook: Send + Sync {
-    fn on_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String>;
+    async fn on_pre_tool(
+        &self,
+        registry: &ToolRegistry,
+        ctx: &HookContext,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Option<String>;
 }
+#[async_trait]
 pub trait PostToolHook: Send + Sync {
-    fn on_post_tool(&self, name: &str, input: &serde_json::Value, output: &str) -> Option<String>;
+    async fn on_post_tool(&self, name: &str, input: &serde_json::Value, output: &str) -> Option<String>;
 }
+#[async_trait]
 pub trait StopHook: Send + Sync {
-    fn on_stop(&self, messages: &[Message]) -> Option<String>;
+    async fn on_stop(&self, messages: &[Message]) -> Option<String>;
 }
 
 /// 钩子注册表: 事件 -> 回调列表。
@@ -65,16 +106,22 @@ impl Hooks {
     }
 
     /// 用户输入后、进入 LLM 前触发。返回值不参与控制流。
-    pub fn trigger_prompt(&self, query: &str) {
+    pub async fn trigger_prompt(&self, query: &str) {
         for f in &self.user_prompt {
-            f.on_prompt(query);
+            f.on_prompt(query).await;
         }
     }
 
     /// 工具执行前触发。第一个返回 Some(reason) 的回调短路 -> 该工具被拦截。
-    pub fn trigger_pre_tool(&self, registry: &ToolRegistry, name: &str, input: &serde_json::Value) -> Option<String> {
+    pub async fn trigger_pre_tool(
+        &self,
+        registry: &ToolRegistry,
+        ctx: &HookContext,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Option<String> {
         for f in &self.pre_tool {
-            if let Some(reason) = f.on_pre_tool(registry, name, input) {
+            if let Some(reason) = f.on_pre_tool(registry, ctx, name, input).await {
                 return Some(reason);
             }
         }
@@ -82,9 +129,9 @@ impl Hooks {
     }
 
     /// 工具执行后触发。返回 Some(msg) -> 由调用方作为独立 user 消息注入（不覆盖 tool_result）。
-    pub fn trigger_post_tool(&self, name: &str, input: &serde_json::Value, output: &str) -> Option<String> {
+    pub async fn trigger_post_tool(&self, name: &str, input: &serde_json::Value, output: &str) -> Option<String> {
         for f in &self.post_tool {
-            if let Some(msg) = f.on_post_tool(name, input, output) {
+            if let Some(msg) = f.on_post_tool(name, input, output).await {
                 return Some(msg);
             }
         }
@@ -92,9 +139,9 @@ impl Hooks {
     }
 
     /// 循环即将退出时触发。返回 Some(msg) -> 注入 msg 并继续, 不退出。
-    pub fn trigger_stop(&self, messages: &[Message]) -> Option<String> {
+    pub async fn trigger_stop(&self, messages: &[Message]) -> Option<String> {
         for f in &self.stop {
-            if let Some(msg) = f.on_stop(messages) {
+            if let Some(msg) = f.on_stop(messages).await {
                 return Some(msg);
             }
         }
@@ -139,50 +186,56 @@ mod tests {
     use crate::client::Message;
 
     struct AlwaysBlock;
+    #[async_trait::async_trait]
     impl PreToolHook for AlwaysBlock {
-        fn on_pre_tool(&self, _r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
+        async fn on_pre_tool(&self, _r: &ToolRegistry, _ctx: &HookContext, _n: &str, _i: &serde_json::Value) -> Option<String> {
             Some("nope".to_string())
         }
     }
     struct NeverBlock;
+    #[async_trait::async_trait]
     impl PreToolHook for NeverBlock {
-        fn on_pre_tool(&self, _r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
+        async fn on_pre_tool(&self, _r: &ToolRegistry, _ctx: &HookContext, _n: &str, _i: &serde_json::Value) -> Option<String> {
             None
         }
     }
     struct PanicIfCalled;
+    #[async_trait::async_trait]
     impl PreToolHook for PanicIfCalled {
-        fn on_pre_tool(&self, _r: &ToolRegistry, _n: &str, _i: &serde_json::Value) -> Option<String> {
+        async fn on_pre_tool(&self, _r: &ToolRegistry, _ctx: &HookContext, _n: &str, _i: &serde_json::Value) -> Option<String> {
             panic!("second hook must not run after a block")
         }
     }
 
-    #[test]
-    fn empty_registry_allows() {
+    #[tokio::test]
+    async fn empty_registry_allows() {
         let h = Hooks::new();
+        let ctx = HookContext::test_noop();
         let registry = ToolRegistry::new();
-        assert!(h.trigger_pre_tool(&registry, "command", &serde_json::json!({})).is_none());
+        assert!(h.trigger_pre_tool(&registry, &ctx, "command", &serde_json::json!({})).await.is_none());
     }
 
-    #[test]
-    fn pre_tool_first_some_short_circuits() {
+    #[tokio::test]
+    async fn pre_tool_first_some_short_circuits() {
         let mut h = Hooks::new();
         h.on_pre_tool(AlwaysBlock);
         h.on_pre_tool(PanicIfCalled); // 没短路就会 panic
+        let ctx = HookContext::test_noop();
         let registry = ToolRegistry::new();
         assert_eq!(
-            h.trigger_pre_tool(&registry, "command", &serde_json::json!({})),
+            h.trigger_pre_tool(&registry, &ctx, "command", &serde_json::json!({})).await,
             Some("nope".to_string())
         );
     }
 
-    #[test]
-    fn none_passes_through() {
+    #[tokio::test]
+    async fn none_passes_through() {
         let mut h = Hooks::new();
         h.on_pre_tool(NeverBlock);
         h.on_pre_tool(NeverBlock);
+        let ctx = HookContext::test_noop();
         let registry = ToolRegistry::new();
-        assert!(h.trigger_pre_tool(&registry, "command", &serde_json::json!({})).is_none());
+        assert!(h.trigger_pre_tool(&registry, &ctx, "command", &serde_json::json!({})).await.is_none());
     }
 
     #[test]
@@ -262,16 +315,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stop_some_forces_continue() {
+    #[tokio::test]
+    async fn stop_some_forces_continue() {
         struct Force;
+        #[async_trait::async_trait]
         impl StopHook for Force {
-            fn on_stop(&self, _m: &[Message]) -> Option<String> {
+            async fn on_stop(&self, _m: &[Message]) -> Option<String> {
                 Some("keep going".to_string())
             }
         }
         let mut h = Hooks::new();
         h.on_stop(Force);
-        assert_eq!(h.trigger_stop(&[]), Some("keep going".to_string()));
+        assert_eq!(h.trigger_stop(&[]).await, Some("keep going".to_string()));
     }
 }

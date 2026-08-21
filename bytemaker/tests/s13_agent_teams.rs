@@ -28,6 +28,7 @@ async fn spawn_teammate_delivers_result_and_idle() {
         workdir: cwd.clone(),
         skills_dir: cwd.join("skills"),
         coordinator,
+        team_input_sender: None,
     })
     .await
     .unwrap();

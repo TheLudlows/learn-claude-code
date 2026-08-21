@@ -57,6 +57,7 @@ async fn main() -> Result<(), AgentError> {
         workdir: cwd.clone(),
         skills_dir: PathBuf::from(&skills_dir),
         coordinator,
+        team_input_sender: None,
     };
     let agent = Agent::new(cfg).await?;
     agent.start_cron_runtime().await?;
@@ -89,7 +90,7 @@ async fn main() -> Result<(), AgentError> {
                     break;
                 }
                 // 用户输入后、进入 LLM 前触发 UserPromptSubmit。
-                agent.trigger_prompt(&query);
+                agent.trigger_prompt(&query).await;
                 messages.push(Message::user_text(query.clone()));
                 if let Err(e) = agent.run_loop(&mut messages, &query).await {
                     output::error(&format!("Error: {}", e));

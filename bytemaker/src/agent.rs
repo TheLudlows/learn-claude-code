@@ -23,7 +23,7 @@ use crate::client::{CallResult, Client, ContentBlock, Message};
 use crate::compact::{ContextCompactor, MAX_REACTIVE_RETRIES};
 use crate::cron_scheduler::{self, CronManager};
 use crate::error::AgentError;
-use crate::hooks::{assemble_post_tool_messages, Hooks};
+use crate::hooks::{assemble_post_tool_messages, HookContext, Hooks};
 use crate::memory::{build_system, MemoryStore};
 use crate::skills::SkillLoader;
 use crate::task_system::store::TaskStore;
@@ -56,6 +56,7 @@ pub struct AgentConfig {
     pub workdir: PathBuf,
     pub skills_dir: PathBuf,
     pub coordinator: Arc<std::sync::Mutex<crate::render::Coordinator<crate::render::CrosstermBackend>>>,
+    pub team_input_sender: Option<tokio::sync::mpsc::Sender<crate::hooks::PermissionQuery>>,
 }
 
 pub struct Agent {
@@ -67,6 +68,7 @@ pub struct Agent {
     pub(crate) bg_manager: Arc<BackgroundManager>,
     pub(crate) todo_manager: Arc<SharedTodoManager>,
     pub(crate) coordinator: Arc<std::sync::Mutex<crate::render::Coordinator<crate::render::CrosstermBackend>>>,
+    pub(crate) team_input_sender: Option<tokio::sync::mpsc::Sender<crate::hooks::PermissionQuery>>,
     pub(crate) workdir: PathBuf,
 
     // ---- per-loop 状态：child 刷新 ----
@@ -130,6 +132,7 @@ impl Agent {
             bg_manager,
             todo_manager,
             coordinator: cfg.coordinator,
+            team_input_sender: cfg.team_input_sender,
             workdir: cfg.workdir,
             cron_manager,
             compactor,
@@ -168,6 +171,7 @@ impl Agent {
             bg_manager: Arc::clone(&self.bg_manager),
             todo_manager: Arc::clone(&self.todo_manager),
             coordinator: Arc::clone(&self.coordinator),
+            team_input_sender: self.team_input_sender.clone(),
             workdir: self.workdir.clone(),
             cron_manager: None,
             compactor,
@@ -229,6 +233,7 @@ impl Agent {
             bg_manager: Arc::clone(&self.bg_manager),
             todo_manager: Arc::clone(&self.todo_manager),
             coordinator: Arc::clone(&self.coordinator),
+            team_input_sender: self.team_input_sender.clone(),
             workdir: self.workdir.clone(),
             cron_manager: None,
             compactor,
@@ -263,8 +268,8 @@ impl Agent {
     }
 
     /// 用户输入提交后触发 UserPromptSubmit 钩子。
-    pub fn trigger_prompt(&self, query: &str) {
-        self.hooks.trigger_prompt(query);
+    pub async fn trigger_prompt(&self, query: &str) {
+        self.hooks.trigger_prompt(query).await;
     }
 
     /// 当前工作目录（供 main 的 banner 等使用）。
@@ -285,7 +290,11 @@ impl Agent {
 
     /// 单个工具调用 + PreToolUse 拦截。子 agent 也走这里 → trigger_pre_tool 不再旁路。
     async fn execute_tool(&self, name: &str, input: &serde_json::Value) -> ToolResult {
-        if let Some(reason) = self.hooks.trigger_pre_tool(&self.registry, name, input) {
+        let ctx = HookContext {
+            coordinator: std::sync::Arc::clone(&self.coordinator),
+            ask: self.team_input_sender.clone(),
+        };
+        if let Some(reason) = self.hooks.trigger_pre_tool(&self.registry, &ctx, name, input).await {
             return ToolResult::Denied {
                 name: name.to_string(),
                 reason,
@@ -325,7 +334,7 @@ impl Agent {
                     self.coordinator.lock().unwrap().render_tool_result(name, &content_str, false);
                 }
                 if result.was_executed() {
-                    if let Some(msg) = self.hooks.trigger_post_tool(name, input, &content_str) {
+                    if let Some(msg) = self.hooks.trigger_post_tool(name, input, &content_str).await {
                         reminders.push(msg);
                     }
                 }
@@ -468,7 +477,7 @@ impl Agent {
 
             // 检查是否需要调用工具。
             if response.stop_reason != "tool_use" {
-                if let Some(force) = self.hooks.trigger_stop(messages) {
+                if let Some(force) = self.hooks.trigger_stop(messages).await {
                     messages.push(Message::user_text(force));
                     continue;
                 }
@@ -626,6 +635,7 @@ impl TestAgent {
             bg_manager,
             todo_manager,
             coordinator,
+            team_input_sender: None,
             workdir,
             cron_manager: None,
             compactor,
@@ -718,6 +728,7 @@ mod tests {
             coordinator: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::render::Coordinator::new(crate::render::CrosstermBackend::new())
             )),
+            team_input_sender: None,
         };
         let result = Agent::new(cfg).await;
         assert!(
