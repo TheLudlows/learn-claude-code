@@ -6,6 +6,7 @@ pub mod compact;
 pub mod cron_scheduler;
 pub mod error;
 pub mod hooks;
+pub mod mcp;
 pub mod memory;
 pub mod output;
 pub mod render;
