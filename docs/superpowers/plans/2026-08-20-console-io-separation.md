@@ -1016,23 +1016,27 @@ Plan complete and saved to `docs/superpowers/plans/2026-08-20-console-io-separat
 
 哪种？
 
-**执行状态 (2026-08-20):**
+**执行状态 (2026-08-21):**
 
-✅ 基础架构完成 (Tasks 1-6):
+✅ 全部完成 (Tasks 1-11):
 - Task 1: Spike PASS - reedline + crossterm 滚动区共存验证通过
 - Task 2: Coordinator core + Backend trait + VirtualTerm - 5个测试通过  
 - Task 3: CrosstermBackend + RawModeGuard - 线程安全 Mutex 包裹
 - Task 4: DeltaSink + Cancelled + cancel-aware stream_messages
 - Task 5: agent.rs wiring - coordinator 共享 infra + delta sink + LoopOutcome::Cancelled
 - Task 6: output UX 方法收口为 Coordinator 方法 - 5个测试通过
-
-已提交分支：`worktree-console-io-separation` (6 commits: fa5f39a, 581b3c6, e982738, e716cfe, baf7fb7, b2cd312)
-
-⏳ 剩余集成工作 (Tasks 7-11):
 - Task 7: 异步 PreToolHook + HookContext + 权限经 InputTask oneshot 路由
-- Task 8: InputTask - reedline 壳 + 提交/排队/Ctrl+C/权限模式  
-- Task 9: main.rs 装配 - RawModeGuard + Coordinator + spawn InputTask + select(input_rx, lead_notify, cancel)
-- Task 10: 非 TTY 降级路径
-- Task 11: pty 端到端测试 (ignored,需真实终端 + API key)
+- Task 8: InputTask - reedline 壳 + 命令通道 (ReadLine/AskPermission/Shutdown) + 纯转移函数 2 测试通过
+- Task 9: main.rs 装配 - RawModeGuard(交互设滚动区) + Coordinator + spawn InputTask + select(line_rx, lead_notify)；非 TTY 退化到 tokio 行读取
+- Task 10: 非 TTY 降级路径 - 1 测试通过
+- Task 11: pty 端到端测试 (ignored, `#[cfg(feature="smoke")]`, 需真终端 + env)
 
-建议：使用 `superpowers:subagent-driven-development` 继续执行剩余 Tasks 7-11。
+验证：`cargo test -p bytemaker` → 300 passed, 0 failed, 4 ignored（smoke/pty 用例）。
+分支：`feat/console-io-tasks-7-11`。Tasks 8-11 提交：df2a374, 6134cc5, 1c77afd, db42713。
+
+设计偏离记录（执行时按真实 API 校准）：
+- reedline 0.50 `read_line(&dyn Prompt)` 每次进出自行 toggle raw 模式，并以**当前光标行**为提示符锚点（`initialize_prompt_position`）；故 InputTask 线程每次读取前把光标移到末行，滚动区（DECSTBM）由 `RawModeGuard` 一次性设置并跨 raw/cooked 持续生效。
+- channel 元素类型从 `PermissionQuery` 改为 `InputCmd`（ReadLine/AskPermission/Shutdown），让 main（ReadLine）与 pre-tool 钩子（AskPermission）共享同一 stdin 拥有线程；`PermissionQuery` 结构（含 `reply: oneshot::Sender<bool>`）保留为 `InputCmd::AskPermission` 的载荷。
+- portable-pty 0.9 API：`CommandBuilder`（非 `std::process::Command`）、`try_clone_reader`（非 take_reader）、`take_writer`；pty 测试直接跑 `CARGO_BIN_EXE_bytemaker`（避免 `cargo run` 编译噪声）+ reader 线程 + 截止轮询。
+- 已知局限：team 事件打断输入等待**且**其回合内需权限确认时，InputTask 线程正阻塞在 `read_line`——需用户键入一行解套（用户键入的行随后成为下一轮用户回合）。常见流（用户查询→回合→权限→应答）不受影响。流式中途 Ctrl+C 取消未接（reedline raw 模式下 ISIG 关闭，Ctrl+C 经 read_line 捕获；回合内 Ctrl+C 字节被缓冲、回合结束后下一 ReadLine 读到即退出）。
+
