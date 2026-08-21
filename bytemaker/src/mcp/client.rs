@@ -62,6 +62,8 @@ struct McpClientInner {
     // stdout_lines is owned by the background reader task, not stored here
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    // Background task handle for proper lifetime management
+    reader_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// MCP client for stdio JSON-RPC transport
@@ -91,8 +93,8 @@ impl McpClient {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let pending_clone = Arc::clone(&pending);
 
-        // Spawn background reader task
-        tokio::spawn(async move {
+        // Spawn background reader task and store handle for proper lifetime management
+        let reader_task = tokio::spawn(async move {
             Self::read_responses(stdout_lines, pending_clone).await;
         });
 
@@ -101,6 +103,7 @@ impl McpClient {
             stdin,
             next_id: AtomicU64::new(1),
             pending,
+            reader_task: Some(reader_task),
         };
 
         Ok(Self {
@@ -284,10 +287,37 @@ impl McpClient {
         // Try to send shutdown request (best effort)
         let _ = self.send_request("shutdown", None).await;
 
+        let mut inner = self.inner.lock().await;
+
+        // Abort the background reader task first
+        if let Some(reader_task) = inner.reader_task.take() {
+            reader_task.abort();
+            // Give the task a moment to clean up
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_millis(100),
+                reader_task
+            ).await;
+        }
+
         // Force kill the child process
-        if let Some(mut child) = self.inner.lock().await.child.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        if let Some(mut child) = inner.child.take() {
+            let kill_result = child.kill().await;
+            let wait_result = child.wait().await;
+
+            // Verify that process is actually killed
+            match (kill_result, wait_result) {
+                (Ok(()), Ok(exit_status)) => {
+                    if !exit_status.success() {
+                        tracing::warn!("MCP server process exited with non-zero status: {:?}", exit_status);
+                    }
+                }
+                (Err(e), _) => {
+                    return Err(AgentError::Other(format!("Failed to kill MCP server process: {}", e)));
+                }
+                (Ok(()), Err(e)) => {
+                    return Err(AgentError::Other(format!("Failed to wait for MCP server process: {}", e)));
+                }
+            }
         }
 
         Ok(())
@@ -361,10 +391,150 @@ mod client_tests {
             stdin,
             next_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            reader_task: None,
         };
 
         McpClient {
             inner: Arc::new(Mutex::new(inner)),
         }
+    }
+
+    #[tokio::test]
+    async fn integration_test_mcp_protocol_interactions() {
+        // This test exercises actual MCP protocol interactions with a simple mock server
+        use std::io::Write;
+        use std::process::{Command, Stdio, ChildStdin};
+
+        // Create a simple Python script that acts as a mock MCP server
+        let mock_server_script = r#"
+import sys
+import json
+
+def send_response(response):
+    print(json.dumps(response))
+    sys.stdout.flush()
+
+while True:
+    try:
+        line = sys.stdin.readline()
+        if not line:
+            break
+
+        request = json.loads(line.strip())
+        request_id = request.get("id", 0)
+        method = request.get("method", "")
+
+        if method == "initialize":
+            send_response({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "capabilities": {
+                        "tools": {}
+                    }
+                }
+            })
+        elif method == "tools/list":
+            send_response({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "test_tool",
+                            "description": "A test tool",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "param1": {"type": "string"}
+                                }
+                            }
+                        }
+                    ]
+                }
+            })
+        elif method == "tools/call":
+            send_response({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Tool execution result"
+                        }
+                    ]
+                }
+            })
+        elif method == "shutdown":
+            send_response({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {}
+            })
+            break
+        else:
+            send_response({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32601,
+                    "message": "Method not found"
+                }
+            })
+    except Exception as e:
+        send_response({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "error": {
+                "code": -32700,
+                "message": str(e)
+            }
+        })
+        break
+"#;
+
+        // Write the mock server script to a temporary file
+        let mut temp_file = tempfile::NamedTempFile::new()
+            .expect("Failed to create temp file");
+        temp_file.write_all(mock_server_script.as_bytes())
+            .expect("Failed to write mock server script");
+        let temp_path = temp_file.path().to_str().expect("Invalid path");
+
+        // Test 1: Spawn and initialize client
+        let client = McpClient::spawn("python", &[temp_path])
+            .await
+            .expect("Failed to spawn MCP client");
+
+        let init_result = client.initialize()
+            .await
+            .expect("Failed to initialize MCP client");
+
+        assert!(init_result.capabilities.is_object(), "Initialize should return capabilities object");
+
+        // Test 2: List tools
+        let tools = client.list_tools()
+            .await
+            .expect("Failed to list tools");
+
+        assert_eq!(tools.len(), 1, "Should have exactly one tool");
+        assert_eq!(tools[0].name, "test_tool", "Tool name should be 'test_tool'");
+        assert_eq!(tools[0].description, "A test tool", "Tool description should match");
+
+        // Test 3: Call tool
+        let tool_args = json!({"param1": "test_value"});
+        let result = client.call_tool("test_tool", &tool_args)
+            .await
+            .expect("Failed to call tool");
+
+        assert!(result.contains("Tool execution result"), "Tool result should contain expected text");
+
+        // Test 4: Shutdown client (this tests the cleanup logic)
+        client.shutdown()
+            .await
+            .expect("Failed to shutdown client");
+
+        // Clean up temp file
+        let _ = std::fs::remove_file(temp_path);
     }
 }
