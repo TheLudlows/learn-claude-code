@@ -147,32 +147,46 @@ pub fn normalize(path_str: &str) -> PathBuf {
 }
 
 /// Build and return a tool registry with all tools registered.
+///
+/// Now uses Arc::new() instead of Box::new() for dynamic registration support.
 pub fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
+    // File operations
     registry.register(Box::new(command::CommandTool));
     registry.register(Box::new(read_file::ReadFileTool));
     registry.register(Box::new(write_file::WriteFileTool));
     registry.register(Box::new(edit_file::EditFileTool));
+
+    // Search utilities
     registry.register(Box::new(glob_tool::GlobTool));
+
+    // Skill management
     registry.register(Box::new(load_skill::LoadSkillTool));
+
+    // Todo management
     registry.register(Box::new(todo_write::TodoWriteTool));
+
+    // Task delegation (s06)
     registry.register(Box::new(task::TaskTool));
-    
+
+    // Task system tools (s06)
     registry.register(Box::new(crate::task_system::CreateTaskTool));
     registry.register(Box::new(crate::task_system::ListTasksTool));
     registry.register(Box::new(crate::task_system::GetTaskTool));
     registry.register(Box::new(crate::task_system::ClaimTaskTool));
     registry.register(Box::new(crate::task_system::CompleteTaskTool));
 
+    // Background task tools (s07)
     registry.register(Box::new(crate::background_tasks::TaskOutputTool));
     registry.register(Box::new(crate::background_tasks::TaskStopTool));
 
+    // Cron scheduler tools (s09)
     registry.register(Box::new(crate::cron_scheduler::ScheduleCronTool));
     registry.register(Box::new(crate::cron_scheduler::ListCronsTool));
     registry.register(Box::new(crate::cron_scheduler::CancelCronTool));
 
-    // s13 team tools
+    // Team coordination tools (s13)
     registry.register(Box::new(crate::team::tools::SpawnTeammateTool));
     registry.register(Box::new(crate::team::tools::ListTeammatesTool));
     registry.register(Box::new(crate::team::tools::SendMessageTool));
