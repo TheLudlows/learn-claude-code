@@ -40,6 +40,22 @@ impl ToolRegistry {
         self.tools.write().unwrap().insert(name, Arc::from(tool));
     }
 
+    /// Register a tool dynamically at runtime (used by MCP connect).
+    ///
+    /// This method takes an Arc-wrapped tool and registers it without requiring
+    /// mutable access to the registry (uses interior mutability via RwLock).
+    pub fn register_dynamic(&self, tool: Arc<dyn Tool>) {
+        let name = tool.name().to_string();
+        self.tools.write().unwrap().insert(name, tool);
+    }
+
+    /// Unregister a tool by name (used by MCP disconnect).
+    ///
+    /// Returns true if a tool was removed, false if no tool with that name existed.
+    pub fn unregister(&self, name: &str) -> bool {
+        self.tools.write().unwrap().remove(name).is_some()
+    }
+
     /// Dispatch a tool call by name.
     ///
     /// 对 `available_for(kind) == false` 的工具返回 `ToolResult::Rejected` 而非执行——
@@ -590,5 +606,61 @@ mod tests {
         // We'll verify the internal structure is Arc in later steps
         registry.register(Box::new(ArcTestTool));
         assert!(registry.has_tool("arc_test"));
+    }
+
+    #[tokio::test]
+    async fn test_register_dynamic_adds_tool_at_runtime() {
+        use std::sync::Arc;
+        use crate::tools::trait_def::{Tool, AgentKind, ToolContext};
+
+        struct DynamicTool;
+        #[async_trait]
+        impl Tool for DynamicTool {
+            fn name(&self) -> &str { "dynamic_tool" }
+            fn description(&self) -> &str { "runtime registered" }
+            fn input_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            async fn execute(&self, _: &ToolContext<'_>, _: &serde_json::Value) -> String { "dynamic".into() }
+        }
+
+        let registry = Arc::new(ToolRegistry::new());
+        assert!(!registry.has_tool("dynamic_tool"));
+
+        // This will fail initially - register_dynamic doesn't exist
+        registry.register_dynamic(Arc::new(DynamicTool));
+        assert!(registry.has_tool("dynamic_tool"));
+
+        // Verify it appears in definitions
+        let defs = registry.definitions_for(AgentKind::Lead);
+        assert!(defs.iter().any(|d| d.name == "dynamic_tool"));
+    }
+
+    #[test]
+    fn test_unregister_removes_tool_at_runtime() {
+        use std::sync::Arc;
+        use crate::tools::trait_def::{Tool, AgentKind};
+
+        struct TempTool;
+        #[async_trait]
+        impl Tool for TempTool {
+            fn name(&self) -> &str { "temp_tool" }
+            fn description(&self) -> &str { "temporary" }
+            fn input_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            async fn execute(&self, _: &ToolContext<'_>, _: &serde_json::Value) -> String { "temp".into() }
+        }
+
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register_dynamic(Arc::new(TempTool));
+        assert!(registry.has_tool("temp_tool"));
+
+        // This will fail initially - unregister doesn't exist
+        assert!(registry.unregister("temp_tool"));
+        assert!(!registry.has_tool("temp_tool"));
+
+        // Verify it doesn't appear in definitions anymore
+        let defs = registry.definitions_for(AgentKind::Lead);
+        assert!(!defs.iter().any(|d| d.name == "temp_tool"));
+
+        // Unregistering non-existent tool returns false
+        assert!(!registry.unregister("temp_tool"));
     }
 }
