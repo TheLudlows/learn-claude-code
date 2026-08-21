@@ -12,6 +12,15 @@ use serde_json::Value;
 use crate::tools::trait_def::{AgentKind, PermissionCheck, Tool, ToolContext};
 use crate::error::AgentError;
 
+/// Real MCP client (stdio JSON-RPC transport)
+pub type RealMcpClient = super::client::McpClient;
+
+/// Trait for MCP client operations (allows mocking)
+#[async_trait]
+pub trait McpClientTrait: Send + Sync {
+    async fn call_tool(&self, name: &str, args: &Value) -> Result<String, AgentError>;
+}
+
 /// Mock MCP client for testing (real client in Task 3.1)
 pub struct MockMcpClient {
     // Placeholder - will be replaced with real McpClient
@@ -27,16 +36,19 @@ impl MockMcpClient {
     }
 }
 
-/// Trait for MCP client operations (allows mocking)
-#[async_trait]
-pub trait McpClientTrait: Send + Sync {
-    async fn call_tool(&self, name: &str, args: &Value) -> Result<String, AgentError>;
-}
-
 #[async_trait]
 impl McpClientTrait for MockMcpClient {
     async fn call_tool(&self, name: &str, args: &Value) -> Result<String, AgentError> {
         MockMcpClient::call_tool(self, name, args).await
+    }
+}
+
+// Implement McpClientTrait for the real McpClient using interior mutability
+#[async_trait]
+impl McpClientTrait for RealMcpClient {
+    async fn call_tool(&self, name: &str, args: &Value) -> Result<String, AgentError> {
+        // Now this works because McpClient::call_tool takes &self
+        RealMcpClient::call_tool(self, name, args).await
     }
 }
 

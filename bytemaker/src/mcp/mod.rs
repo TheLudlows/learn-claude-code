@@ -8,7 +8,9 @@ This module implements:
 */
 
 pub mod tool;
+pub mod client;
 pub use tool::{McpTool, McpClientTrait};
+pub use client::{McpClient, InitResult};
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -43,19 +45,14 @@ pub fn prefixed_tool_name(server: &str, tool: &str) -> Result<String, AgentError
     Ok(prefixed)
 }
 
-/// MCP tool definition from server
-#[derive(Debug, Clone)]
-pub struct McpToolDef {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-}
+/// MCP tool definition from server (re-exported from client)
+pub use client::McpToolDef;
 
 /// Active MCP server connection
 pub struct McpConnection {
     pub server_name: String,
+    pub client: Arc<McpClient>,
     pub tools: Vec<McpToolDef>,
-    // client will be added in Task 3.1
 }
 
 /// MCP server info for listing
