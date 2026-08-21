@@ -25,7 +25,6 @@ use crate::cron_scheduler::{self, CronManager};
 use crate::error::AgentError;
 use crate::hooks::{assemble_post_tool_messages, Hooks};
 use crate::memory::{build_system, MemoryStore};
-use crate::output;
 use crate::skills::SkillLoader;
 use crate::task_system::store::TaskStore;
 use crate::todo::{SharedTodoManager, TodoManager};
@@ -323,8 +322,7 @@ impl Agent {
                 let result = self.execute_tool(name, input).await;
                 let content_str = result.as_content();
                 {
-                    let mut out = std::io::stdout().lock();
-                    output::render_tool_result(name, &content_str, &mut out);
+                    self.coordinator.lock().unwrap().render_tool_result(name, &content_str, false);
                 }
                 if result.was_executed() {
                     if let Some(msg) = self.hooks.trigger_post_tool(name, input, &content_str) {
@@ -424,7 +422,7 @@ impl Agent {
                 }
                 // prompt_too_long 且还有重试预算：压缩后重试。
                 CallResult::PromptTooLong(_) if reactive_retries < MAX_REACTIVE_RETRIES => {
-                    output::status("[reactive compact]");
+                    self.coordinator.lock().unwrap().status("[reactive compact]");
                     self.compactor
                         .reactive_compact(&self.client, messages, active_request)
                         .await?;
@@ -493,7 +491,7 @@ impl Agent {
     pub async fn run_subagent(&self, prompt: &str, max_turns: usize) -> Result<String, AgentError> {
         let max_turns = max_turns.clamp(1, 50);
         let child = self.child_agent(max_turns, SUB_SYSTEM);
-        output::status("[Subagent started]");
+        self.coordinator.lock().unwrap().status("[Subagent started]");
 
         let mut messages: Vec<Message> = vec![Message::user_text(prompt)];
 
@@ -509,17 +507,17 @@ impl Agent {
                     .unwrap_or(&[]);
                 match extract_final_text(last_assistant) {
                     Some(text) => {
-                        output::status("[Subagent done]");
+                        self.coordinator.lock().unwrap().status("[Subagent done]");
                         text
                     }
                     None => {
-                        output::status("[Subagent done - no text]");
+                        self.coordinator.lock().unwrap().status("[Subagent done - no text]");
                         "(no summary)".to_string()
                     }
                 }
             }
             LoopOutcome::MaxTurnsReached => {
-                output::status(&format!(
+                self.coordinator.lock().unwrap().status(&format!(
                     "[Subagent stopped after {} turns without final answer]",
                     max_turns
                 ));
@@ -529,7 +527,7 @@ impl Agent {
                 )
             }
             LoopOutcome::Cancelled => {
-                output::status("[Subagent cancelled]");
+                self.coordinator.lock().unwrap().status("[Subagent cancelled]");
                 "(cancelled)".to_string()
             }
         };
