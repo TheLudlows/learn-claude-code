@@ -21,33 +21,33 @@ hooks.rs - 钩子系统 (s04)
 */
 
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::oneshot;
 
 use crate::client::{ContentBlock, Message};
-use crate::render::{Coordinator, CrosstermBackend};
 use crate::tools::registry::ToolRegistry;
 
-/// 钩子运行时上下文：pre_tool 需要的 coordinator + 权限应答通道。
+/// 钩子运行时上下文：pre_tool 需要的 output + input 抽象接口。
 pub struct HookContext {
-    pub coordinator: Arc<Mutex<Coordinator<CrosstermBackend>>>,
-    /// Lead 的 InputTask 命令发送端（下发 `InputCmd::AskPermission`）；
-    /// 非交互 agent（无 InputTask）为 None。
-    pub ask: Option<mpsc::Sender<crate::render::input::InputCmd>>,
+    /// 抽象的输出接口
+    pub output: Arc<dyn crate::io::Output>,
+    /// 抽象的输入接口
+    pub input: Arc<dyn crate::io::Input>,
 }
 
 impl HookContext {
-    /// 测试用：独立 coordinator、无 ask 通道。
+    /// 测试用：使用内存 I/O 的测试上下文
     #[cfg(test)]
     pub(crate) fn test_noop() -> Self {
+        let io = crate::io::IO::memory();
         Self {
-            coordinator: Arc::new(Mutex::new(Coordinator::new(CrosstermBackend::new()))),
-            ask: None,
+            output: Arc::clone(&io.output),
+            input: Arc::clone(&io.input),
         }
     }
 }
 
-/// 一条权限查询：钩子发往 InputTask，InputTask 读 y/N 后经 reply 回答。
+/// 一条权限查询：InputTask 经 reply 回答权限确认。
 pub struct PermissionQuery {
     pub reason: String,
     pub name: String,

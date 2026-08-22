@@ -30,6 +30,7 @@ impl TaskStoreLock {
 }
 
 pub struct TaskStoreGuard<'a> {
+    #[allow(dead_code)]
     guard: std::sync::MutexGuard<'a, ()>,
     file: std::fs::File,
 }

@@ -11,9 +11,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use crate::tools::trait_def::{AgentKind, PermissionCheck, Tool, ToolContext};
 use crate::error::AgentError;
-
-/// Real MCP client (stdio JSON-RPC transport)
-pub type RealMcpClient = super::client::McpClient;
+use super::client::McpClient;
 
 /// Trait for MCP client operations (allows mocking)
 #[async_trait]
@@ -21,34 +19,27 @@ pub trait McpClientTrait: Send + Sync {
     async fn call_tool(&self, name: &str, args: &Value) -> Result<String, AgentError>;
 }
 
-/// Mock MCP client for testing (real client in Task 3.1)
-pub struct MockMcpClient {
-    // Placeholder - will be replaced with real McpClient
+/// Implement McpClientTrait for the real McpClient
+#[async_trait]
+impl McpClientTrait for McpClient {
+    async fn call_tool(&self, name: &str, args: &Value) -> Result<String, AgentError> {
+        McpClient::call_tool(self, name, args).await
+    }
 }
+
+/// Mock MCP client for testing
+pub struct MockMcpClient;
 
 impl MockMcpClient {
     pub fn new() -> Self {
-        Self {}
-    }
-
-    pub async fn call_tool(&self, _name: &str, _args: &Value) -> Result<String, AgentError> {
-        Ok("mock result".to_string())
+        Self
     }
 }
 
 #[async_trait]
 impl McpClientTrait for MockMcpClient {
-    async fn call_tool(&self, name: &str, args: &Value) -> Result<String, AgentError> {
-        MockMcpClient::call_tool(self, name, args).await
-    }
-}
-
-// Implement McpClientTrait for the real McpClient using interior mutability
-#[async_trait]
-impl McpClientTrait for RealMcpClient {
-    async fn call_tool(&self, name: &str, args: &Value) -> Result<String, AgentError> {
-        // Now this works because McpClient::call_tool takes &self
-        RealMcpClient::call_tool(self, name, args).await
+    async fn call_tool(&self, _name: &str, _args: &Value) -> Result<String, AgentError> {
+        Ok("mock result".to_string())
     }
 }
 
@@ -124,7 +115,6 @@ impl Tool for McpTool {
 #[cfg(test)]
 mod mcp_tool_tests {
     use super::*;
-    use crate::tools::trait_def::AgentKind;
 
     #[test]
     fn mcp_tool_name_returns_prefixed_name() {

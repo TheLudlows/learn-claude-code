@@ -25,10 +25,12 @@ use crate::cron_scheduler::{self, CronManager};
 use crate::error::AgentError;
 use crate::hooks::{assemble_post_tool_messages, HookContext, Hooks};
 use crate::memory::{build_system, MemoryStore};
+use crate::mcp::McpManager;
 use crate::skills::SkillLoader;
 use crate::task_system::store::TaskStore;
 use crate::todo::{SharedTodoManager, TodoManager};
 use crate::tools;
+use crate::tools::compact_tool::CompactionRequest;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::trait_def::{AgentKind, ToolContext, ToolResult};
 
@@ -55,21 +57,24 @@ pub struct AgentConfig {
     pub model: String,
     pub workdir: PathBuf,
     pub skills_dir: PathBuf,
-    pub coordinator: Arc<std::sync::Mutex<crate::render::Coordinator<crate::render::CrosstermBackend>>>,
-    pub team_input_sender: Option<tokio::sync::mpsc::Sender<crate::render::input::InputCmd>>,
+    /// I/O 组合：包含输入输出抽象
+    pub io: Arc<crate::io::IO>,
 }
 
 pub struct Agent {
     // ---- 共享 infra：child_agent Arc-clone ----
     pub(crate) client: Arc<Client>,
     pub(crate) registry: Arc<ToolRegistry>,
+    pub(crate) mcp_manager: Arc<McpManager>,
     pub(crate) skills: Arc<SkillLoader>,
     pub(crate) task_store: Arc<TaskStore>,
     pub(crate) bg_manager: Arc<BackgroundManager>,
     pub(crate) todo_manager: Arc<SharedTodoManager>,
-    pub(crate) coordinator: Arc<std::sync::Mutex<crate::render::Coordinator<crate::render::CrosstermBackend>>>,
-    pub(crate) team_input_sender: Option<tokio::sync::mpsc::Sender<crate::render::input::InputCmd>>,
+    /// I/O 抽象：输入输出接口
+    pub(crate) io: Arc<crate::io::IO>,
     pub(crate) workdir: PathBuf,
+    /// P2: Compaction request flag for model-initiated compression
+    pub(crate) compaction_request: Arc<tokio::sync::Mutex<CompactionRequest>>,
 
     // ---- per-loop 状态：child 刷新 ----
     pub(crate) cron_manager: Option<Arc<CronManager>>,
@@ -116,7 +121,17 @@ impl Agent {
         );
         let memory = MemoryStore::new(cfg.workdir.join(".memory"));
 
-        let registry = Arc::new(tools::build_registry());
+        // P2: Compaction request flag for model-initiated compression
+        let compaction_request = Arc::new(tokio::sync::Mutex::new(CompactionRequest::new()));
+
+        let registry = Arc::new(tools::build_registry_with_compact(Arc::clone(&compaction_request)));
+
+        // s14: 初始化 MCP manager 并注册管理工具
+        let mcp_manager = Arc::new(McpManager::new(Arc::clone(&registry)));
+        registry.register_dynamic(Arc::new(crate::mcp::ConnectMcpTool::new(Arc::clone(&mcp_manager))));
+        registry.register_dynamic(Arc::new(crate::mcp::DisconnectMcpTool::new(Arc::clone(&mcp_manager))));
+        registry.register_dynamic(Arc::new(crate::mcp::ListMcpTool::new(Arc::clone(&mcp_manager))));
+
         let base_system = build_base_system(&skills, &cfg.workdir);
         let hooks = Self::build_hooks(&bg_manager, &todo_manager);
         let team = Arc::new(
@@ -127,13 +142,14 @@ impl Agent {
         Ok(Agent {
             client,
             registry,
+            mcp_manager,
             skills,
             task_store,
             bg_manager,
             todo_manager,
-            coordinator: cfg.coordinator,
-            team_input_sender: cfg.team_input_sender,
+            io: cfg.io,
             workdir: cfg.workdir,
+            compaction_request,
             cron_manager,
             compactor,
             memory,
@@ -166,13 +182,14 @@ impl Agent {
         Agent {
             client: Arc::clone(&self.client),
             registry: Arc::clone(&self.registry),
+            mcp_manager: Arc::clone(&self.mcp_manager),
             skills: Arc::clone(&self.skills),
             task_store: Arc::clone(&self.task_store),
             bg_manager: Arc::clone(&self.bg_manager),
             todo_manager: Arc::clone(&self.todo_manager),
-            coordinator: Arc::clone(&self.coordinator),
-            team_input_sender: self.team_input_sender.clone(),
+            io: Arc::clone(&self.io),
             workdir: self.workdir.clone(),
+            compaction_request: Arc::clone(&self.compaction_request),
             cron_manager: None,
             compactor,
             memory,
@@ -194,6 +211,11 @@ impl Agent {
                 .map_err(|e| AgentError::Other(format!("cron start: {e}")))?;
         }
         Ok(())
+    }
+
+    /// s14: 清理所有 MCP server 进程（程序退出前调用）。
+    pub async fn shutdown_mcp(&self) {
+        self.mcp_manager.shutdown_all().await;
     }
 
     /// 装配默认 hook 集（原 main.rs:299-305）。
@@ -228,13 +250,14 @@ impl Agent {
         Agent {
             client: Arc::clone(&self.client),
             registry: Arc::clone(&self.registry),
+            mcp_manager: Arc::clone(&self.mcp_manager),
             skills: Arc::clone(&self.skills),
             task_store: Arc::clone(&self.task_store),
             bg_manager: Arc::clone(&self.bg_manager),
             todo_manager: Arc::clone(&self.todo_manager),
-            coordinator: Arc::clone(&self.coordinator),
-            team_input_sender: self.team_input_sender.clone(),
+            io: Arc::clone(&self.io),
             workdir: self.workdir.clone(),
+            compaction_request: Arc::clone(&self.compaction_request),
             cron_manager: None,
             compactor,
             memory,
@@ -291,8 +314,8 @@ impl Agent {
     /// 单个工具调用 + PreToolUse 拦截。子 agent 也走这里 → trigger_pre_tool 不再旁路。
     async fn execute_tool(&self, name: &str, input: &serde_json::Value) -> ToolResult {
         let ctx = HookContext {
-            coordinator: std::sync::Arc::clone(&self.coordinator),
-            ask: self.team_input_sender.clone(),
+            output: Arc::clone(&self.io.output),
+            input: Arc::clone(&self.io.input),
         };
         if let Some(reason) = self.hooks.trigger_pre_tool(&self.registry, &ctx, name, input).await {
             return ToolResult::Denied {
@@ -331,7 +354,7 @@ impl Agent {
                 let result = self.execute_tool(name, input).await;
                 let content_str = result.as_content();
                 {
-                    self.coordinator.lock().unwrap().render_tool_result(name, &content_str, crate::output::colors_enabled());
+                    self.io.output.render_tool_result(name, &content_str, crate::output::colors_enabled());
                 }
                 if result.was_executed() {
                     if let Some(msg) = self.hooks.trigger_post_tool(name, input, &content_str).await {
@@ -354,12 +377,6 @@ impl Agent {
         messages: &mut Vec<Message>,
         active_request: &str,
     ) -> Result<LoopOutcome, AgentError> {
-        // s09：召回相关记忆拼进 system（每请求一次，与压缩正交）。
-        // read_only 实例也可召回；extract/consolidate 阶段 read_only 自动跳过写盘。
-        let recalled = self.memory.load_memories(&self.client, messages).await;
-        let index = self.memory.read_memory_index();
-        let system = build_system(&self.base_system, &index, &recalled);
-
         let mut reactive_retries = 0u32;
         let max = self.max_turns;
 
@@ -395,6 +412,24 @@ impl Agent {
             // s08：每次调用模型前运行压缩管线。
             self.compactor.prepare(&self.client, messages, active_request).await?;
 
+            // P0 修复：每轮重新构建 system prompt（对齐 Python s15）
+            // 包含：当前时间、MCP 状态、memory 召回
+            let current_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let mcp_suffix = self.mcp_manager.system_prompt_suffix();
+            let recalled = self.memory.load_memories(&self.client, messages).await;
+            let index = self.memory.read_memory_index();
+
+            // 组装 base + MCP + 时间 + memory
+            let base_with_time_and_mcp = if mcp_suffix.is_empty() {
+                format!("{}\n\nCurrent time: {}", self.base_system, current_time)
+            } else {
+                format!(
+                    "{}\n\nCurrent time: {}\n\n{}",
+                    self.base_system, current_time, mcp_suffix
+                )
+            };
+            let system = build_system(&base_with_time_and_mcp, &index, &recalled);
+
             let defs = self.registry.definitions_for(self.kind);
 
             let cancel = tokio_util::sync::CancellationToken::new();
@@ -411,7 +446,7 @@ impl Agent {
                 }
                 // prompt_too_long 且还有重试预算：压缩后重试。
                 CallResult::PromptTooLong(_) if reactive_retries < MAX_REACTIVE_RETRIES => {
-                    self.coordinator.lock().unwrap().status("[reactive compact]");
+                    self.io.output.status("[reactive compact]");
                     self.compactor
                         .reactive_compact(&self.client, messages, active_request)
                         .await?;
@@ -440,24 +475,21 @@ impl Agent {
             };
 
             // client 收集完返回后，统一渲染本轮内容（text 整行 emit，tool_use 显示 ⚙ + JSON）。
-            {
-                let mut c = self.coordinator.lock().unwrap();
-                for block in &response.content {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            let _ = c.emit(text);
-                        }
-                        ContentBlock::ToolUse { name, input, .. } => {
-                            let _ = c.emit(&format!("⚙ {}", name));
-                            if *input != serde_json::Value::Null {
-                                let input_str = serde_json::to_string_pretty(input).unwrap_or_default();
-                                for line in input_str.lines() {
-                                    let _ = c.emit(&format!("  {}", line));
-                                }
+            for block in &response.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        self.io.output.emit(text);
+                    }
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        self.io.output.emit(&format!("⚙ {}", name));
+                        if *input != serde_json::Value::Null {
+                            let input_str = serde_json::to_string_pretty(input).unwrap_or_default();
+                            for line in input_str.lines() {
+                                self.io.output.emit(&format!("  {}", line));
                             }
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
 
@@ -489,6 +521,14 @@ impl Agent {
 
             // 执行本轮工具调用 + PostToolUse 提醒（父子共用 helper）。
             messages.extend(self.execute_tool_use_blocks(&response.content).await);
+
+            // P2: 检查是否请求了压缩（模型调用了 compact 工具）
+            if self.compaction_request.lock().await.take() {
+                self.io.output.status("[model-initiated compact]");
+                self.compactor
+                    .compact_history(&self.client, messages, active_request)
+                    .await?;
+            }
         }
 
         Ok(LoopOutcome::MaxTurnsReached)
@@ -499,7 +539,7 @@ impl Agent {
     pub async fn run_subagent(&self, prompt: &str, max_turns: usize) -> Result<String, AgentError> {
         let max_turns = max_turns.clamp(1, 50);
         let child = self.child_agent(max_turns, SUB_SYSTEM);
-        self.coordinator.lock().unwrap().status("[Subagent started]");
+        self.io.output.status("[Subagent started]");
 
         let mut messages: Vec<Message> = vec![Message::user_text(prompt)];
 
@@ -515,17 +555,17 @@ impl Agent {
                     .unwrap_or(&[]);
                 match extract_final_text(last_assistant) {
                     Some(text) => {
-                        self.coordinator.lock().unwrap().status("[Subagent done]");
+                        self.io.output.status("[Subagent done]");
                         text
                     }
                     None => {
-                        self.coordinator.lock().unwrap().status("[Subagent done - no text]");
+                        self.io.output.status("[Subagent done - no text]");
                         "(no summary)".to_string()
                     }
                 }
             }
             LoopOutcome::MaxTurnsReached => {
-                self.coordinator.lock().unwrap().status(&format!(
+                self.io.output.status(&format!(
                     "[Subagent stopped after {} turns without final answer]",
                     max_turns
                 ));
@@ -535,7 +575,7 @@ impl Agent {
                 )
             }
             LoopOutcome::Cancelled => {
-                self.coordinator.lock().unwrap().status("[Subagent cancelled]");
+                self.io.output.status("[Subagent cancelled]");
                 "(cancelled)".to_string()
             }
         };
@@ -612,6 +652,8 @@ impl TestAgent {
         ));
         let todo_manager = Arc::new(SharedTodoManager::new(TodoManager::new()));
         let registry = Arc::new(tools::build_registry());
+        // s14: 测试用 MCP manager
+        let mcp_manager = Arc::new(McpManager::new(Arc::clone(&registry)));
         let hooks = Agent::build_hooks(&bg_manager, &todo_manager);
         let team = Arc::new(
             crate::team::TeamCtx::new(workdir.clone(), Arc::clone(&task_store)).unwrap(),
@@ -622,20 +664,22 @@ impl TestAgent {
         );
         let memory = MemoryStore::new_read_only(workdir.join(".memory"));
 
-        let coordinator = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::render::Coordinator::new(crate::render::CrosstermBackend::new())
-        ));
+        let compaction_request = Arc::new(tokio::sync::Mutex::new(CompactionRequest::new()));
+
+        // 使用内存 I/O 用于测试
+        let io = Arc::new(crate::io::IO::memory());
 
         let agent = Agent {
             client,
             registry,
+            mcp_manager,
             skills,
             task_store,
             bg_manager,
             todo_manager,
-            coordinator,
-            team_input_sender: None,
+            io,
             workdir,
+            compaction_request,
             cron_manager: None,
             compactor,
             memory,
@@ -718,16 +762,17 @@ mod tests {
     async fn agent_new_propagates_task_store_failure() {
         // S8 回归：TaskStore 构造失败时 Agent::new 返回 Err（旧 LazyLock 在首次工具调用 panic）。
         let file = tempfile::NamedTempFile::new().expect("tempfile");
+        let coordinator = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::render::Coordinator::new(crate::render::CrosstermBackend::new())
+        ));
+        let io = Arc::new(crate::io::IO::console(coordinator, None));
         let cfg = AgentConfig {
             api_key: "k".into(),
             base_url: "http://localhost".into(),
             model: "m".into(),
             workdir: file.path().to_path_buf(),
             skills_dir: file.path().join("skills"),
-            coordinator: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::render::Coordinator::new(crate::render::CrosstermBackend::new())
-            )),
-            team_input_sender: None,
+            io,
         };
         let result = Agent::new(cfg).await;
         assert!(

@@ -21,6 +21,7 @@ pub mod registry;
 
 // Tool module implementations
 pub mod command;
+pub mod compact_tool;
 pub mod read_file;
 pub mod write_file;
 pub mod edit_file;
@@ -35,7 +36,9 @@ pub use self::trait_def::{PermissionCheck, Tool, ToolContext, ToolResult};
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use path_clean::PathClean;
+use tokio::sync::Mutex;
 
 /// 工作目录
 pub fn workdir() -> PathBuf {
@@ -149,6 +152,7 @@ pub fn normalize(path_str: &str) -> PathBuf {
 /// Build and return a tool registry with all tools registered.
 ///
 /// Now uses Arc::new() instead of Box::new() for dynamic registration support.
+/// P2: Added compact tool for model-initiated context compaction.
 pub fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
@@ -195,6 +199,21 @@ pub fn build_registry() -> ToolRegistry {
     registry.register(Box::new(crate::team::tools::ReviewPlanTool));
     registry.register(Box::new(crate::team::tools::SubmitPlanTool));
     registry.register(Box::new(crate::team::tools::CreateWorktreeTool));
+
+    registry
+}
+
+/// Build and return a tool registry with all tools registered, plus compact tool.
+/// This version includes the compact tool for model-initiated compaction.
+pub fn build_registry_with_compact(
+    compaction_request: Arc<Mutex<crate::tools::compact_tool::CompactionRequest>>,
+) -> ToolRegistry {
+    let registry = build_registry();
+
+    // P2: Compact tool for model-initiated context compaction
+    registry.register_dynamic(Arc::new(compact_tool::CompactTool::new(
+        Arc::clone(&compaction_request),
+    )));
 
     registry
 }

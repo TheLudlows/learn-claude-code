@@ -314,7 +314,7 @@ impl Client {
         // 流式解析 SSE：用 eventsource-stream 处理协议层（行分割、事件边界），
         // 我们只负责解析每个事件的 JSON data。
         let bytes_stream = response.bytes_stream();
-        let mut es = bytes_stream.eventsource();
+        let es = bytes_stream.eventsource();
 
         let mut content: Vec<ContentBlock> = Vec::new();
         // 初始化为 "unknown" 而非空串：若流异常结束且未收到 message_delta 事件，

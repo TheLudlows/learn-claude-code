@@ -14,32 +14,56 @@ main.rs 默认注册的钩子集中于此(5 个内置钩子全部到位):
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::oneshot;
 
 use crate::client::{ContentBlock, Message};
-use crate::hooks::{HookContext, PermissionQuery, PostToolHook, PreToolHook, PromptHook, StopHook};
+use crate::hooks::{HookContext, PostToolHook, PreToolHook, PromptHook, StopHook};
 use crate::todo::SharedTodoManager;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::trait_def::PermissionCheck;
 use crate::tools::workdir;
 
-/// PostToolUse: 每次工具执行后注入当前 todo 列表。
-/// 持有 Arc<SharedTodoManager>，经 render() 只读获取当前状态。
+/// PostToolUse: 每 3 轮注入一次 todo 提醒（对齐 Python s15）。
+/// 持有计数器，调用 todo_write 后重置计数器，否则每轮递增，达到 3 时提醒并归零。
 pub struct TodoReminderHook {
+    #[allow(dead_code)]  // 保留引用以保持 API 兼容性，未来可能需要访问 todo 列表
     todo_manager: Arc<SharedTodoManager>,
+    counter: Arc<std::sync::Mutex<usize>>,
 }
 
 impl TodoReminderHook {
     pub fn new(todo_manager: Arc<SharedTodoManager>) -> Self {
-        Self { todo_manager }
+        Self {
+            todo_manager,
+            counter: Arc::new(std::sync::Mutex::new(0)),
+        }
+    }
+
+    /// 重置计数器（用于子 agent 隔离边界，防止计数器跨边界泄漏）。
+    pub fn reset_counter(&self) {
+        *self.counter.lock().unwrap() = 0;
     }
 }
 
 #[async_trait]
 impl PostToolHook for TodoReminderHook {
-    async fn on_post_tool(&self, _name: &str, _input: &serde_json::Value, _output: &str) -> Option<String> {
-        let todos = self.todo_manager.render();
-        Some(format!("<reminder>\nCurrent todos:\n{}\n</reminder>", todos))
+    async fn on_post_tool(&self, name: &str, _input: &serde_json::Value, _output: &str) -> Option<String> {
+        // 调用 todo_write 后重置计数器
+        if name == "todo_write" {
+            *self.counter.lock().unwrap() = 0;
+            return None;
+        }
+
+        // 递增计数器
+        let mut counter = self.counter.lock().unwrap();
+        *counter += 1;
+
+        // 每 3 轮提醒一次
+        if *counter >= 3 {
+            *counter = 0;
+            Some(format!("<reminder>Update your todos.</reminder>"))
+        } else {
+            None
+        }
     }
 }
 
@@ -147,21 +171,9 @@ fn requires_approval(command: &str) -> Option<&'static str> {
     None
 }
 
-/// 经 InputTask 询问用户批准。无 ask 通道（非交互 agent）→ 渲染 blocked 并拒绝。
+/// 经 InputTask 询问用户批准。无 ask 通道（非交互 agent）→ 返回 false。
 async fn ask_via_input(ctx: &HookContext, name: &str, input: &serde_json::Value, reason: &str) -> bool {
-    let Some(ask) = ctx.ask.as_ref() else {
-        ctx.coordinator.lock().unwrap().error(&format!("cannot approve {name}: no interactive input channel"));
-        return false;
-    };
-    let (tx, rx) = oneshot::channel();
-    ctx.coordinator.lock().unwrap().permission(reason, name, input);
-    let _ = ask.send(crate::render::input::InputCmd::AskPermission(PermissionQuery {
-        reason: reason.into(),
-        name: name.into(),
-        input: input.clone(),
-        reply: tx,
-    })).await;
-    rx.await.unwrap_or(false)
+    ctx.input.ask_permission(reason, name, input).await
 }
 
 /// PreToolUse 钩子: 三道闸门串联, 返回 Some(reason) 表示拦截, None 表示放行。
@@ -184,7 +196,7 @@ impl PreToolHook for PermissionHook {
         if name == "command" {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(reason) = check_deny_patterns(cmd) {
-                ctx.coordinator.lock().unwrap().blocked(reason);
+                ctx.output.blocked(reason);
                 return Some(format!("Permission denied: {}", reason));
             }
         }
@@ -221,8 +233,49 @@ impl PreToolHook for PermissionHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::{HookContext, PreToolHook};
+    use crate::hooks::{HookContext, PostToolHook, PreToolHook};
+    use crate::todo::TodoManager;
     use crate::tools::registry::ToolRegistry;
+
+    #[tokio::test]
+    async fn todo_reminder_counter_every_three_turns() {
+        let todo_manager = Arc::new(SharedTodoManager::new(TodoManager::new()));
+        let hook = TodoReminderHook::new(Arc::clone(&todo_manager));
+        let input = serde_json::json!({});
+
+        // 前 2 次调用不应该提醒
+        assert!(hook.on_post_tool("command", &input, "").await.is_none());
+        assert!(hook.on_post_tool("read_file", &input, "").await.is_none());
+
+        // 第 3 次调用应该提醒
+        let reminder = hook.on_post_tool("write_file", &input, "").await;
+        assert!(reminder.is_some());
+        assert!(reminder.unwrap().contains("Update your todos"));
+
+        // 重置后，又需要 3 次才能触发
+        assert!(hook.on_post_tool("command", &input, "").await.is_none());
+        assert!(hook.on_post_tool("read_file", &input, "").await.is_none());
+        assert!(hook.on_post_tool("write_file", &input, "").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn todo_reminder_resets_on_todo_write() {
+        let todo_manager = Arc::new(SharedTodoManager::new(TodoManager::new()));
+        let hook = TodoReminderHook::new(Arc::clone(&todo_manager));
+        let input = serde_json::json!({});
+
+        // 调用 2 次普通工具
+        assert!(hook.on_post_tool("command", &input, "").await.is_none());
+        assert!(hook.on_post_tool("read_file", &input, "").await.is_none());
+
+        // 调用 todo_write 应该重置计数器
+        assert!(hook.on_post_tool("todo_write", &input, "").await.is_none());
+
+        // 又需要 3 次普通工具调用才能触发
+        assert!(hook.on_post_tool("command", &input, "").await.is_none());
+        assert!(hook.on_post_tool("read_file", &input, "").await.is_none());
+        assert!(hook.on_post_tool("write_file", &input, "").await.is_some());
+    }
 
     #[tokio::test]
     async fn permission_hook_gate1_denies_destructive() {

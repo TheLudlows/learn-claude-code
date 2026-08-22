@@ -79,14 +79,17 @@ async fn main() -> Result<(), AgentError> {
     } else {
         None
     };
+
+    // 创建 I/O 组合
+    let io = Arc::new(bytemaker::io::IO::console(coordinator.clone(), cmd_tx.clone()));
+
     let cfg = AgentConfig {
         api_key,
         base_url,
         model,
         workdir: cwd.clone(),
         skills_dir: PathBuf::from(&skills_dir),
-        coordinator: coordinator.clone(),
-        team_input_sender: cmd_tx.clone(),
+        io: io.clone(),
     };
     let agent = Agent::new(cfg).await?;
     agent.start_cron_runtime().await?;
@@ -100,11 +103,14 @@ async fn main() -> Result<(), AgentError> {
 
     if let Some(cmd_tx) = cmd_tx {
         // ---- 交互模式：reedline InputTask ----
-        run_interactive(&agent, &mut messages, &coordinator, cmd_tx).await?;
+        run_interactive(&agent, &mut messages, Arc::clone(&io.output), cmd_tx).await?;
     } else {
         // ---- 非交互模式：tokio 行读取 ----
-        run_noninteractive(&agent, &mut messages, &coordinator).await;
+        run_noninteractive(&agent, &mut messages, Arc::clone(&io.output)).await;
     }
+
+    // s14: 清理所有 MCP server 进程
+    agent.shutdown_mcp().await;
 
     Ok(())
 }
@@ -115,7 +121,7 @@ async fn main() -> Result<(), AgentError> {
 async fn run_interactive(
     agent: &Agent,
     messages: &mut Vec<Message>,
-    coordinator: &Arc<Mutex<Coordinator<CrosstermBackend>>>,
+    output: Arc<dyn bytemaker::io::Output>,
     cmd_tx: tokio::sync::mpsc::Sender<InputCmd>,
 ) -> Result<(), AgentError> {
     loop {
@@ -139,11 +145,11 @@ async fn run_interactive(
         // defer 唤醒：每轮用户回合开头排空 Lead 收件箱。`run_team_wake`
         // 内部自己 `consume_lead_inbox`，空收件箱 → is_empty → 返回 false
         //（no-op）；勿在外层预 consume（会与内部 consume 重复排空成空）。
-        if run_team_wake(agent, messages, coordinator).await {
+        if run_team_wake(agent, messages, Arc::clone(&output)).await {
             let _ = cmd_tx.send(InputCmd::Shutdown).await;
             return Ok(());
         }
-        if run_user_turn(agent, messages, &query, coordinator).await {
+        if run_user_turn(agent, messages, &query, Arc::clone(&output)).await {
             let _ = cmd_tx.send(InputCmd::Shutdown).await;
             return Ok(());
         }
@@ -155,11 +161,11 @@ async fn run_interactive(
 async fn run_noninteractive(
     agent: &Agent,
     messages: &mut Vec<Message>,
-    coordinator: &Arc<Mutex<Coordinator<CrosstermBackend>>>,
+    output: Arc<dyn bytemaker::io::Output>,
 ) {
     let mut reader = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     loop {
-        coordinator.lock().unwrap().prompt();
+        output.prompt();
         let notify = agent.lead_notify().expect("team initialized");
         tokio::select! {
             biased;
@@ -175,12 +181,12 @@ async fn run_noninteractive(
                 if query.eq_ignore_ascii_case("q") || query == "exit" {
                     break;
                 }
-                if run_user_turn(agent, messages, &query, coordinator).await {
+                if run_user_turn(agent, messages, &query, Arc::clone(&output)).await {
                     break;
                 }
             }
             _ = notify.notified() => {
-                if run_team_wake(agent, messages, coordinator).await {
+                if run_team_wake(agent, messages, Arc::clone(&output)).await {
                     break;
                 }
             }
@@ -193,7 +199,7 @@ async fn run_user_turn(
     agent: &Agent,
     messages: &mut Vec<Message>,
     query: &str,
-    coordinator: &Arc<Mutex<Coordinator<CrosstermBackend>>>,
+    output: Arc<dyn bytemaker::io::Output>,
 ) -> bool {
     // 用户输入后、进入 LLM 前触发 UserPromptSubmit。
     agent.trigger_prompt(query).await;
@@ -201,11 +207,11 @@ async fn run_user_turn(
     match agent.run_loop(messages, query).await {
         Ok(LoopOutcome::Cancelled) => true,
         Ok(_) => {
-            coordinator.lock().unwrap().blank();
+            output.blank();
             false
         }
         Err(e) => {
-            coordinator.lock().unwrap().error(&format!("Error: {}", e));
+            output.error(&format!("Error: {}", e));
             false
         }
     }
@@ -216,7 +222,7 @@ async fn run_user_turn(
 async fn run_team_wake(
     agent: &Agent,
     messages: &mut Vec<Message>,
-    coordinator: &Arc<Mutex<Coordinator<CrosstermBackend>>>,
+    output: Arc<dyn bytemaker::io::Output>,
 ) -> bool {
     let inbox = team::consume_lead_inbox(agent.team().expect("team initialized"));
     if inbox.is_empty() {
@@ -224,7 +230,7 @@ async fn run_team_wake(
     }
     let text = team::format_team_events(&inbox);
     messages.push(Message::user_text(text));
-    coordinator.lock().unwrap().banner(&format!(
+    output.banner(&format!(
         "[wake: {} team event(s) -> new turn]",
         inbox.len()
     ));
@@ -232,7 +238,7 @@ async fn run_team_wake(
         Ok(LoopOutcome::Cancelled) => true,
         Ok(_) => false,
         Err(e) => {
-            coordinator.lock().unwrap().error(&format!("Error: {}", e));
+            output.error(&format!("Error: {}", e));
             false
         }
     }
